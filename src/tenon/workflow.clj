@@ -1,7 +1,8 @@
 (ns tenon.workflow
   (:require [clojure.edn :as edn]
             [tenon.workflow.db :as db]
-            [tenon.workflow.sqlite :as sqlite]))
+            [tenon.workflow.sqlite :as sqlite])
+  (:import [java.time Duration LocalDateTime]))
 
 (defn register! [v raw-fn]
   (doto v (alter-meta! assoc ::raw-fn raw-fn)))
@@ -25,10 +26,18 @@
    id (a random UUID) for each new workflow invocation."
   #(str (random-uuid)))
 
+(def default-timeout-ms
+  "Default :tenon/timeout-ms for init - how long after it started an
+   invocation may stay STARTED. Past that, the next call of the same
+   wf+arguments (or a restart-invocation) marks it ERROR as timed out -
+   e.g. when the process running it died and it will never finish."
+  30000)
+
 (defn init
   "Builds the application-state map threaded through run-invocation,
    restart-invocation, list-pending, and tenon.workflow.http's
-   wrap-handler/app: {:tenon/db ... :tenon/id-gen ...}.
+   wrap-handler/app: {:tenon/db ... :tenon/id-gen ...
+   :tenon/timeout-ms ...}.
 
    db-path names a SQLite file (creating it if needed); tenon.workflow.sqlite
    opens it (sqlite/datasource) and tenon.workflow.db/init-db! - a
@@ -36,10 +45,12 @@
    stored under :tenon/db. Additional key/value pairs override the
    defaults - most usefully :tenon/id-gen, a nullary fn called once per
    new invocation to produce its id (a random UUID string by default;
-   see default-id-gen)."
+   see default-id-gen) and :tenon/timeout-ms (see default-timeout-ms;
+   nil never times out)."
   [db-path & {:as opts}]
   (merge {:tenon/db (db/init-db! (sqlite/datasource db-path))
-          :tenon/id-gen default-id-gen}
+          :tenon/id-gen default-id-gen
+          :tenon/timeout-ms default-timeout-ms}
          opts))
 
 (def ^:dynamic *workflow-engine*
@@ -94,9 +105,19 @@
     (db/insert-event! ds workflow-id "DONE" (safe-pr-str result))
     result))
 
-(defn- await-existing-result
-  "Waits out an in-flight invocation of the same wf+arguments."
-  [ds workflow-id]
+(defn- time-out-if-expired! [ds workflow-id latest-ev timeout-ms]
+  (when (and (some? timeout-ms)
+             (= "STARTED" (:state latest-ev))
+             (.isAfter ^LocalDateTime (db/current-time ds)
+                       (.plus ^LocalDateTime (:changed_at latest-ev) (Duration/ofMillis timeout-ms))))
+    (db/insert-event! ds workflow-id "ERROR"
+                      (safe-pr-str {:message (str "Timed out: still running " timeout-ms
+                                                  " ms after it started")
+                                    :class (str `timed-out)
+                                    :data {:type ::timed-out :timeout-ms timeout-ms}}))
+    true))
+
+(defn- await-existing-result [ds workflow-id timeout-ms]
   (loop [wait-ms 5]
     (let [ev (db/latest-event ds workflow-id)]
       (case (:state ev)
@@ -106,8 +127,10 @@
                                    {:type ::previous-failure
                                     :workflow-id workflow-id
                                     :failure failure})))
-        "STARTED" (do (Thread/sleep (long wait-ms))
-                      (recur (min 200 (* 2 wait-ms))))))))
+        "STARTED" (if (time-out-if-expired! ds workflow-id ev timeout-ms)
+                    (recur wait-ms)
+                    (do (Thread/sleep (long wait-ms))
+                        (recur (min 200 (* 2 wait-ms)))))))))
 
 (defn run-invocation
   "Runs raw-fn with args, persisting the invocation.
@@ -117,10 +140,11 @@
   ([engine v raw-fn args]
    (let [ds (:tenon/db engine)
          id-gen (:tenon/id-gen engine)
+         timeout-ms (:tenon/timeout-ms engine default-timeout-ms)
          wf-def-str (str (symbol v))
          args-str (safe-pr-str (vec args))]
      (if-let [existing (db/find-by-wf-def-and-arguments ds wf-def-str args-str)]
-       (await-existing-result ds (:id existing))
+       (await-existing-result ds (:id existing) timeout-ms)
        (let [id (id-gen)
              parent-id (first *invocation-stack*)
              meta-str (when (some? *workflow-meta*) (safe-pr-str *workflow-meta*))
@@ -128,7 +152,7 @@
          (if inserted-id
            (execute-and-record! ds inserted-id raw-fn args)
            (if-let [existing (db/find-by-wf-def-and-arguments ds wf-def-str args-str)]
-             (await-existing-result ds (:id existing))
+             (await-existing-result ds (:id existing) timeout-ms)
              (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
                               {:type ::race-condition :wf-def wf-def-str})))))))))
 
@@ -140,8 +164,9 @@
 
 (defn restart-invocation
   "Restarts the invocation identified by workflow-id, appending new events to
-   the same row. Requires the invocation's latest event to be DONE or ERROR,
-   and its wf_def to currently be registered in this process. engine
+   the same row. Requires the invocation's latest event to be DONE or ERROR
+   (or STARTED but timed out - see :tenon/timeout-ms in init), and its
+   wf_def to currently be registered in this process. engine
    defaults to *workflow-engine*, same as run-invocation."
   ([workflow-id]
    (restart-invocation *workflow-engine* workflow-id))
@@ -150,7 +175,10 @@
          wf (or (db/get-workflow ds workflow-id)
                 (throw (ex-info "No such workflow"
                                  {:type ::precondition-failed :workflow-id workflow-id})))
-         latest (db/latest-event ds workflow-id)]
+         latest (let [ev (db/latest-event ds workflow-id)]
+                  (if (time-out-if-expired! ds workflow-id ev (:tenon/timeout-ms engine default-timeout-ms))
+                    (db/latest-event ds workflow-id)
+                    ev))]
      (when-not (contains? #{"DONE" "ERROR"} (:state latest))
        (throw (ex-info "Cannot restart: latest event is not DONE or ERROR"
                         {:type ::precondition-failed

@@ -235,3 +235,56 @@
   ;; lookup must swallow that and return nil like any other miss, since
   ;; this is exactly what happens for a stale/bogus wf_def string.
   (is (nil? (engine/lookup 'this.namespace.was.never/loaded))))
+
+(deftest run-invocation-times-out-expired-started-invocation-test
+  ;; A STARTED row older than :tenon/timeout-ms (e.g. its process died)
+  ;; must not make later calls with the same args wait - it gets marked
+  ;; ERROR as timed out, without re-executing the function.
+  (let [id (str (java.util.UUID/randomUUID))
+        calls (atom 0)]
+    (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/dedup-started-fn" (pr-str [5]) nil nil)
+    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/backdate-events! (test-util/ds) id)
+    (let [e (is (thrown? clojure.lang.ExceptionInfo
+                  (engine/run-invocation #'dedup-started-fn (fn [n] (swap! calls inc) n) [5])))]
+      (is (= ::engine/previous-failure (:type (ex-data e))))
+      (is (= ::engine/timed-out (-> e ex-data :failure :data :type))))
+    (is (zero? @calls))
+    (is (= ["STARTED" "ERROR"] (mapv :state (test-util/get-events (test-util/ds) id))))))
+
+(deftest run-invocation-timeout-counts-from-start-time-test
+  ;; The deadline is the invocation's start time + :tenon/timeout-ms, not
+  ;; the moment a waiter begins waiting: a waiter arriving late must give
+  ;; up sooner than timeout-ms.
+  (binding [engine/*workflow-engine* (assoc engine/*workflow-engine* :tenon/timeout-ms 2000)]
+    (let [id (str (java.util.UUID/randomUUID))]
+      (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/dedup-started-fn" (pr-str [7]) nil nil)
+      (db/insert-event! (test-util/ds) id "STARTED" nil)
+      (Thread/sleep 1500)
+      (let [t0 (System/nanoTime)]
+        (is (thrown? clojure.lang.ExceptionInfo
+              (engine/run-invocation #'dedup-started-fn dedup-started-fn [7])))
+        (is (< (/ (- (System/nanoTime) t0) 1e6) 1800)
+            "gave up well before a full timeout-ms after it began waiting")))))
+
+(deftest restart-invocation-restarts-timed-out-invocation-test
+  (engine/register! #'echo-fn echo-fn)
+  (let [id (str (java.util.UUID/randomUUID))]
+    (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/echo-fn" (pr-str [2]) nil nil)
+    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/backdate-events! (test-util/ds) id)
+    (is (= 2 (engine/restart-invocation id)))
+    (is (= ["STARTED" "ERROR" "STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) id))))))
+
+(deftest run-invocation-without-timeout-waits-without-limit-test
+  ;; nil :tenon/timeout-ms opts out - even a long-STARTED invocation is
+  ;; waited out until it finishes.
+  (binding [engine/*workflow-engine* (assoc engine/*workflow-engine* :tenon/timeout-ms nil)]
+    (let [id (str (java.util.UUID/randomUUID))]
+      (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/dedup-started-fn" (pr-str [6]) nil nil)
+      (db/insert-event! (test-util/ds) id "STARTED" nil)
+      (test-util/backdate-events! (test-util/ds) id)
+      (future
+        (Thread/sleep 300)
+        (db/insert-event! (test-util/ds) id "DONE" (pr-str :late-result)))
+      (is (= :late-result (engine/run-invocation #'dedup-started-fn dedup-started-fn [6]))))))

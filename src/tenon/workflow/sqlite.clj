@@ -5,7 +5,20 @@
             [next.jdbc.result-set :as rs]
             [tenon.workflow.db :as db])
   (:import [java.security MessageDigest]
+           [java.time LocalDateTime]
            [javax.sql DataSource]))
+
+(def ^:private now-ms
+  "SQL expression for the current UTC time with millisecond precision,
+   \"YYYY-MM-DD HH:MM:SS.SSS\" - unlike CURRENT_TIMESTAMP, which stops at
+   seconds. Same format, so both sort correctly against each other."
+  "strftime('%Y-%m-%d %H:%M:%f', 'now')")
+
+(defn- ->local-date-time
+  "Parses a timestamp as now-ms (or, in rows written before changed_at had
+   millisecond precision, CURRENT_TIMESTAMP) formats it."
+  ^LocalDateTime [^String s]
+  (LocalDateTime/parse (.replace s " " "T")))
 
 (defn- dedup-key [wf-def arguments-edn-str]
   (->> (.getBytes (str wf-def "\u0000" arguments-edn-str) "UTF-8")
@@ -34,12 +47,12 @@
                                 dedup_key TEXT NOT NULL)"])
       (jdbc/execute! ["CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_dedup_key
                             ON workflow(dedup_key)"])
-      (jdbc/execute! ["CREATE TABLE IF NOT EXISTS workflow_events (
+      (jdbc/execute! [(str "CREATE TABLE IF NOT EXISTS workflow_events (
                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 workflow_id TEXT NOT NULL REFERENCES workflow(id),
-                                changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                                changed_at TEXT NOT NULL DEFAULT (" now-ms "),
                                 state TEXT NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR')),
-                                payload TEXT)"])
+                                payload TEXT)")])
       (jdbc/execute! ["CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_id
                             ON workflow_events(workflow_id)"])
       (jdbc/execute! ["CREATE INDEX IF NOT EXISTS idx_workflow_parent_workflow_id
@@ -55,16 +68,25 @@
 
   (insert-event! [this workflow-id state payload-edn-str]
     (doto this
-      (jdbc/execute! ["INSERT INTO workflow_events (workflow_id, state, payload) VALUES (?, ?, ?)"
+      ;; changed_at given explicitly (not left to the column DEFAULT), so
+      ;; databases created before it had millisecond precision get it too.
+      (jdbc/execute! [(str "INSERT INTO workflow_events (workflow_id, state, payload, changed_at)
+                            VALUES (?, ?, ?, " now-ms ")")
                       workflow-id state payload-edn-str])))
+
+  (current-time [this]
+    (->local-date-time
+     (:now (jdbc/execute-one! this [(str "SELECT " now-ms " AS now")]
+                              {:builder-fn rs/as-unqualified-lower-maps}))))
 
   (get-workflow [this id]
     (jdbc/execute-one! this ["SELECT * FROM workflow WHERE id = ?" id]
                        {:builder-fn rs/as-unqualified-lower-maps}))
 
   (latest-event [this workflow-id]
-    (jdbc/execute-one! this ["SELECT * FROM workflow_events WHERE workflow_id = ? ORDER BY id DESC LIMIT 1" workflow-id]
-                       {:builder-fn rs/as-unqualified-lower-maps}))
+    (some-> (jdbc/execute-one! this ["SELECT * FROM workflow_events WHERE workflow_id = ? ORDER BY id DESC LIMIT 1" workflow-id]
+                               {:builder-fn rs/as-unqualified-lower-maps})
+            (update :changed_at ->local-date-time)))
 
   (find-by-wf-def-and-arguments [this wf-def arguments-edn-str]
     (jdbc/execute-one! this ["SELECT * FROM workflow WHERE dedup_key = ?" (dedup-key wf-def arguments-edn-str)]

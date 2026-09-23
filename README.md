@@ -67,6 +67,7 @@ stateDiagram-v2
     [*] --> STARTED: run-invocation
     STARTED --> DONE: raw fn returns
     STARTED --> ERROR: raw fn throws
+    STARTED --> ERROR: timed out
     DONE --> STARTED: restart-invocation
     ERROR --> STARTED: restart-invocation
 ```
@@ -74,6 +75,17 @@ stateDiagram-v2
 `restart-invocation` appends new events to the *same* workflow row rather
 than starting a new one, so a restarted invocation's full history (e.g.
 `STARTED, ERROR, STARTED, DONE`) is preserved.
+
+A call whose function and arguments match an invocation that is still
+`STARTED` waits for that invocation's result. An invocation still `STARTED`
+more than `:tenon/timeout-ms` (default 30s, `nil` for no limit) after it
+started - e.g. because the process running it died - is marked `ERROR` as
+timed out by the next such call (which then throws, as for any failed
+invocation) or by `restart-invocation` (which then restarts it):
+
+```clojure
+(tenon.workflow/init "app.db" :tenon/timeout-ms 60000)
+```
 
 ## Build tooling
 

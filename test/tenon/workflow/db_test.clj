@@ -34,6 +34,8 @@
   (let [events (test-util/get-events (test-util/ds) "id-2")]
     (is (= ["STARTED" "DONE"] (mapv :state events)))
     (is (every? some? (map :changed_at events)) "changed_at is supplied by the db")
+    (is (every? #(re-matches #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}" %) (map :changed_at events))
+        "changed_at has millisecond precision")
     (is (= 42 (edn/read-string (:payload (last events)))))))
 
 (deftest latest-event-test
@@ -81,3 +83,13 @@
   (let [pending (db/pending-workflows (test-util/ds))]
     (is (some #(= "id-5" (:id %)) pending))
     (is (not (some #(= "id-6" (:id %)) pending)))))
+
+(deftest current-time-test
+  (db/insert-workflow! (test-util/ds) "id-7" "test.ns/clock" (pr-str []) nil nil)
+  (db/insert-event! (test-util/ds) "id-7" "STARTED" nil)
+  (let [now (db/current-time (test-util/ds))
+        changed-at (:changed_at (db/latest-event (test-util/ds) "id-7"))]
+    (is (instance? java.time.LocalDateTime now))
+    (is (instance? java.time.LocalDateTime changed-at))
+    (is (not (.isAfter ^java.time.LocalDateTime changed-at now))
+        "same clock as changed_at, so an event is never later than current-time")))

@@ -32,6 +32,13 @@
   (jdbc/execute! ds ["SELECT * FROM workflow WHERE wf_def = ?" wf-def]
                  {:builder-fn rs/as-unqualified-lower-maps}))
 
+(defn backdate-events!
+  "Moves every workflow_events row of workflow-id far into the past, so a
+   STARTED one looks like it started long ago."
+  [ds workflow-id]
+  (jdbc/execute! ds ["UPDATE workflow_events SET changed_at = '2000-01-01 00:00:00' WHERE workflow_id = ?"
+                     workflow-id]))
+
 (defn temp-db-fixture [f]
   (let [file (java.io.File/createTempFile "tenon-test" ".db")]
     (.deleteOnExit file)

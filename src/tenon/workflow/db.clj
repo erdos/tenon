@@ -12,9 +12,16 @@
 
   (insert-event! [this workflow-id state payload-edn-str])
 
+  (current-time [this]
+    "The storage's own current UTC time, as a java.time.LocalDateTime - the
+     clock that also supplies workflow_events.changed_at, so the two can be
+     compared without mixing in the JVM's clock.")
+
   (get-workflow [this id])
 
-  (latest-event [this workflow-id])
+  (latest-event [this workflow-id]
+    "The most recent workflow_events row of workflow-id, or nil. Its
+     changed_at is a UTC java.time.LocalDateTime.")
 
   (find-by-wf-def-and-arguments [this wf-def arguments-edn-str])
 
