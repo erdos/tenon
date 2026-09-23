@@ -1,7 +1,8 @@
 (ns tenon.workflow.test-util
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
-            [tenon.workflow :as engine]))
+            [tenon.workflow :as engine]
+            [tenon.workflow.db :as db]))
 
 (def ^:dynamic *db-path*
   "Absolute path of the current test's temp SQLite file, bound by
@@ -31,6 +32,12 @@
   [ds wf-def]
   (jdbc/execute! ds ["SELECT * FROM workflow WHERE wf_def = ?" wf-def]
                  {:builder-fn rs/as-unqualified-lower-maps}))
+
+(defn insert-event!
+  "Appends an event to workflow-id unconditionally - whatever its latest
+   event is - for tests setting up a workflow's history."
+  [ds workflow-id state payload-edn-str]
+  (db/append-event! ds workflow-id (:id (db/latest-event ds workflow-id)) state payload-edn-str))
 
 (defn backdate-events!
   "Moves every workflow_events row of workflow-id far into the past, so a

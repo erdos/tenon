@@ -27,7 +27,7 @@
        (apply str)))
 
 (def ^:private with-created-and-state
-  "SELECT w.id, w.wf_def, w.parent_workflow_id,
+  "SELECT w.*,
           (SELECT changed_at FROM workflow_events e
            WHERE e.workflow_id = w.id ORDER BY e.id ASC LIMIT 1) AS created_at,
           (SELECT state FROM workflow_events e
@@ -66,13 +66,16 @@
                              (dedup-key wf-def arguments-edn-str)])
         first :next.jdbc/update-count pos? (#{true}) (and id)))
 
-  (insert-event! [this workflow-id state payload-edn-str]
-    (doto this
-      ;; changed_at given explicitly (not left to the column DEFAULT), so
-      ;; databases created before it had millisecond precision get it too.
-      (jdbc/execute! [(str "INSERT INTO workflow_events (workflow_id, state, payload, changed_at)
-                            VALUES (?, ?, ?, " now-ms ")")
-                      workflow-id state payload-edn-str])))
+  (append-event! [this workflow-id expected-latest-event-id state payload-edn-str]
+    ;; changed_at given explicitly (not left to the column DEFAULT), so
+    ;; databases created before it had millisecond precision get it too.
+    (:id (jdbc/execute-one! this [(str "INSERT INTO workflow_events (workflow_id, state, payload, changed_at)
+                                        SELECT ?, ?, ?, " now-ms "
+                                         WHERE (SELECT id FROM workflow_events
+                                                 WHERE workflow_id = ? ORDER BY id DESC LIMIT 1) IS ?
+                                        RETURNING id")
+                                  workflow-id state payload-edn-str workflow-id expected-latest-event-id]
+                            {:builder-fn rs/as-unqualified-lower-maps})))
 
   (current-time [this]
     (->local-date-time
@@ -135,14 +138,7 @@
         JOIN descendants d ON d.id = e.workflow_id
         ORDER BY e.changed_at ASC, e.id ASC"
        workflow-id]
-      {:builder-fn rs/as-unqualified-lower-maps}))
-
-  (pending-workflows [this]
-    (->> (jdbc/execute! this ["SELECT id FROM workflow"] {:builder-fn rs/as-unqualified-lower-maps})
-         (keep (fn [{:keys [id]}]
-                 (when (= "STARTED" (:state (db/latest-event this id)))
-                   (db/get-workflow this id))))
-         vec)))
+      {:builder-fn rs/as-unqualified-lower-maps})))
 
 (defn datasource
   "A javax.sql.DataSource for the SQLite file at db-path (creating it if

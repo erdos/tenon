@@ -29,8 +29,8 @@
 
 (deftest insert-and-fetch-events-test
   (db/insert-workflow! (test-util/ds) "id-2" "test.ns/bar" (pr-str []) nil nil)
-  (db/insert-event! (test-util/ds) "id-2" "STARTED" nil)
-  (db/insert-event! (test-util/ds) "id-2" "DONE" (pr-str 42))
+  (test-util/insert-event! (test-util/ds) "id-2" "STARTED" nil)
+  (test-util/insert-event! (test-util/ds) "id-2" "DONE" (pr-str 42))
   (let [events (test-util/get-events (test-util/ds) "id-2")]
     (is (= ["STARTED" "DONE"] (mapv :state events)))
     (is (every? some? (map :changed_at events)) "changed_at is supplied by the db")
@@ -40,9 +40,9 @@
 
 (deftest latest-event-test
   (db/insert-workflow! (test-util/ds) "id-3" "test.ns/baz" (pr-str []) nil nil)
-  (db/insert-event! (test-util/ds) "id-3" "STARTED" nil)
+  (test-util/insert-event! (test-util/ds) "id-3" "STARTED" nil)
   (is (= "STARTED" (:state (db/latest-event (test-util/ds) "id-3"))))
-  (db/insert-event! (test-util/ds) "id-3" "ERROR" (pr-str {:message "x"}))
+  (test-util/insert-event! (test-util/ds) "id-3" "ERROR" (pr-str {:message "x"}))
   (is (= "ERROR" (:state (db/latest-event (test-util/ds) "id-3")))))
 
 (deftest find-by-wf-def-test
@@ -59,7 +59,7 @@
   (dotimes [n 10]
     (let [id (str "seek-" n)]
       (db/insert-workflow! (test-util/ds) id (str "test.ns/seek" n) (pr-str [n]) nil nil)
-      (db/insert-event! (test-util/ds) id "STARTED" nil)))
+      (test-util/insert-event! (test-util/ds) id "STARTED" nil)))
   (let [page1 (db/top-level-workflows (test-util/ds) {:limit 4})
         trimmed1 (vec (take 4 page1))
         cursor1 {:created-at (:created_at (last trimmed1)) :id (:id (last trimmed1))}
@@ -74,22 +74,26 @@
       (is (= 10 (count all-ids)) "all 10 rows covered across the 3 pages")
       (is (= 10 (count (distinct all-ids))) "no row repeated across page boundaries"))))
 
-(deftest pending-workflows-test
-  (db/insert-workflow! (test-util/ds) "id-5" "test.ns/pending" (pr-str []) nil nil)
-  (db/insert-event! (test-util/ds) "id-5" "STARTED" nil)
-  (db/insert-workflow! (test-util/ds) "id-6" "test.ns/done" (pr-str []) nil nil)
-  (db/insert-event! (test-util/ds) "id-6" "STARTED" nil)
-  (db/insert-event! (test-util/ds) "id-6" "DONE" (pr-str :ok))
-  (let [pending (db/pending-workflows (test-util/ds))]
-    (is (some #(= "id-5" (:id %)) pending))
-    (is (not (some #(= "id-6" (:id %)) pending)))))
-
 (deftest current-time-test
   (db/insert-workflow! (test-util/ds) "id-7" "test.ns/clock" (pr-str []) nil nil)
-  (db/insert-event! (test-util/ds) "id-7" "STARTED" nil)
+  (test-util/insert-event! (test-util/ds) "id-7" "STARTED" nil)
   (let [now (db/current-time (test-util/ds))
         changed-at (:changed_at (db/latest-event (test-util/ds) "id-7"))]
     (is (instance? java.time.LocalDateTime now))
     (is (instance? java.time.LocalDateTime changed-at))
     (is (not (.isAfter ^java.time.LocalDateTime changed-at now))
         "same clock as changed_at, so an event is never later than current-time")))
+
+(deftest append-event-test
+  (db/insert-workflow! (test-util/ds) "id-8" "test.ns/conditional" (pr-str []) nil nil)
+  (is (nil? (db/append-event! (test-util/ds) "id-8" 12345 "STARTED" nil))
+      "no events yet, so no latest event to match")
+  (let [started-id (db/append-event! (test-util/ds) "id-8" nil "STARTED" nil)]
+    (is (some? started-id))
+    (is (nil? (db/append-event! (test-util/ds) "id-8" nil "STARTED" nil))
+        "nil expects no events, but there is one now")
+    (let [done-id (db/append-event! (test-util/ds) "id-8" started-id "DONE" (pr-str :ok))]
+      (is (= done-id (:id (db/latest-event (test-util/ds) "id-8"))))
+      (is (nil? (db/append-event! (test-util/ds) "id-8" started-id "ERROR" nil))
+          "started-id is no longer the latest event")))
+  (is (= ["STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) "id-8")))))

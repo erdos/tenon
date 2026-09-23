@@ -17,7 +17,7 @@
 (deftest pending-endpoint-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/crashed" (pr-str [1 2]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/workflows/pending"))
           body (json/parse-string (:body response) true)]
       (is (= 200 (:status response)))
@@ -30,9 +30,9 @@
   (let [good-id (str (java.util.UUID/randomUUID))
         bad-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) good-id "test.ns/good" (pr-str [1 2]) nil nil)
-    (db/insert-event! (test-util/ds) good-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) good-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) bad-id "test.ns/bad" "(1 2" nil nil)
-    (db/insert-event! (test-util/ds) bad-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) bad-id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/workflows/pending"))
           body (json/parse-string (:body response) true)]
       (is (= 200 (:status response)))
@@ -64,8 +64,8 @@
 (deftest dashboard-lists-top-level-workflows-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/top" (pr-str [1]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "DONE" (pr-str :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/"))]
       (is (= 200 (:status response)))
       (is (re-find #"text/html" (get-in response [:headers "Content-Type"])))
@@ -76,9 +76,9 @@
   (let [parent-id (str (java.util.UUID/randomUUID))
         child-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) parent-id "test.ns/parent" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) parent-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) parent-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) child-id "test.ns/child" (pr-str []) parent-id nil)
-    (db/insert-event! (test-util/ds) child-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/"))]
       (is (re-find #"test\.ns/parent" (:body response)))
       (is (not (re-find #"test\.ns/child" (:body response)))))))
@@ -87,9 +87,9 @@
   (let [parent-id (str (java.util.UUID/randomUUID))
         child-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) parent-id "test.ns/parent4" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) parent-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) parent-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) child-id "test.ns/child4" (pr-str []) parent-id nil)
-    (db/insert-event! (test-util/ds) child-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/" {:all "1"}))
           body (:body response)]
       (is (re-find #"test\.ns/parent4" body))
@@ -102,10 +102,10 @@
   (let [done-id (str (java.util.UUID/randomUUID))
         pending-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) done-id "test.ns/done-wf" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) done-id "STARTED" nil)
-    (db/insert-event! (test-util/ds) done-id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) done-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) done-id "DONE" (pr-str :ok))
     (db/insert-workflow! (test-util/ds) pending-id "test.ns/pending-wf" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) pending-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) pending-id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/"))]
       (is (re-find #"test\.ns/done-wf" (:body response)))
       (is (re-find #"test\.ns/pending-wf" (:body response)))
@@ -115,10 +115,10 @@
   (let [done-id (str (java.util.UUID/randomUUID))
         pending-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) done-id "test.ns/done-wf2" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) done-id "STARTED" nil)
-    (db/insert-event! (test-util/ds) done-id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) done-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) done-id "DONE" (pr-str :ok))
     (db/insert-workflow! (test-util/ds) pending-id "test.ns/pending-wf2" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) pending-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) pending-id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/" {:state "DONE"}))]
       (is (re-find (re-pattern (str "/workflows/" done-id)) (:body response)))
       (is (not (re-find (re-pattern (str "/workflows/" pending-id)) (:body response)))
@@ -129,9 +129,9 @@
   (let [a-id (str (java.util.UUID/randomUUID))
         b-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) a-id "test.ns/name-a" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) a-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) a-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) b-id "test.ns/name-b" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) b-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) b-id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/" {:wf_def "test.ns/name-a"}))]
       (is (re-find (re-pattern (str "/workflows/" a-id)) (:body response)))
       (is (not (re-find (re-pattern (str "/workflows/" b-id)) (:body response))))
@@ -143,7 +143,7 @@
   (dotimes [i n]
     (let [id (str prefix "-" i)]
       (db/insert-workflow! (test-util/ds) id (str "test.ns/" prefix i) (pr-str [i]) nil nil)
-      (db/insert-event! (test-util/ds) id "STARTED" nil))))
+      (test-util/insert-event! (test-util/ds) id "STARTED" nil))))
 
 (deftest dashboard-defaults-to-page-size-100-with-no-next-page-link-for-small-result-sets-test
   (insert-n-workflows! 5 "small")
@@ -172,8 +172,8 @@
 (deftest workflow-detail-page-shows-arguments-and-result-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/detail" (pr-str [1 2]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "DONE" (pr-str 42))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "DONE" (pr-str 42))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))]
       (is (= 200 (:status response)))
       (is (re-find #"\[1 2\]" (:body response)))
@@ -182,7 +182,7 @@
 (deftest workflow-detail-page-id-line-is-a-real-link-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/id-link" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id))))]
       (is (re-find (re-pattern (str "<b>Id: </b><a href=\"/workflows/" id "\""))
                    body))
@@ -192,9 +192,9 @@
   (let [parent-id (str (java.util.UUID/randomUUID))
         child-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) parent-id "test.ns/parent-link" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) parent-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) parent-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) child-id "test.ns/child-link" (pr-str []) parent-id nil)
-    (db/insert-event! (test-util/ds) child-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" child-id))))]
       (is (re-find #"<b>Parent: </b>" body))
       (is (re-find (re-pattern (str "href=\"/workflows/" parent-id "\"")) body)))))
@@ -202,14 +202,14 @@
 (deftest workflow-detail-page-hides-parent-link-for-top-level-workflow-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/top-level-no-parent" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id))))]
       (is (not (re-find #"<b>Parent: </b>" body))))))
 
 (deftest workflow-detail-page-shows-metadata-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/with-meta" (pr-str [1 2]) nil (pr-str {:actor-id 42}))
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))]
       (is (re-find #"<h2>Metadata</h2>" (:body response)))
       (is (re-find #"actor-id 42" (:body response))))))
@@ -217,15 +217,15 @@
 (deftest workflow-detail-page-hides-metadata-section-when-absent-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/no-meta" (pr-str [1 2]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))]
       (is (not (re-find #"<h2>Metadata</h2>" (:body response)))))))
 
 (deftest workflow-detail-page-shows-error-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/failed" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))]
       (is (= 200 (:status response)))
       (is (re-find #"boom" (:body response))))))
@@ -235,10 +235,10 @@
   ;; timeline must show every one of them, in order, not just the latest.
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/timeline" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "ERROR" (pr-str {:message "first failure" :class "clojure.lang.ExceptionInfo" :data nil}))
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "DONE" (pr-str :recovered))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "ERROR" (pr-str {:message "first failure" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "DONE" (pr-str :recovered))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))
           events (test-util/get-events (test-util/ds) id)]
       (is (= 4 (count events)))
@@ -255,14 +255,14 @@
         child-id (str (java.util.UUID/randomUUID))
         grandchild-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) parent-id "test.ns/parent2" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) parent-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) parent-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) child-id "test.ns/child2" (pr-str []) parent-id nil)
-    (db/insert-event! (test-util/ds) child-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) grandchild-id "test.ns/grandchild2" (pr-str []) child-id nil)
-    (db/insert-event! (test-util/ds) grandchild-id "STARTED" nil)
-    (db/insert-event! (test-util/ds) grandchild-id "DONE" (pr-str :ok))
-    (db/insert-event! (test-util/ds) child-id "DONE" (pr-str :ok))
-    (db/insert-event! (test-util/ds) parent-id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) grandchild-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) grandchild-id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) child-id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) parent-id "DONE" (pr-str :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent-id)))
           body (:body response)
           timeline (db/full-timeline (test-util/ds) parent-id)]
@@ -282,10 +282,10 @@
   (let [parent-id (str (java.util.UUID/randomUUID))
         child-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) parent-id "test.ns/hoverable" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) parent-id "STARTED" nil)
-    (db/insert-event! (test-util/ds) parent-id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) parent-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) parent-id "DONE" (pr-str :ok))
     (db/insert-workflow! (test-util/ds) child-id "test.ns/hoverable-child" (pr-str []) parent-id nil)
-    (db/insert-event! (test-util/ds) child-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent-id))))]
       (is (= 2 (count (re-seq (re-pattern (str "data-tenon-wf-id=\"" parent-id "\"")) body)))
           "both of the parent's own events carry its id")
@@ -298,11 +298,11 @@
         child-id (str (java.util.UUID/randomUUID))
         grandchild-id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) parent-id "test.ns/parent3" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) parent-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) parent-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) child-id "test.ns/child3" (pr-str []) parent-id nil)
-    (db/insert-event! (test-util/ds) child-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
     (db/insert-workflow! (test-util/ds) grandchild-id "test.ns/grandchild3" (pr-str []) child-id nil)
-    (db/insert-event! (test-util/ds) grandchild-id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) grandchild-id "STARTED" nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent-id))))]
       (is (re-find (re-pattern (str ">" "<code>test\\.ns/parent3</code>")) body)
           "depth 0 - no leading padding")
@@ -328,15 +328,15 @@
   ;; check for the absence of the <button> itself, not that substring.
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/still-running" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id))))]
       (is (not (re-find #"<button" body))))))
 
 (deftest workflow-detail-page-hides-restart-button-when-wf-def-unregistered-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/never-registered-anywhere" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "DONE" (pr-str :ok))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "DONE" (pr-str :ok))
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id))))]
       (is (not (re-find #"<button" body))))))
 
@@ -362,7 +362,7 @@
     (is (re-find #"<h1>Workflows</h1>" (:body (app (mock/request :get "/tenon")))))
     (let [id (str (java.util.UUID/randomUUID))]
       (db/insert-workflow! (test-util/ds) id "test.ns/prefixed" (pr-str []) nil nil)
-      (db/insert-event! (test-util/ds) id "STARTED" nil)
+      (test-util/insert-event! (test-util/ds) id "STARTED" nil)
       (let [body (:body (app (mock/request :get "/tenon/workflows/pending")))]
         (is (some #(= id (:id %)) (json/parse-string body true)))))))
 
@@ -371,7 +371,7 @@
         app (wrapped-app "/tenon" original)
         id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/prefixed-link" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (let [dashboard-body (:body (app (mock/request :get "/tenon")))
           detail-body (:body (app (mock/request :get (str "/tenon/workflows/" id))))]
       (is (re-find (re-pattern (str "href=\"/tenon/workflows/" id "\"")) dashboard-body))

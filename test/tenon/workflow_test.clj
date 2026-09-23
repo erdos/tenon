@@ -70,8 +70,14 @@
 (deftest list-pending-test
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/crashed" (pr-str [1]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (is (some #(= id (:id %)) (engine/list-pending)))
+    (is (= (pr-str [1]) (:arguments (first (filter #(= id (:id %)) (engine/list-pending)))))
+        "pending rows carry their arguments")
+    (let [child-id (str (java.util.UUID/randomUUID))]
+      (db/insert-workflow! (test-util/ds) child-id "test.ns/crashed-child" (pr-str [2]) id nil)
+      (test-util/insert-event! (test-util/ds) child-id "STARTED" nil)
+      (is (some #(= child-id (:id %)) (engine/list-pending)) "nested workflows are listed too"))
     (engine/run-invocation #'finished-fn finished-fn [])
     (is (not (some #(= "tenon.workflow-test/finished-fn" (:wf_def %)) (engine/list-pending))))))
 
@@ -107,10 +113,12 @@
   (let [calls (atom [])
         side-effect-ran (atom false)
         f (fn [] (reset! side-effect-ran true) :ok)]
-    (with-redefs [db/insert-event! (fn [_ds _workflow-id state _payload]
-                                      (swap! calls conj state)
-                                      (when (= state "DONE")
-                                        (throw (ex-info "db down while recording DONE" {}))))]
+    (with-redefs [db/append-event! (let [real-append-event! db/append-event!]
+                                     (fn [ds workflow-id expected-id state payload]
+                                       (swap! calls conj state)
+                                       (if (= state "DONE")
+                                         (throw (ex-info "db down while recording DONE" {}))
+                                         (real-append-event! ds workflow-id expected-id state payload))))]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"db down while recording DONE"
             (engine/run-invocation #'done-record-fails-fn f []))))
     (is (true? @side-effect-ran) "the underlying fn ran and succeeded")
@@ -167,10 +175,10 @@
         args-str (pr-str [42])
         id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id wf-def args-str nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (future
       (Thread/sleep 50)
-      (db/insert-event! (test-util/ds) id "DONE" (pr-str :polled-result)))
+      (test-util/insert-event! (test-util/ds) id "DONE" (pr-str :polled-result)))
     (let [calls (atom 0)
           result (engine/run-invocation #'dedup-started-fn
                                          (fn [n] (swap! calls inc) n)
@@ -193,8 +201,8 @@
     (with-redefs [db/insert-workflow!
                   (fn [ds id wf-def args-str parent-id meta-str]
                     (real-insert-workflow! ds winner-id wf-def args-str parent-id meta-str)
-                    (db/insert-event! ds winner-id "STARTED" nil)
-                    (db/insert-event! ds winner-id "DONE" (pr-str :winner-result))
+                    (test-util/insert-event! ds winner-id "STARTED" nil)
+                    (test-util/insert-event! ds winner-id "DONE" (pr-str :winner-result))
                     (real-insert-workflow! ds id wf-def args-str parent-id meta-str))]
       (let [result (engine/run-invocation #'dedup-fn
                                            (fn [x] (swap! calls inc) (* x 10))
@@ -206,12 +214,12 @@
   (is (thrown? clojure.lang.ExceptionInfo (engine/restart-invocation "does-not-exist")))
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/pending-only" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (is (thrown? clojure.lang.ExceptionInfo (engine/restart-invocation id))))
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "test.ns/never-registered" (pr-str []) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
-    (db/insert-event! (test-util/ds) id "DONE" (pr-str nil))
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "DONE" (pr-str nil))
     (is (thrown? clojure.lang.ExceptionInfo (engine/restart-invocation id)))))
 
 (deftest register-and-lookup-test
@@ -243,7 +251,7 @@
   (let [id (str (java.util.UUID/randomUUID))
         calls (atom 0)]
     (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/dedup-started-fn" (pr-str [5]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (test-util/backdate-events! (test-util/ds) id)
     (let [e (is (thrown? clojure.lang.ExceptionInfo
                   (engine/run-invocation #'dedup-started-fn (fn [n] (swap! calls inc) n) [5])))]
@@ -259,7 +267,7 @@
   (binding [engine/*workflow-engine* (assoc engine/*workflow-engine* :tenon/timeout-ms 2000)]
     (let [id (str (java.util.UUID/randomUUID))]
       (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/dedup-started-fn" (pr-str [7]) nil nil)
-      (db/insert-event! (test-util/ds) id "STARTED" nil)
+      (test-util/insert-event! (test-util/ds) id "STARTED" nil)
       (Thread/sleep 1500)
       (let [t0 (System/nanoTime)]
         (is (thrown? clojure.lang.ExceptionInfo
@@ -271,7 +279,7 @@
   (engine/register! #'echo-fn echo-fn)
   (let [id (str (java.util.UUID/randomUUID))]
     (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/echo-fn" (pr-str [2]) nil nil)
-    (db/insert-event! (test-util/ds) id "STARTED" nil)
+    (test-util/insert-event! (test-util/ds) id "STARTED" nil)
     (test-util/backdate-events! (test-util/ds) id)
     (is (= 2 (engine/restart-invocation id)))
     (is (= ["STARTED" "ERROR" "STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) id))))))
@@ -282,9 +290,51 @@
   (binding [engine/*workflow-engine* (assoc engine/*workflow-engine* :tenon/timeout-ms nil)]
     (let [id (str (java.util.UUID/randomUUID))]
       (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/dedup-started-fn" (pr-str [6]) nil nil)
-      (db/insert-event! (test-util/ds) id "STARTED" nil)
+      (test-util/insert-event! (test-util/ds) id "STARTED" nil)
       (test-util/backdate-events! (test-util/ds) id)
       (future
         (Thread/sleep 300)
-        (db/insert-event! (test-util/ds) id "DONE" (pr-str :late-result)))
+        (test-util/insert-event! (test-util/ds) id "DONE" (pr-str :late-result)))
       (is (= :late-result (engine/run-invocation #'dedup-started-fn dedup-started-fn [6]))))))
+
+(deftest concurrent-restart-runs-function-once-test
+  ;; Two restarts that both passed the DONE/ERROR precondition check before
+  ;; either recorded STARTED: only one may run the function. Simulated
+  ;; deterministically by making the second restart's check see the stale
+  ;; latest event from before the first restart started.
+  (let [calls (atom 0)
+        running (promise)
+        release (promise)
+        blocking-fn (fn [x] (swap! calls inc) (deliver running true) @release x)]
+    (engine/register! #'echo-fn blocking-fn)
+    (let [id (str (java.util.UUID/randomUUID))]
+      (db/insert-workflow! (test-util/ds) id "tenon.workflow-test/echo-fn" (pr-str [4]) nil nil)
+      (test-util/insert-event! (test-util/ds) id "STARTED" nil)
+      (test-util/insert-event! (test-util/ds) id "DONE" (pr-str 4))
+      (let [stale-latest (db/latest-event (test-util/ds) id)
+            first-restart (future (engine/restart-invocation id))]
+        @running
+        (let [e (with-redefs [db/latest-event (fn [_ _] stale-latest)]
+                  (is (thrown? clojure.lang.ExceptionInfo (engine/restart-invocation id))))]
+          (is (= ::engine/precondition-failed (:type (ex-data e)))))
+        (deliver release true)
+        (is (= 4 @first-restart))
+        (is (= 1 @calls))
+        (is (= ["STARTED" "DONE" "STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) id))))))))
+
+(deftest late-finish-after-timeout-keeps-timeout-test
+  ;; An invocation timed out while still running: when it finally finishes,
+  ;; its DONE must not overwrite the recorded timeout - but its own caller
+  ;; still gets the result.
+  (let [running (promise)
+        release (promise)
+        f (fn [x] (deliver running true) @release x)
+        caller (future (engine/run-invocation #'echo-fn f [8]))]
+    @running
+    (let [id (:id (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow-test/echo-fn")))]
+      (test-util/backdate-events! (test-util/ds) id)
+      (is (thrown? clojure.lang.ExceptionInfo (engine/run-invocation #'echo-fn f [8]))
+          "a waiter times it out")
+      (deliver release true)
+      (is (= 8 @caller))
+      (is (= ["STARTED" "ERROR"] (mapv :state (test-util/get-events (test-util/ds) id)))))))

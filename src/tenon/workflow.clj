@@ -94,15 +94,20 @@
    nil (the default) stores nothing."
   nil)
 
-(defn- execute-and-record! [ds workflow-id raw-fn args]
-  (db/insert-event! ds workflow-id "STARTED" nil)
+(defn- execute-and-record!
+  "Runs raw-fn with args for workflow-id, whose STARTED event (with id
+   started-event-id) the caller has already recorded, and records how it
+   ended - unless it was timed out meanwhile, in which case the timeout's
+   ERROR stays its recorded outcome, and only this caller gets the result
+   (or exception)."
+  [ds workflow-id started-event-id raw-fn args]
   (let [result (try
                  (binding [*invocation-stack* (conj *invocation-stack* workflow-id)]
                    (apply raw-fn args))
                  (catch Throwable e
-                   (db/insert-event! ds workflow-id "ERROR" (serialize-exception e))
+                   (db/append-event! ds workflow-id started-event-id "ERROR" (serialize-exception e))
                    (throw e)))]
-    (db/insert-event! ds workflow-id "DONE" (safe-pr-str result))
+    (db/append-event! ds workflow-id started-event-id "DONE" (safe-pr-str result))
     result))
 
 (defn- time-out-if-expired! [ds workflow-id latest-ev timeout-ms]
@@ -110,12 +115,11 @@
              (= "STARTED" (:state latest-ev))
              (.isAfter ^LocalDateTime (db/current-time ds)
                        (.plus ^LocalDateTime (:changed_at latest-ev) (Duration/ofMillis timeout-ms))))
-    (db/insert-event! ds workflow-id "ERROR"
-                      (safe-pr-str {:message (str "Timed out: still running " timeout-ms
-                                                  " ms after it started")
-                                    :class (str `timed-out)
-                                    :data {:type ::timed-out :timeout-ms timeout-ms}}))
-    true))
+    (some? (db/append-event! ds workflow-id (:id latest-ev) "ERROR"
+                             (safe-pr-str {:message (str "Timed out: still running " timeout-ms
+                                                         " ms after it started")
+                                           :class (str `timed-out)
+                                           :data {:type ::timed-out :timeout-ms timeout-ms}})))))
 
 (defn- await-existing-result [ds workflow-id timeout-ms]
   (loop [wait-ms 5]
@@ -150,7 +154,8 @@
              meta-str (when (some? *workflow-meta*) (safe-pr-str *workflow-meta*))
              inserted-id (db/insert-workflow! ds id wf-def-str args-str parent-id meta-str)]
          (if inserted-id
-           (execute-and-record! ds inserted-id raw-fn args)
+           (execute-and-record! ds inserted-id (db/append-event! ds inserted-id nil "STARTED" nil)
+                                raw-fn args)
            (if-let [existing (db/find-by-wf-def-and-arguments ds wf-def-str args-str)]
              (await-existing-result ds (:id existing) timeout-ms)
              (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
@@ -159,7 +164,7 @@
 
 (defn list-pending
   ([] (list-pending *workflow-engine*))
-  ([engine] (db/pending-workflows (:tenon/db engine))))
+  ([engine] (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})))
 
 
 (defn restart-invocation
@@ -178,12 +183,14 @@
          latest (let [ev (db/latest-event ds workflow-id)]
                   (if (time-out-if-expired! ds workflow-id ev (:tenon/timeout-ms engine default-timeout-ms))
                     (db/latest-event ds workflow-id)
-                    ev))]
+                    ev))
+         not-restartable (fn [latest-state]
+                           (ex-info "Cannot restart: latest event is not DONE or ERROR"
+                                    {:type ::precondition-failed
+                                     :workflow-id workflow-id
+                                     :latest-state latest-state}))]
      (when-not (contains? #{"DONE" "ERROR"} (:state latest))
-       (throw (ex-info "Cannot restart: latest event is not DONE or ERROR"
-                        {:type ::precondition-failed
-                         :workflow-id workflow-id
-                         :latest-state (:state latest)})))
+       (throw (not-restartable (:state latest))))
      (let [wf-def-sym (symbol (:wf_def wf))
            v (or (lookup wf-def-sym)
                  (throw (ex-info "wf_def not registered in this process"
@@ -191,7 +198,12 @@
                                    :wf-def (str wf-def-sym)})))
            impl (raw-fn v)
            args (edn/read-string (:arguments wf))]
-       (execute-and-record! ds workflow-id impl args)))))
+       ;; A concurrent restart may have started the invocation since latest
+       ;; was read - appending only if latest is still the latest event lets
+       ;; only one of them through.
+       (if-let [started-event-id (db/append-event! ds workflow-id (:id latest) "STARTED" nil)]
+         (execute-and-record! ds workflow-id started-event-id impl args)
+         (throw (not-restartable (:state (db/latest-event ds workflow-id)))))))))
 
 
 (defn workflow
