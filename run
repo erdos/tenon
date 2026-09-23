@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+set -e
+
+REPO_DIR="$( cd "$( dirname -- "$0" )" && pwd )"
+cd "$REPO_DIR"
+
+case "$1" in
+
+  r|repl)
+    shift
+    clj -M:test "$@"
+    ;;
+
+  t|test|tests)
+    shift
+    clojure -M:test -m cognitect.test-runner -d test -d http/test "$@"
+    ;;
+
+  deps|download)
+    echo "Downloading main deps..."
+    clojure -P
+    echo "Downloading :test alias deps..."
+    clojure -P -M:test
+    ;;
+
+  setup)
+    curl -L -O https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+    chmod +x linux-install.sh
+    sudo ./linux-install.sh
+    rm ./linux-install.sh
+    ;;
+
+  c|clean)
+    echo "Dropping .cpcache."
+    rm -Rf ./.cpcache ./http/.cpcache
+    echo "Dropping ._ junk files."
+    find . -name "._*" -delete
+    ;;
+
+  *)
+    echo "Usage: $0 {r|repl|t|test|tests|deps|download|setup|c|clean}"
+    echo ""
+    echo "Commands:"
+    echo "  r, repl          Start the interactive REPL"
+    echo "  t, test, tests   Run tests (passes extra args to test runner)"
+    echo "  deps, download   Download project + test dependencies"
+    echo "  setup            Install the Clojure CLI tools"
+    echo "  c, clean         Clean build/cache artifacts"
+    exit 1
+    ;;
+esac

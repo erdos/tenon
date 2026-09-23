@@ -1,0 +1,87 @@
+(ns tenon.workflow.reader-test
+  (:require [clojure.test :refer [deftest is use-fixtures]]
+            [clojure.edn :as edn]
+            [tenon.workflow.fixtures :as fixtures]
+            [tenon.workflow :as engine]
+            [tenon.workflow.db :as db]
+            [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
+
+(use-fixtures :each temp-db-fixture)
+
+(deftest tagged-defn-registers-and-audits-test
+  (is (some? (engine/lookup 'tenon.workflow.fixtures/add-numbers)))
+  (is (= 7 (fixtures/add-numbers 3 4)))
+  (let [wf (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/add-numbers"))
+        events (test-util/get-events (test-util/ds) (:id wf))]
+    (is (= [3 4] (edn/read-string (:arguments wf))))
+    (is (= ["STARTED" "DONE"] (mapv :state events)))
+    (is (= 7 (edn/read-string (:payload (last events)))))))
+
+(deftest tagged-defn-error-path-test
+  (is (thrown? clojure.lang.ExceptionInfo (fixtures/boom "kaboom")))
+  (let [wf (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/boom"))
+        events (test-util/get-events (test-util/ds) (:id wf))]
+    (is (= ["STARTED" "ERROR"] (mapv :state events)))
+    (is (= "kaboom" (:message (edn/read-string (:payload (last events))))))))
+
+(deftest tagged-defn-with-docstring-test
+  (is (= 12 (fixtures/with-docstring 3 4)))
+  (let [wf (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/with-docstring"))
+        events (test-util/get-events (test-util/ds) (:id wf))]
+    (is (= [3 4] (edn/read-string (:arguments wf))))
+    (is (= ["STARTED" "DONE"] (mapv :state events)))
+    (is (= 12 (edn/read-string (:payload (last events)))))))
+
+(deftest tagged-defn-restart-via-reader-path-test
+  ;; Exercises the real user-facing path end to end: #workflow tag ->
+  ;; engine/register! -> wf_def stored as a string -> restart-invocation
+  ;; parses that string back into a symbol -> engine/lookup -> re-run.
+  (reset! fixtures/retryable-should-fail? true)
+  (is (thrown? clojure.lang.ExceptionInfo (fixtures/retryable 1)))
+  (let [wf (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/retryable"))
+        id (:id wf)]
+    (is (= "ERROR" (:state (db/latest-event (test-util/ds) id))))
+    (reset! fixtures/retryable-should-fail? false)
+    (let [result (engine/restart-invocation id)]
+      (is (= :recovered result))
+      (is (= ["STARTED" "ERROR" "STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) id)))))))
+
+(deftest tagged-defn-nested-invocation-records-parent-test
+  ;; nested-parent calls nested-child from within its own body (both real
+  ;; #workflow defns) - nested-child's row must record nested-parent's id
+  ;; as parent_workflow_id, via *invocation-stack*, with neither fn passing
+  ;; anything explicitly.
+  (is (= 11 (fixtures/nested-parent 5)))
+  (let [parent-wf (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/nested-parent"))
+        child-wf (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/nested-child"))]
+    (is (nil? (:parent_workflow_id parent-wf)))
+    (is (= (:id parent-wf) (:parent_workflow_id child-wf)))))
+
+(deftest tagged-defn-fibonacci-test
+  (is (= 55 (fixtures/fibonacci 10)))
+  ;; find-by-wf-def-and-arguments, not find-by-wf-def - fibonacci's own
+  ;; recursive calls are audited too now (see the dedup test below), so
+  ;; several rows share this wf_def; only this exact-args lookup is
+  ;; guaranteed to be the outermost n=10 call.
+  (let [wf (db/find-by-wf-def-and-arguments (test-util/ds) "tenon.workflow.fixtures/fibonacci" (pr-str [10]))
+        events (test-util/get-events (test-util/ds) (:id wf))]
+    (is (= [10] (edn/read-string (:arguments wf))))
+    (is (= ["STARTED" "DONE"] (mapv :state events)))
+    (is (= 55 (edn/read-string (:payload (last events)))))))
+
+(deftest tagged-defn-fibonacci-recursive-calls-are-audited-and-deduped-test
+  ;; fibonacci's own recursive calls now go through run-invocation too (not
+  ;; just the outermost call) - and since run-invocation dedups by
+  ;; (wf_def, arguments), every repeated (fibonacci k) across the naive,
+  ;; unmemoized call tree collapses onto one row per distinct k. Naive
+  ;; fib(10)'s call tree touches every k from 0 to 10, so exactly 11 rows
+  ;; should exist - proof the recursion is both audited and memoized for
+  ;; free by the existing dedup machinery.
+  (is (= 55 (fixtures/fibonacci 10)))
+  (let [rows (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.fixtures/fibonacci")
+        arg-of (fn [row] (first (edn/read-string (:arguments row))))]
+    (is (= 11 (count rows)))
+    (is (= (set (range 11)) (set (map arg-of rows))))
+    (doseq [row rows]
+      (is (= ["STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) (:id row))))
+          (str "row for n=" (arg-of row) " ran to completion exactly once")))))

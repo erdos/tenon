@@ -1,0 +1,19 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clojure tools
+        uses: DeLaGuardo/setup-clojure@13
+        with:
+          cli: latest
+      - name: Run tests
+        run: ./run t

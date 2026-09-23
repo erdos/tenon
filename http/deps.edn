@@ -1,0 +1,15 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        tenon/tenon {:local/root ".."}
+        ring/ring-core {:mvn/version "1.13.0"}
+        ring/ring-json {:mvn/version "0.5.1"}
+        cheshire/cheshire {:mvn/version "5.13.0"}
+        hiccup/hiccup {:mvn/version "2.0.0-RC5"}}
+ :aliases
+ {:test {:extra-paths ["test" "../test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      ring/ring-mock {:mvn/version "0.4.0"}
+                      ring/ring-jetty-adapter {:mvn/version "1.13.0"}
+                      ring/ring-devel {:mvn/version "1.13.0"}}
+         :main-opts ["-m" "cognitect.test-runner" "-d" "test"]}}}
