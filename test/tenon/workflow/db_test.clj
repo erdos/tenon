@@ -102,8 +102,8 @@
 
 (deftest history-requires-existing-workflow-test
   (is (thrown? Exception
-        (jdbc/execute! (test-util/ds) ["INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at, state_seq)
-                                        VALUES (x'00', 1, 'DONE', 0, 0)"]))
+        (jdbc/execute! (test-util/ds) ["INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at)
+                                        VALUES (x'00', 1, 'DONE', 0)"]))
       "foreign keys are enforced"))
 
 (deftest top-level-workflows-seek-pagination-test
@@ -180,12 +180,12 @@
     (db/finish! (test-util/ds) child "DONE" (pr-str 1))
     (db/record-reuse! (test-util/ds) child parent (pr-str {:actor-id 7}))
     (is (= [[child "STARTED" nil nil]
-            [child "REUSED" (pr-str {:actor-id 7}) parent]
-            [child "DONE" (pr-str 1) nil]]
+            [child "DONE" (pr-str 1) nil]
+            [child "REUSED" (pr-str {:actor-id 7}) parent]]
            (mapv (juxt :invocation_id :state :data :parent_invocation_id)
                  (test-util/history (test-util/ds) child))))
     (is (= "DONE" (:state (db/get-workflow (test-util/ds) child)))
-        "the workflow row itself is untouched - still the current state, listed last")))
+        "the workflow row itself is untouched - still the current state")))
 
 (deftest record-reuse-accepts-past-invocation-id-test
   ;; The served invocation may have been restarted between reading its
@@ -195,7 +195,7 @@
     (db/restart! (test-util/ds) child nil nil)
     (db/record-reuse! (test-util/ds) child nil nil)
     (is (= [child "REUSED"]
-           ((juxt :invocation_id :state) (last (butlast (test-util/history (test-util/ds) child))))))))
+           ((juxt :invocation_id :state) (last (test-util/history (test-util/ds) child)))))))
 
 (deftest full-timeline-includes-reused-children-test
   (let [parent1 (test-util/insert! "test.ns/rt-parent1")

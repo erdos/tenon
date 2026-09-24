@@ -17,25 +17,18 @@
   (:tenon/db engine/*workflow-engine*))
 
 (defn history
-  "Every state - past ones from workflow_history, then the current one - of
-   the workflow invocation-id belongs to, oldest first. Test-only - the
-   library reads it only as part of db/full-timeline."
+  "Every state - the current one included - of the workflow invocation-id
+   belongs to, oldest first, straight from workflow_history. Test-only -
+   the library reads it only as part of db/full-timeline."
   [ds invocation-id]
-  (let [current-id (:invocation_id (db/get-workflow ds invocation-id))]
-    (jdbc/execute! ds ["SELECT h.id, h.wf_invocation_id AS invocation_id,
-                             h.state, h.state_changed_at, h.data, h.parent_invocation_id
-                        FROM workflow_history h
-                        JOIN workflow w ON w.idempotence_key = h.idempotence_key
-                       WHERE w.invocation_id = ?
-                      UNION ALL
-                      SELECT NULL, invocation_id, state, state_changed_at,
-                             CASE state WHEN 'STARTED' THEN metadata ELSE result END,
-                             parent_invocation_id
-                        FROM workflow
-                       WHERE invocation_id = ?
-                      ORDER BY id NULLS LAST"
-                     current-id current-id]
-                   {:builder-fn rs/as-unqualified-lower-maps})))
+  (jdbc/execute! ds ["SELECT h.id, h.wf_invocation_id AS invocation_id,
+                           h.state, h.state_changed_at, h.data, h.parent_invocation_id
+                      FROM workflow_history h
+                      JOIN workflow w ON w.idempotence_key = h.idempotence_key
+                     WHERE w.invocation_id = ?
+                     ORDER BY h.id"
+                     (:invocation_id (db/get-workflow ds invocation-id))]
+                 {:builder-fn rs/as-unqualified-lower-maps}))
 
 (defn timeline
   "The states of the workflow invocation-id belongs to - not those of its

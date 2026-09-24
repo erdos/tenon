@@ -4,8 +4,9 @@
    Every workflow is a single row of the workflow table holding its current
    state. Rows are only ever INSERTed or UPDATEd with compare-and-set
    semantics - on (invocation_id, state), where invocation_id changes on
-   every restart - and a trigger copies each replaced state into
-   workflow_history. The only history row written directly is REUSED
+   every restart - and triggers log each state into workflow_history as it
+   is entered, so history ids order every state of every workflow. The
+   only history row written directly is REUSED
    (record-reuse!): a caller got an earlier invocation's result instead of
    running it. Every history row carries the parent_invocation_id it was
    recorded under - for REUSED rows, the reusing caller's.
@@ -88,7 +89,7 @@
      workflow regardless of nesting.")
 
   (full-timeline [this invocation-id]
-    "Every state (past ones from workflow_history and the current one) of
+    "Every state (from workflow_history, the current one included) of
      the workflow invocation-id belongs to and of every workflow nested
      under any of its invocations at any depth, interleaved into a single
      chronological sequence. Each row carries invocation_id (the
