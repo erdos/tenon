@@ -27,6 +27,7 @@
     "ERROR" [:span.chip.state-ERROR chip-attrs "Error"]
     "STARTED" [:span.chip.state-STARTED chip-attrs "Started"]
     "DONE" [:span.chip.state-DONE chip-attrs "Done"]
+    "REUSED" [:span.chip.state-REUSED chip-attrs "Reused"]
     [:span (str state)]))
 
 (def page-style
@@ -37,6 +38,7 @@
    tr.state-DONE span.chip {background:#ccf6cc; border-radius:4px}
    tr.state-STARTED{background:#fdf6c9}
    tr.state-ERROR{background:#f7d4d4}
+   tr.state-REUSED{background:#dde8f7}
    tr:hover{filter:brightness(0.95)}
    tr.tenon-hl{outline:2px solid #333}
    a{color:inherit;text-decoration:none}

@@ -5,7 +5,10 @@
    state. Rows are only ever INSERTed or UPDATEd with compare-and-set
    semantics - on (invocation_id, state), where invocation_id changes on
    every restart - and a trigger copies each replaced state into
-   workflow_history, so no method here writes the history directly.
+   workflow_history. The only history row written directly is REUSED
+   (record-reuse!): a caller got an earlier invocation's result instead of
+   running it. Every history row carries the parent_invocation_id it was
+   recorded under - for REUSED rows, the reusing caller's.
 
    Timestamps are UTC milliseconds since the epoch, supplied by the
    storage's own clock - never the JVM's, so they can be compared without
@@ -38,6 +41,13 @@
      leasing it for timeout-ms (nil: never expires). Returns the new
      invocation_id, or nil if invocation-id is no longer DONE or ERROR
      (e.g. a concurrent restart got there first).")
+
+  (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
+    "Logs that a caller running under parent-invocation-id (nil: top-level)
+     with metadata-edn-str got the stored result (or failure) of
+     invocation-id instead of running it again: appends a REUSED row to the
+     history of the workflow invocation-id belongs to - which may also be
+     an earlier invocation_id of it - without changing the workflow row.")
 
   (get-workflow [this invocation-id]
     "The workflow row invocation-id belongs to, or nil. invocation-id may
@@ -82,6 +92,7 @@
      under any of its invocations at any depth, interleaved into a single
      chronological sequence. Each row carries invocation_id (the
      invocation it was recorded under), current_invocation_id, wf_def,
-     state, state_changed_at, data (metadata for STARTED, the result
-     otherwise) and depth (0 for the workflow itself, 1 for a direct
-     sub-workflow, and so on)."))
+     state, state_changed_at, data (metadata for STARTED and REUSED, the
+     result otherwise) and depth (0 for the workflow itself, 1 for a direct
+     sub-workflow, and so on). A workflow whose result an invocation reused
+     counts as its sub-workflow too, with its whole history included."))

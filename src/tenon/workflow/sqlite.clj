@@ -54,20 +54,25 @@
       wf_invocation_id INTEGER NOT NULL,
       state            TEXT    NOT NULL,
       state_changed_at INTEGER NOT NULL,
-      data             TEXT
+      data             TEXT,
+      parent_invocation_id INTEGER
     ) STRICT"
    "CREATE INDEX IF NOT EXISTS idx_workflow_history_key
       ON workflow_history(idempotence_key, id)"
    "CREATE INDEX IF NOT EXISTS idx_workflow_history_invocation
       ON workflow_history(wf_invocation_id)"
+   "CREATE INDEX IF NOT EXISTS idx_workflow_history_parent
+      ON workflow_history(parent_invocation_id) WHERE parent_invocation_id IS NOT NULL"
    ;; Logs the replaced state - lease-only updates (neither state nor
    ;; invocation_id changes) are not state changes.
    "CREATE TRIGGER IF NOT EXISTS workflow_log_history AFTER UPDATE ON workflow
     WHEN OLD.state IS NOT NEW.state OR OLD.invocation_id IS NOT NEW.invocation_id
     BEGIN
-      INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at, data)
+      INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at, data,
+                                    parent_invocation_id)
       VALUES (OLD.idempotence_key, OLD.invocation_id, OLD.state, OLD.state_changed_at,
-              CASE OLD.state WHEN 'STARTED' THEN OLD.metadata ELSE OLD.result END);
+              CASE OLD.state WHEN 'STARTED' THEN OLD.metadata ELSE OLD.result END,
+              OLD.parent_invocation_id);
     END"
    ;; AUTOINCREMENT only advances sqlite_sequence on INSERT - without this,
    ;; an invocation_id assigned by a restart could be handed out again.
@@ -78,12 +83,19 @@
     END"
    "CREATE VIEW IF NOT EXISTS workflow_full_history AS
       SELECT id, idempotence_key, wf_invocation_id AS invocation_id,
-             state, state_changed_at, data
+             state, state_changed_at, data, parent_invocation_id
         FROM workflow_history
       UNION ALL
       SELECT NULL, idempotence_key, invocation_id, state, state_changed_at,
-             CASE state WHEN 'STARTED' THEN metadata ELSE result END
+             CASE state WHEN 'STARTED' THEN metadata ELSE result END, parent_invocation_id
         FROM workflow"])
+
+(def ^:private key-of-invocation
+  "SQL expression for the idempotence_key of the workflow the bound
+   invocation id - current or past - belongs to. Takes two parameters,
+   both the invocation id."
+  "COALESCE((SELECT idempotence_key FROM workflow WHERE invocation_id = ?),
+            (SELECT idempotence_key FROM workflow_history WHERE wf_invocation_id = ? LIMIT 1))")
 
 (def ^:private select-workflow-with-created-at
   "SELECT w.*,
@@ -141,13 +153,17 @@
                                metadata-edn-str timeout-ms timeout-ms invocation-id]
                         opts)))
 
+  (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
+    (jdbc/execute-one! this [(str "INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state,
+                                                                 state_changed_at, data, parent_invocation_id)
+                                   VALUES (" key-of-invocation ", ?, 'REUSED', " now-ms ", ?, ?)")
+                             invocation-id invocation-id invocation-id metadata-edn-str parent-invocation-id])
+    nil)
+
   (get-workflow [this invocation-id]
     (some-> (jdbc/execute-one! this [(str "SELECT *, expires_at <= " now-ms " IS 1 AS expired
                                              FROM workflow
-                                            WHERE idempotence_key = COALESCE(
-                                                    (SELECT idempotence_key FROM workflow WHERE invocation_id = ?),
-                                                    (SELECT idempotence_key FROM workflow_history
-                                                      WHERE wf_invocation_id = ? LIMIT 1))")
+                                            WHERE idempotence_key = " key-of-invocation)
                                      invocation-id invocation-id]
                                opts)
             (update :expired pos?)))
@@ -190,6 +206,8 @@
     ;; A child references whichever invocation of its parent it started
     ;; under, so descending the tree goes through every invocation_id
     ;; (current and past) of each workflow - one recursive step for each.
+    ;; A REUSED history row links its workflow as a child of the reusing
+    ;; parent too, so the same two steps are repeated over workflow_history.
     ;; UNION (not UNION ALL) drops the duplicate (key, depth) rows reached
     ;; via several past invocations. Both steps and the final select join
     ;; the tables directly rather than workflow_full_history: SQLite
@@ -197,11 +215,9 @@
     ;; tables in full. CROSS JOIN makes SQLite start from the (small) tree
     ;; instead of scanning workflow_history for rows matching it.
     (jdbc/execute! this
-      ["WITH RECURSIVE tree(idempotence_key, depth) AS (
+      [(str "WITH RECURSIVE tree(idempotence_key, depth) AS (
           SELECT idempotence_key, 0 FROM workflow
-           WHERE idempotence_key = COALESCE(
-                   (SELECT idempotence_key FROM workflow WHERE invocation_id = ?),
-                   (SELECT idempotence_key FROM workflow_history WHERE wf_invocation_id = ? LIMIT 1))
+           WHERE idempotence_key = " key-of-invocation "
           UNION
           SELECT c.idempotence_key, t.depth + 1
             FROM tree t
@@ -212,6 +228,16 @@
             FROM tree t
             JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
             JOIN workflow c ON c.parent_invocation_id = h.wf_invocation_id
+          UNION
+          SELECT c.idempotence_key, t.depth + 1
+            FROM tree t
+            JOIN workflow p ON p.idempotence_key = t.idempotence_key
+            JOIN workflow_history c ON c.parent_invocation_id = p.invocation_id
+          UNION
+          SELECT c.idempotence_key, t.depth + 1
+            FROM tree t
+            JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
+            JOIN workflow_history c ON c.parent_invocation_id = h.wf_invocation_id
         )
         SELECT invocation_id, current_invocation_id, wf_def, state, state_changed_at, data, depth
           FROM (SELECT h.wf_invocation_id AS invocation_id, w.invocation_id AS current_invocation_id,
@@ -224,7 +250,7 @@
                        CASE w.state WHEN 'STARTED' THEN w.metadata ELSE w.result END, t.depth, NULL
                   FROM tree t
                   CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key)
-         ORDER BY state_changed_at ASC, history_id IS NULL ASC, history_id ASC"
+         ORDER BY state_changed_at ASC, history_id IS NULL ASC, history_id ASC")
        invocation-id invocation-id]
       opts)))
 

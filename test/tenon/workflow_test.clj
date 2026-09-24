@@ -179,6 +179,40 @@
       (is (= :polled-result result))
       (is (zero? @calls) "must not have re-executed - it polled the STARTED row instead"))))
 
+(defn- reuse-rows [wf-def]
+  (let [id (:invocation_id (first (test-util/find-by-wf-def (test-util/ds) wf-def)))]
+    (filterv #(= "REUSED" (:state %)) (test-util/history (test-util/ds) id))))
+
+(deftest run-invocation-logs-reused-result-test
+  (let [id (test-util/insert! "tenon.workflow-test/dedup-fn" :params (pr-str [8]))
+        parent (test-util/insert! "test.ns/reusing-parent")]
+    (db/finish! (test-util/ds) id "DONE" (pr-str 80))
+    (is (= 80 (binding [engine/*invocation-stack* (list parent)
+                        engine/*workflow-meta* {:actor-id 42}]
+                (engine/run-invocation #'dedup-fn dedup-fn [8]))))
+    (is (= [[id parent {:actor-id 42}]]
+           (mapv (juxt :invocation_id :parent_invocation_id (comp edn/read-string :data))
+                 (reuse-rows "tenon.workflow-test/dedup-fn"))))))
+
+(deftest run-invocation-logs-reused-failure-test
+  (is (thrown? clojure.lang.ExceptionInfo
+        (engine/run-invocation #'dedup-error-fn dedup-error-fn ["reused boom"])))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"previously failed"
+        (engine/run-invocation #'dedup-error-fn dedup-error-fn ["reused boom"])))
+  (is (= [[nil nil]] (mapv (juxt :parent_invocation_id :data)
+                           (reuse-rows "tenon.workflow-test/dedup-error-fn")))
+      "a top-level reuse of a failure is logged too"))
+
+(deftest run-invocation-logs-reuse-after-polling-test
+  (let [id (test-util/insert! "tenon.workflow-test/dedup-started-fn" :params (pr-str [43]))]
+    (future
+      (Thread/sleep 50)
+      (db/finish! (test-util/ds) id "DONE" (pr-str :polled)))
+    (is (= :polled (engine/run-invocation #'dedup-started-fn dedup-started-fn [43])))
+    (is (= ["STARTED" "REUSED"]
+           (mapv :state (butlast (test-util/history (test-util/ds) id))))
+        "logged once, after the awaited result arrived")))
+
 (deftest run-invocation-race-loser-awaits-winner-test
   ;; Simulates two threads racing to start the same (wf-def, args) call,
   ;; where the dedup pre-check (find-by-wf-def-and-params) sees nothing
@@ -243,7 +277,8 @@
       (is (= ::engine/previous-failure (:type (ex-data e))))
       (is (= ::engine/timed-out (-> e ex-data :failure :data :type))))
     (is (zero? @calls))
-    (is (= ["STARTED" "ERROR"] (mapv :state (test-util/history (test-util/ds) id))))))
+    (is (= ["STARTED" "REUSED" "ERROR"] (mapv :state (test-util/history (test-util/ds) id)))
+        "the caller that timed it out reused the timeout failure")))
 
 (deftest run-invocation-timeout-counts-from-start-time-test
   ;; The deadline is the invocation's start time + :tenon/timeout-ms, not
@@ -312,4 +347,5 @@
           "a waiter times it out")
       (deliver release true)
       (is (= 8 @caller))
-      (is (= ["STARTED" "ERROR"] (mapv :state (test-util/history (test-util/ds) id)))))))
+      (is (= ["STARTED" "REUSED" "ERROR"] (mapv :state (test-util/history (test-util/ds) id)))
+          "only the waiter's reuse of the timeout is logged - no late DONE"))))

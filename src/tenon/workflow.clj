@@ -75,8 +75,8 @@
 (def ^:dynamic *workflow-meta*
   "Arbitrary caller-supplied metadata (e.g. an actor id, span id, or trace
    id) to attach to the next #workflow invocation. run-invocation reads
-   this once, at the moment it starts a new invocation (not on a dedup
-   hit), serializes it, and stores it in that invocation's workflow row.
+   this once, serializes it, and stores it in that invocation's workflow
+   row - or, on a dedup hit, in the REUSED history row it logs instead.
    restart-invocation stores it too when bound, otherwise the restarted
    invocation keeps the metadata of the previous one. Callers bind it
    around a call:
@@ -114,20 +114,33 @@
                                   :class (str `timed-out)
                                   :data {:type ::timed-out :timeout-ms timeout-ms}})))))
 
-(defn- await-existing-result [ds invocation-id]
+(defn- await-finished
+  "Polls the workflow invocation-id belongs to until it is DONE or ERROR
+   (timing it out if its lease runs out meanwhile), and returns its row."
+  [ds invocation-id]
   (loop [wait-ms 5]
     (let [wf (db/get-workflow ds invocation-id)]
       (case (:state wf)
-        "DONE" (edn/read-string (:result wf))
-        "ERROR" (let [failure (edn/read-string (:result wf))]
-                  (throw (ex-info (str "Workflow previously failed: " (:message failure))
-                                   {:type ::previous-failure
-                                    :invocation-id (:invocation_id wf)
-                                    :failure failure})))
+        ("DONE" "ERROR") wf
         "STARTED" (if (time-out-if-expired! ds wf)
                     (recur wait-ms)
                     (do (Thread/sleep (long wait-ms))
                         (recur (min 200 (* 2 wait-ms)))))))))
+
+(defn- reuse-existing-result!
+  "Awaits the invocation-id run started by someone else, logs that the
+   current caller - under parent-id with meta-str - reused it, then returns
+   its result, or throws describing its failure."
+  [ds invocation-id parent-id meta-str]
+  (let [wf (await-finished ds invocation-id)]
+    (db/record-reuse! ds (:invocation_id wf) parent-id meta-str)
+    (case (:state wf)
+      "DONE" (edn/read-string (:result wf))
+      "ERROR" (let [failure (edn/read-string (:result wf))]
+                (throw (ex-info (str "Workflow previously failed: " (:message failure))
+                                {:type ::previous-failure
+                                 :invocation-id (:invocation_id wf)
+                                 :failure failure}))))))
 
 (defn run-invocation
   "Runs raw-fn with args, persisting the invocation.
@@ -138,17 +151,17 @@
    (let [ds (:tenon/db engine)
          timeout-ms (:tenon/timeout-ms engine default-timeout-ms)
          wf-def-str (str (symbol v))
-         params-str (safe-pr-str (vec args))]
+         params-str (safe-pr-str (vec args))
+         parent-id (first *invocation-stack*)
+         meta-str (when (some? *workflow-meta*) (safe-pr-str *workflow-meta*))]
      (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-       (await-existing-result ds (:invocation_id existing))
-       (let [parent-id (first *invocation-stack*)
-             meta-str (when (some? *workflow-meta*) (safe-pr-str *workflow-meta*))]
-         (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
-           (execute-and-record! ds invocation-id raw-fn args)
-           (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-             (await-existing-result ds (:invocation_id existing))
-             (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
-                              {:type ::race-condition :wf-def wf-def-str})))))))))
+       (reuse-existing-result! ds (:invocation_id existing) parent-id meta-str)
+       (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
+         (execute-and-record! ds invocation-id raw-fn args)
+         (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
+           (reuse-existing-result! ds (:invocation_id existing) parent-id meta-str)
+           (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
+                            {:type ::race-condition :wf-def wf-def-str}))))))))
 
 
 (defn list-pending

@@ -83,5 +83,7 @@
     (is (= 11 (count rows)))
     (is (= (set (range 11)) (set (map arg-of rows))))
     (doseq [row rows]
-      (is (= ["STARTED" "DONE"] (mapv :state (test-util/history (test-util/ds) (:invocation_id row))))
+      (is (= ["STARTED" "DONE"] (->> (test-util/history (test-util/ds) (:invocation_id row))
+                                     (map :state)
+                                     (remove #{"REUSED"})))
           (str "row for n=" (arg-of row) " ran to completion exactly once")))))

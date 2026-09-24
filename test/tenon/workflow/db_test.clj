@@ -164,3 +164,54 @@
     (is (false? (:expired (db/get-workflow (test-util/ds) id))) "no lease outside STARTED"))
   (is (false? (:expired (db/get-workflow (test-util/ds) (test-util/insert! "test.ns/no-expiry"))))
       "no lease never expires"))
+
+(deftest history-rows-carry-parent-invocation-id-test
+  (let [parent (test-util/insert! "test.ns/hp-parent")
+        child (test-util/insert! "test.ns/hp-child" :parent parent)]
+    (db/finish! (test-util/ds) child "ERROR" (pr-str {:message "x"}))
+    (db/finish! (test-util/ds) (db/restart! (test-util/ds) child nil nil) "DONE" "1")
+    (is (= [parent parent parent parent]
+           (mapv :parent_invocation_id (test-util/history (test-util/ds) child)))
+        "every history state, not only the current row, names the parent")))
+
+(deftest record-reuse-logs-reused-state-test
+  (let [child (test-util/insert! "test.ns/reused")
+        parent (test-util/insert! "test.ns/reuser")]
+    (db/finish! (test-util/ds) child "DONE" (pr-str 1))
+    (db/record-reuse! (test-util/ds) child parent (pr-str {:actor-id 7}))
+    (is (= [[child "STARTED" nil nil]
+            [child "REUSED" (pr-str {:actor-id 7}) parent]
+            [child "DONE" (pr-str 1) nil]]
+           (mapv (juxt :invocation_id :state :data :parent_invocation_id)
+                 (test-util/history (test-util/ds) child))))
+    (is (= "DONE" (:state (db/get-workflow (test-util/ds) child)))
+        "the workflow row itself is untouched - still the current state, listed last")))
+
+(deftest record-reuse-accepts-past-invocation-id-test
+  ;; The served invocation may have been restarted between reading its
+  ;; result and logging the reuse - the reuse still belongs to its workflow.
+  (let [child (test-util/insert! "test.ns/reused-past")]
+    (db/finish! (test-util/ds) child "DONE" "1")
+    (db/restart! (test-util/ds) child nil nil)
+    (db/record-reuse! (test-util/ds) child nil nil)
+    (is (= [child "REUSED"]
+           ((juxt :invocation_id :state) (last (butlast (test-util/history (test-util/ds) child))))))))
+
+(deftest full-timeline-includes-reused-children-test
+  (let [parent1 (test-util/insert! "test.ns/rt-parent1")
+        child (test-util/insert! "test.ns/rt-child" :parent parent1)
+        parent2 (test-util/insert! "test.ns/rt-parent2")]
+    (db/finish! (test-util/ds) child "DONE" "1")
+    (db/record-reuse! (test-util/ds) child parent2 nil)
+    (let [timeline (db/full-timeline (test-util/ds) parent2)]
+      (is (= [[0 "test.ns/rt-parent2" "STARTED"]
+              [1 "test.ns/rt-child" "STARTED"]
+              [1 "test.ns/rt-child" "DONE"]
+              [1 "test.ns/rt-child" "REUSED"]]
+             (sort-by (juxt first #({"STARTED" 0 "DONE" 1 "REUSED" 2} (nth % 2)))
+                      (map (juxt :depth :wf_def :state) timeline))))
+      (is (= [child] (map :invocation_id (filter #(= "REUSED" (:state %)) timeline)))))
+    (db/finish! (test-util/ds) parent2 "DONE" "2")
+    (is (some #(= "REUSED" (:state %))
+              (db/full-timeline (test-util/ds) (db/restart! (test-util/ds) parent2 nil nil)))
+        "still reached via the parent's past invocation")))

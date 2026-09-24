@@ -310,3 +310,16 @@
   (let [original (constantly {:status 200 :body "unreachable"})
         app (wrapped-app "" original)]
     (is (re-find #"<h1>Workflows</h1>" (:body (app (mock/request :get "/")))))))
+
+(deftest workflow-detail-page-shows-reused-sub-workflow-test
+  ;; A child whose result another parent reused shows under that parent's
+  ;; timeline too, with its REUSED row labelled.
+  (let [parent1 (test-util/insert! "test.ns/reuse-parent1")
+        child (test-util/insert! "test.ns/reuse-child" :parent parent1)
+        parent2 (test-util/insert! "test.ns/reuse-parent2")]
+    (db/finish! (test-util/ds) child "DONE" (pr-str :ok))
+    (db/record-reuse! (test-util/ds) child parent2 nil)
+    (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent2))))]
+      (is (re-find #"test\.ns/reuse-child" body))
+      (is (re-find #"class=\"state-REUSED\"" body))
+      (is (re-find #">Reused<" body)))))
