@@ -9,7 +9,7 @@ case "$1" in
 
   r|repl)
     shift
-    clj -M:test "$@"
+    clojure -M:test:repl/rebel "$@"
     ;;
 
   t|test|tests)
