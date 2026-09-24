@@ -61,8 +61,9 @@
   (top-level-workflows
     [this]
     [this filters]
-    "Workflow rows (every column), each annotated with created_at (when its
-     first invocation started), newest invocation first. filters is an
+    "Workflow rows (every column but idempotence_key), each annotated with
+     created_at (when its first invocation started), newest invocation
+     first. filters is an
      optional map of {:state s :wf-def w :top-level-only? t :limit n
      :before invocation-id}.
 

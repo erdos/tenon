@@ -91,15 +91,7 @@
     WHEN NEW.invocation_id > OLD.invocation_id
     BEGIN
       UPDATE sqlite_sequence SET seq = max(seq, NEW.invocation_id) WHERE name = 'workflow';
-    END"
-   "CREATE VIEW IF NOT EXISTS workflow_full_history AS
-      SELECT id, idempotence_key, wf_invocation_id AS invocation_id,
-             state, state_changed_at, data, parent_invocation_id
-        FROM workflow_history
-      UNION ALL
-      SELECT NULL, idempotence_key, invocation_id, state, state_changed_at,
-             CASE state WHEN 'STARTED' THEN metadata ELSE result END, parent_invocation_id
-        FROM workflow"])
+    END"])
 
 (def ^:private key-of-invocation
   "SQL expression for the idempotence_key of the workflow the bound
@@ -109,12 +101,18 @@
             (SELECT idempotence_key FROM workflow_history
               WHERE wf_invocation_id = ? AND state = 'STARTED' LIMIT 1))")
 
+(def ^:private workflow-columns
+  "The columns of a workflow row (aliased w) returned by Storage - all but
+   idempotence_key, which is internal to this namespace."
+  "w.invocation_id, w.wf_def, w.params, w.parent_invocation_id, w.state,
+   w.state_changed_at, w.expires_at, w.metadata, w.result")
+
 (def ^:private select-workflow-with-created-at
-  "SELECT w.*,
+  (str "SELECT " workflow-columns ",
           COALESCE((SELECT h.state_changed_at FROM workflow_history h
                      WHERE h.idempotence_key = w.idempotence_key ORDER BY h.id LIMIT 1),
                    w.state_changed_at) AS created_at
-     FROM workflow w")
+     FROM workflow w"))
 
 (def ^:private opts {:builder-fn rs/as-unqualified-lower-maps})
 
@@ -173,15 +171,15 @@
     nil)
 
   (get-workflow [this invocation-id]
-    (some-> (jdbc/execute-one! this [(str "SELECT *, expires_at <= " now-ms " IS 1 AS expired
-                                             FROM workflow
-                                            WHERE idempotence_key = " key-of-invocation)
+    (some-> (jdbc/execute-one! this [(str "SELECT " workflow-columns ", w.expires_at <= " now-ms " IS 1 AS expired
+                                             FROM workflow w
+                                            WHERE w.idempotence_key = " key-of-invocation)
                                      invocation-id invocation-id]
                                opts)
             (update :expired pos?)))
 
   (find-by-wf-def-and-params [this wf-def params-edn-str]
-    (jdbc/execute-one! this ["SELECT * FROM workflow WHERE idempotence_key = ?"
+    (jdbc/execute-one! this [(str "SELECT " workflow-columns " FROM workflow w WHERE w.idempotence_key = ?")
                              (idempotence-key wf-def params-edn-str)]
                        opts))
 
@@ -225,10 +223,7 @@
     ;; A REUSED history row links its workflow as a child of the reusing
     ;; parent too, so the same two steps are repeated over workflow_history.
     ;; UNION (not UNION ALL) drops the duplicate (key, depth) rows reached
-    ;; via several past invocations. Both steps and the final select join
-    ;; the tables directly rather than workflow_full_history: SQLite
-    ;; can't push the join key into that view, so it would scan both
-    ;; tables in full. CROSS JOIN makes SQLite start from the (small) tree
+    ;; via several past invocations. CROSS JOIN makes SQLite start from the (small) tree
     ;; instead of scanning workflow_history for rows matching it.
     ;; Within the same millisecond, REUSED rows go after the states: a
     ;; reuse is logged only once the state it reused was entered, while

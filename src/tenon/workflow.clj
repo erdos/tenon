@@ -174,7 +174,6 @@
    :invocation_id is its current one then. Returns a map of:
 
      :invocation_id        long - the current invocation id
-     :idempotence_key      byte[] - SHA-256 of wf_def and params
      :wf_def               string - the workflow fn's qualified symbol
      :params               string - EDN vector of the args
      :parent_invocation_id long - the invocation it ran nested under
