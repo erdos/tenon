@@ -83,11 +83,11 @@
      [:table
       [:thead [:tr [:th "Timestamp"] [:th "Workflow"] [:th "State"]]]
       [:tbody
-       (for [{:keys [invocation_id wf_def state created_at]} rows]
+       (for [{:keys [invocation_id wf_def state created_at reused]} rows]
          [:tr {:class (str "state-" state)}
           [:td [:a {:href (uri :workflows invocation_id)} (ui/timestamp created_at)]]
           [:td [:a {:href (uri :workflows invocation_id)} (ui/workflow-name wf_def)]]
-          [:td [:a {:href (uri :workflows invocation_id)} (ui/state state)]]])]
+          [:td [:a {:href (uri :workflows invocation_id)} (ui/state state) (when reused [:span " " (ui/state "REUSED")])]]])]
       (when footer
         [:tfoot [:tr [:td {:colspan 3} footer]]])])))
 
@@ -134,7 +134,7 @@
                                        :limit page-size :before before})
         has-more? (> (count rows) page-size)
         page-rows (vec (take page-size rows))
-        next-cursor (when has-more? (:invocation_id (last page-rows)))]
+        next-cursor (when has-more? (:call_id (last page-rows)))]
     (layout "Workflows"
             [:div
              (filter-form selected-state selected-wf-def show-all?)

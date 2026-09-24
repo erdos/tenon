@@ -38,9 +38,9 @@
 
 (defn find-by-wf-def
   "Workflows (of any nesting) whose wf_def is exactly wf-def, newest
-   first, via the public tenon.workflow/list-invocations."
+   first, via the public tenon.workflow/list-invocations - reuses left out."
   [wf-def]
-  (engine/list-invocations {:wf-def wf-def :top-level-only? false}))
+  (remove :reused (engine/list-invocations {:wf-def wf-def :top-level-only? false})))
 
 (defn find-by-wf-def-and-params
   "The workflow run with exactly this wf-def and params (an edn string), or

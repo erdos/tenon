@@ -116,9 +116,9 @@
     (test-util/insert! (str "test.ns/seek" n) :params (pr-str [n])))
   (let [page1 (db/top-level-workflows (test-util/ds) {:limit 4})
         trimmed1 (vec (take 4 page1))
-        page2 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:invocation_id (last trimmed1))})
+        page2 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:call_id (last trimmed1))})
         trimmed2 (vec (take 4 page2))
-        page3 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:invocation_id (last trimmed2))})]
+        page3 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:call_id (last trimmed2))})]
     (is (= 5 (count page1)) "limit+1, so the caller can detect there's a next page")
     (is (= 5 (count page2)) "still more after page 2")
     (is (<= (count page3) 4) "nothing left beyond page 3")
@@ -222,3 +222,39 @@
     (is (some #(= "REUSED" (:state %))
               (db/full-timeline (test-util/ds) (db/restart! (test-util/ds) parent2 nil nil)))
         "still reached via the parent's past invocation")))
+
+(deftest top-level-workflows-lists-calls-test
+  ;; One call per workflow (its first start - restarts aren't new calls)
+  ;; plus one per reuse of its result, newest first.
+  (let [a (test-util/insert! "test.ns/calls-a")
+        b (test-util/insert! "test.ns/calls-b" :parent a)]
+    (test-util/finish! a "DONE" "1")
+    (test-util/finish! b "DONE" "2")
+    (test-util/record-reuse! a nil)
+    (test-util/record-reuse! b a)
+    (let [a' (test-util/restart! a)
+          summary (juxt :invocation_id :wf_def :parent_invocation_id :state :reused)]
+      (is (= [[b "test.ns/calls-b" a "DONE" true]
+              [a' "test.ns/calls-a" nil "STARTED" true]
+              [b "test.ns/calls-b" a "DONE" false]
+              [a' "test.ns/calls-a" nil "STARTED" false]]
+             (mapv summary (db/top-level-workflows (test-util/ds) {:top-level-only? false}))))
+      (is (= [[a' "test.ns/calls-a" nil "STARTED" true]
+              [a' "test.ns/calls-a" nil "STARTED" false]]
+             (mapv summary (db/top-level-workflows (test-util/ds) {}))))
+      (is (= [[b "test.ns/calls-b" a "DONE" true]
+              [b "test.ns/calls-b" a "DONE" false]]
+             (mapv summary (db/top-level-workflows (test-util/ds) {:top-level-only? false :state "DONE"}))
+             (mapv summary (db/top-level-workflows (test-util/ds) {:top-level-only? false :wf-def "test.ns/calls-b"}))))
+      (let [[c1 c2 c3 c4] (db/top-level-workflows (test-util/ds) {:top-level-only? false})]
+        (is (= [c3 c4] (db/top-level-workflows (test-util/ds) {:top-level-only? false :before (:call_id c2)})))
+        (is (= [c1 c2 c3] (db/top-level-workflows (test-util/ds) {:top-level-only? false :limit 2}))
+            "limit+1, so the caller can detect there's a next page")))))
+
+(deftest top-level-wf-defs-include-top-level-reuses-test
+  (let [parent (test-util/insert! "test.ns/defs-parent")
+        child (test-util/insert! "test.ns/defs-child" :parent parent)]
+    (is (= ["test.ns/defs-parent"] (db/top-level-wf-defs (test-util/ds) true)))
+    (test-util/finish! child "DONE" "1")
+    (test-util/record-reuse! child nil)
+    (is (= ["test.ns/defs-child" "test.ns/defs-parent"] (db/top-level-wf-defs (test-util/ds) true)))))

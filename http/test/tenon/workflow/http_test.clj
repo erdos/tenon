@@ -322,3 +322,25 @@
       (is (re-find #"test\.ns/reuse-child" body))
       (is (re-find #"class=\"state-REUSED\"" body))
       (is (re-find #">Reused<" body)))))
+
+(deftest dashboard-lists-reused-top-level-call-again-test
+  ;; The second (add-numbers 3 4) reuses the first one's stored result -
+  ;; it's a call of its own nonetheless, so the dashboard lists it too,
+  ;; linking to the workflow whose result it got.
+  (let [id (test-util/insert! "test.ns/reused-top" :params (pr-str [3 4]))]
+    (test-util/finish! id "DONE" (pr-str 7))
+    (test-util/record-reuse! id nil)
+    (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get "/")))]
+      (is (= 2 (count (re-seq #"class=\"state-DONE\"" body))))
+      (is (= 2 (count (re-seq #"test\.ns/reused-top</code>" body))))
+      (is (re-find #"Reused" body) "the reusing call is marked as such"))))
+
+(deftest dashboard-lists-nested-reuse-only-with-all-checkbox-test
+  (let [parent-id (test-util/insert! "test.ns/reuse-parent")
+        child-id (test-util/insert! "test.ns/reuse-child" :parent parent-id)]
+    (test-util/finish! child-id "DONE" (pr-str 1))
+    (test-util/record-reuse! child-id parent-id)
+    (let [top ((http/app engine/*workflow-engine*) (mock/request :get "/"))
+          all ((http/app engine/*workflow-engine*) (mock/request :get "/" {:all "1"}))]
+      (is (not (re-find #"test\.ns/reuse-child</code>" (:body top))))
+      (is (= 2 (count (re-seq #"test\.ns/reuse-child</code>" (:body all))))))))

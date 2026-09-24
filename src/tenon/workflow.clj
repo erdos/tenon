@@ -166,7 +166,9 @@
 
 (defn list-pending
   ([] (list-pending *workflow-engine*))
-  ([engine] (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})))
+  ([engine] (->> (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})
+                 (remove :reused)
+                 (vec))))
 
 (defn get-invocation
   "The workflow invocation-id belongs to, or nil. invocation-id may also
@@ -191,12 +193,16 @@
   ([engine invocation-id] (db/get-workflow (:tenon/db engine) invocation-id)))
 
 (defn list-invocations
-  "Workflows matching filters, newest invocation first. filters is a map
-   of {:state s :wf-def w :top-level-only? t :limit n :before invocation-id}
+  "Calls of workflows matching filters, newest first - each workflow's
+   first run plus every later call that reused its stored result. filters
+   is a map of {:state s :wf-def w :top-level-only? t :limit n :before call-id}
    - see tenon.workflow.db/top-level-workflows. Returns a vector of maps
-   with the keys of get-invocation except :expired, plus:
+   with the keys of get-invocation except :expired (:parent_invocation_id
+   being the caller's), plus:
 
-     :created_at long - epoch ms its first invocation started"
+     :call_id    long - identifies the call, the :before cursor
+     :created_at long - epoch ms of the call
+     :reused     boolean - whether the call reused a stored result"
   ([filters] (list-invocations *workflow-engine* filters))
   ([engine filters] (db/top-level-workflows (:tenon/db engine) filters)))
 

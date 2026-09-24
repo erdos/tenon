@@ -62,21 +62,24 @@
   (top-level-workflows
     [this]
     [this filters]
-    "Workflow rows (every column but idempotence_key), each annotated with
-     created_at (when its first invocation started), newest invocation
-     first. filters is an
+    "One row per call of a workflow fn, newest first: a workflow's first
+     start (restarts are not new calls), plus one for each later call that
+     reused its stored result. Each row is the called workflow's row
+     (every column but idempotence_key), except that parent_invocation_id
+     is the caller's, plus call_id (identifies the call), created_at (when
+     the call happened) and reused (true for a reuse). filters is an
      optional map of {:state s :wf-def w :top-level-only? t :limit n
-     :before invocation-id}.
+     :before call-id}.
 
-     :state and :wf-def, when given, restrict to rows matching exactly;
-     omitting a key (or the whole map) leaves that dimension unfiltered.
-     :top-level-only? defaults to true (only parent_invocation_id IS NULL
-     rows, i.e. hides sub-workflows nested under another invocation); pass
-     false to include every workflow regardless of nesting.
+     :state and :wf-def, when given, restrict to calls of workflows
+     matching exactly; omitting a key (or the whole map) leaves that
+     dimension unfiltered. :top-level-only? defaults to true (only calls
+     not nested under another invocation); pass false to include every
+     call regardless of nesting.
 
      :limit caps the number of rows returned - pagination is seek-based,
      not OFFSET-based (which gets slower, and can skip/repeat rows under
-     concurrent writes, as the offset grows): pass the invocation_id of the
+     concurrent writes, as the offset grows): pass the call_id of the
      last row of the previous page as :before to fetch the rows
      immediately after it. Callers asking for n rows and wanting to know
      whether a further page exists should request :limit (inc n) and check
@@ -85,7 +88,7 @@
   (top-level-wf-defs [this top-level-only?]
     "Distinct wf_def values, alphabetical - the option list for a
      workflow-name filter dropdown. top-level-only? true restricts to
-     wf_defs seen among top-level workflows; false includes every
+     wf_defs called at the top level (reuses included); false includes every
      workflow regardless of nesting.")
 
   (full-timeline [this invocation-id]

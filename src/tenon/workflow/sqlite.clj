@@ -45,15 +45,14 @@
    ;; handed out, and inserts (max(rowid) + 1) and restarts never reuse one.
    ;; Every index ends in the rowid (invocation_id / id) implicitly, so
    ;; none lists it: equality on the indexed column still yields rows in
-   ;; invocation_id order. NULL keys included, this one serves both the
-   ;; child lookup and the newest-first top-level listing.
+   ;; invocation_id order.
    "CREATE INDEX IF NOT EXISTS idx_workflow_parent_invocation
       ON workflow(parent_invocation_id)"
    "CREATE INDEX IF NOT EXISTS idx_workflow_wf_def
       ON workflow(wf_def)"
    ;; Only the few STARTED rows (list-pending) - DONE and ERROR listings
-   ;; walk the table newest first instead, so finishing a workflow doesn't
-   ;; have to maintain an index entry for it.
+   ;; walk the history newest first instead, so finishing a workflow
+   ;; doesn't have to maintain an index entry for it.
    "CREATE INDEX IF NOT EXISTS idx_workflow_started
       ON workflow(invocation_id) WHERE state = 'STARTED'"
    "CREATE TABLE IF NOT EXISTS workflow_history (
@@ -108,12 +107,6 @@
    idempotence_key, which is internal to this namespace."
   "w.invocation_id, w.wf_def, w.params, w.parent_invocation_id, w.state,
    w.state_changed_at, w.expires_at, w.metadata, w.result")
-
-(def ^:private select-workflow-with-created-at
-  (str "SELECT " workflow-columns ",
-          (SELECT h.state_changed_at FROM workflow_history h
-            WHERE h.idempotence_key = w.idempotence_key ORDER BY h.id LIMIT 1) AS created_at
-     FROM workflow w"))
 
 (def ^:private opts {:builder-fn rs/as-unqualified-lower-maps})
 
@@ -188,33 +181,51 @@
     ([this]
      (db/top-level-workflows this nil))
     ([this {:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
-     ;; STARTED is spelled out, not bound: SQLite only uses the partial
-     ;; idx_workflow_started for a literal matching its WHERE clause.
+     ;; One row per call: a workflow's first STARTED history row (later
+     ;; ones are restarts) and each REUSED row. The history row's
+     ;; parent_invocation_id is the caller's. A plain JOIN (not CROSS
+     ;; JOIN) lets SQLite start from the few STARTED workflows via
+     ;; idx_workflow_started instead of scanning all history - which it
+     ;; only uses for the literal 'STARTED', not a bound parameter.
      (let [started? (= "STARTED" state)
-           conditions (cond-> []
-                        top-level-only? (conj "w.parent_invocation_id IS NULL")
+           conditions (cond-> ["(h.state = 'REUSED'
+                                 OR (h.state = 'STARTED'
+                                     AND NOT EXISTS (SELECT 1 FROM workflow_history e
+                                                      WHERE e.idempotence_key = h.idempotence_key
+                                                        AND e.state = 'STARTED' AND e.id < h.id)))"]
+                        top-level-only? (conj "h.parent_invocation_id IS NULL")
                         started? (conj "w.state = 'STARTED'")
                         (and state (not started?)) (conj "w.state = ?")
                         wf-def (conj "w.wf_def = ?")
-                        before (conj "w.invocation_id < ?"))
+                        before (conj "h.id < ?"))
            params (cond-> []
                     (and state (not started?)) (conj state)
                     wf-def (conj wf-def)
                     before (conj before)
                     limit (conj (inc limit)))]
-       (jdbc/execute! this
-         (into [(str select-workflow-with-created-at
-                     (when (seq conditions) (str " WHERE " (str/join " AND " conditions)))
-                     " ORDER BY w.invocation_id DESC"
-                     (when limit " LIMIT ?"))]
-               params)
-         opts))))
+       (mapv #(update % :reused pos?)
+             (jdbc/execute! this
+               (into [(str "SELECT h.id AS call_id, h.state_changed_at AS created_at,
+                                   h.parent_invocation_id, h.state = 'REUSED' AS reused,
+                                   w.invocation_id, w.wf_def, w.params, w.state, w.state_changed_at,
+                                   w.expires_at, w.metadata, w.result
+                              FROM workflow_history h
+                              JOIN workflow w ON w.idempotence_key = h.idempotence_key
+                             WHERE " (str/join " AND " conditions) "
+                             ORDER BY h.id DESC"
+                           (when limit " LIMIT ?"))]
+                     params)
+               opts)))))
 
   (top-level-wf-defs [this top-level-only?]
     (mapv :wf_def (jdbc/execute! this
-                    [(str "SELECT DISTINCT wf_def FROM workflow"
-                          (when top-level-only? " WHERE parent_invocation_id IS NULL")
-                          " ORDER BY wf_def")]
+                    [(str "SELECT DISTINCT w.wf_def FROM workflow w"
+                          (when top-level-only?
+                            " WHERE w.parent_invocation_id IS NULL
+                                 OR EXISTS (SELECT 1 FROM workflow_history h
+                                             WHERE h.idempotence_key = w.idempotence_key
+                                               AND h.state = 'REUSED' AND h.parent_invocation_id IS NULL)")
+                          " ORDER BY w.wf_def")]
                     opts)))
 
   (full-timeline [this invocation-id]

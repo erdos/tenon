@@ -144,3 +144,13 @@
             [0 f4 nil fib "DONE" (pr-str 3)]]
            (mapv (juxt :depth :invocation_id :parent_invocation_id :wf_def :state :data)
                  (engine/full-timeline f4))))))
+
+(deftest tagged-defn-repeated-call-is-listed-twice-test
+  ;; The second call reuses the first one's result - no new workflow row,
+  ;; but it's a call of its own, so list-invocations returns both.
+  (is (= 7 (fixtures/add-numbers 3 4)))
+  (is (= 7 (fixtures/add-numbers 3 4)))
+  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/add-numbers")))]
+    (is (= [[id "DONE" true] [id "DONE" false]]
+           (mapv (juxt :invocation_id :state :reused)
+                 (engine/list-invocations {:wf-def "tenon.workflow.fixtures/add-numbers"}))))))
