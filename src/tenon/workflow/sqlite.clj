@@ -249,14 +249,17 @@
             JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
             JOIN workflow_history c ON c.parent_invocation_id = h.wf_invocation_id AND c.state = 'REUSED'
         )
-        SELECT invocation_id, current_invocation_id, wf_def, state, state_changed_at, data, depth
+        SELECT invocation_id, current_invocation_id, parent_invocation_id, wf_def, state,
+               state_changed_at, data, depth
           FROM (SELECT h.wf_invocation_id AS invocation_id, w.invocation_id AS current_invocation_id,
-                       w.wf_def, h.state, h.state_changed_at, h.data, t.depth, h.id AS history_id
+                       h.parent_invocation_id, w.wf_def, h.state, h.state_changed_at, h.data, t.depth,
+                       h.id AS history_id
                   FROM tree t
                   CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key
                   CROSS JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
                 UNION ALL
-                SELECT w.invocation_id, w.invocation_id, w.wf_def, w.state, w.state_changed_at,
+                SELECT w.invocation_id, w.invocation_id, w.parent_invocation_id, w.wf_def, w.state,
+                       w.state_changed_at,
                        CASE w.state WHEN 'STARTED' THEN w.metadata ELSE w.result END, t.depth, NULL
                   FROM tree t
                   CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key)

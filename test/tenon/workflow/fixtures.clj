@@ -47,3 +47,14 @@
   (if (< n 2)
     n
     (+ (fibonacci (dec n)) (fibonacci (- n 2)))))
+
+#workflow
+(defn say-hi [x]
+  (str "Hello " x))
+
+;; Calls say-hi twice with the same argument, so the second call reuses the
+;; first one's stored result instead of running it again.
+#workflow
+(defn say-hi-twice [x]
+  (say-hi x)
+  (say-hi x))

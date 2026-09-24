@@ -86,3 +86,18 @@
                                      (map :state)
                                      (remove #{"REUSED"})))
           (str "row for n=" (arg-of row) " ran to completion exactly once")))))
+
+(deftest tagged-defn-repeated-sub-workflow-full-timeline-test
+  ;; The second (say-hi "Bob") reuses the first one's result, so the
+  ;; timeline holds say-hi's single run plus a REUSED row, both nested
+  ;; under say-hi-twice, between its STARTED and DONE.
+  (is (= "Hello Bob" (fixtures/say-hi-twice "Bob")))
+  (let [parent (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/say-hi-twice")))
+        child (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/say-hi")))]
+    (is (= [[0 parent nil "tenon.workflow.fixtures/say-hi-twice" "STARTED" nil]
+            [1 child parent "tenon.workflow.fixtures/say-hi" "STARTED" nil]
+            [1 child parent "tenon.workflow.fixtures/say-hi" "DONE" (pr-str "Hello Bob")]
+            [1 child parent "tenon.workflow.fixtures/say-hi" "REUSED" nil]
+            [0 parent nil "tenon.workflow.fixtures/say-hi-twice" "DONE" (pr-str "Hello Bob")]]
+           (mapv (juxt :depth :invocation_id :parent_invocation_id :wf_def :state :data)
+                 (engine/full-timeline parent))))))

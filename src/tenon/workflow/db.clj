@@ -92,8 +92,10 @@
      the workflow invocation-id belongs to and of every workflow nested
      under any of its invocations at any depth, interleaved into a single
      chronological sequence. Each row carries invocation_id (the
-     invocation it was recorded under), current_invocation_id, wf_def,
-     state, state_changed_at, data (metadata for STARTED and REUSED, the
-     result otherwise) and depth (0 for the workflow itself, 1 for a direct
+     invocation it was recorded under), current_invocation_id,
+     parent_invocation_id (the caller's invocation - for REUSED, the
+     reusing one's; nil at the top level), wf_def, state,
+     state_changed_at, data (metadata for STARTED and REUSED, the result
+     otherwise) and depth (0 for the workflow itself, 1 for a direct
      sub-workflow, and so on). A workflow whose result an invocation reused
      counts as its sub-workflow too, with its whole history included."))

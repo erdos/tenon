@@ -210,7 +210,10 @@
               [1 "test.ns/rt-child" "REUSED"]]
              (sort-by (juxt first #({"STARTED" 0 "DONE" 1 "REUSED" 2} (nth % 2)))
                       (map (juxt :depth :wf_def :state) timeline))))
-      (is (= [child] (map :invocation_id (filter #(= "REUSED" (:state %)) timeline)))))
+      (is (= [child] (map :invocation_id (filter #(= "REUSED" (:state %)) timeline))))
+      (is (= {"STARTED" parent1 "DONE" parent1 "REUSED" parent2}
+             (into {} (map (juxt :state :parent_invocation_id) (filter #(= 1 (:depth %)) timeline))))
+          "the child's own states keep the parent it ran under, the REUSED row the reusing one"))
     (db/finish! (test-util/ds) parent2 "DONE" "2")
     (is (some #(= "REUSED" (:state %))
               (db/full-timeline (test-util/ds) (db/restart! (test-util/ds) parent2 nil nil)))

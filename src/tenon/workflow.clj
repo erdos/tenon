@@ -213,6 +213,8 @@
 
      :invocation_id         long - the invocation the state was recorded under
      :current_invocation_id long - the workflow's current invocation id
+     :parent_invocation_id  long - the caller's invocation id (for REUSED,
+                            the reusing caller's), nil at the top level
      :wf_def                string - the workflow fn's qualified symbol
      :state                 string - \"STARTED\", \"DONE\", \"ERROR\" or
                             \"REUSED\" (a caller got its stored outcome)
