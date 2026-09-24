@@ -15,22 +15,22 @@
 (defn- uri
   "Builds a prefix-relative URI from path segments."
   [& segments]
-  (str *uri-prefix* "/" (str/join "/" (map name segments))))
+  (str *uri-prefix* "/" (str/join "/" (map #(if (keyword? %) (name %) (str %)) segments))))
 
 (defn- current-ds []
   (:tenon/db engine/*workflow-engine*))
 
 (defn- workflow->response [wf]
   (try
-    {:id (:id wf) :wf_def (:wf_def wf) :arguments (edn/read-string (:arguments wf))}
+    {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params (edn/read-string (:params wf))}
     (catch Throwable _
-      {:id (:id wf) :wf_def (:wf_def wf) :arguments_raw (:arguments wf)})))
+      {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params_raw (:params wf)})))
 
 (defn- restart! [id]
   (try
     (engine/restart-invocation id)
-    (let [latest (db/latest-event (current-ds) id)]
-      {:status 200 :body {:id id :state (:state latest) :payload (:payload latest)}})
+    (let [wf (db/get-workflow (current-ds) id)]
+      {:status 200 :body {:invocation_id (:invocation_id wf) :state (:state wf) :result (:result wf)}})
     (catch clojure.lang.ExceptionInfo e
       (if (= ::engine/precondition-failed (:type (ex-data e)))
         {:status 409 :body {:error (ex-message e) :data (dissoc (ex-data e) :type)}}
@@ -87,11 +87,11 @@
      [:table
       [:thead [:tr [:th "Timestamp"] [:th "Workflow"] [:th "State"]]]
       [:tbody
-       (for [{:keys [id wf_def state created_at]} rows]
+       (for [{:keys [invocation_id wf_def state created_at]} rows]
          [:tr {:class (str "state-" state)}
-          [:td [:a {:href (uri :workflows id)} (ui/timestamp created_at)]]
-          [:td [:a {:href (uri :workflows id)} (ui/workflow-name wf_def)]]
-          [:td [:a {:href (uri :workflows id)} (ui/state state)]]])]
+          [:td [:a {:href (uri :workflows invocation_id)} (ui/timestamp created_at)]]
+          [:td [:a {:href (uri :workflows invocation_id)} (ui/workflow-name wf_def)]]
+          [:td [:a {:href (uri :workflows invocation_id)} (ui/state state)]]])]
       (when footer
         [:tfoot [:tr [:td {:colspan 3} footer]]])])))
 
@@ -127,8 +127,7 @@
    (if next-cursor
      [:a {:href (str (uri) "?" (query-string {:state selected-state :wf_def selected-wf-def
                                                :all (when show-all? "1") :page_size page-size
-                                               :before_ts (:created-at next-cursor)
-                                               :before_id (:id next-cursor)}))
+                                               :before_id next-cursor}))
           :style "padding:4px 10px; border:1px solid #999; border-radius:4px; background:#eee"}
       "Next page →"]
      [:span {:style "padding:4px 10px; color:#999"} "Next page →"])])
@@ -140,9 +139,7 @@
                                        :limit page-size :before before})
         has-more? (> (count rows) page-size)
         page-rows (vec (take page-size rows))
-        next-cursor (when has-more?
-                      (let [{:keys [created_at id]} (last page-rows)]
-                        {:created-at created_at :id id}))]
+        next-cursor (when has-more? (:invocation_id (last page-rows)))]
     (layout "Workflows"
             [:div
              (filter-form selected-state selected-wf-def show-all?)
@@ -153,20 +150,20 @@
                                                     :page-size page-size
                                                     :next-cursor next-cursor}))])))
 
-(defn- result-html [latest]
-  (case (:state latest)
-    "DONE" [:pre (pr-str (try-read-edn (:payload latest)))]
-    "ERROR" (let [{:keys [message class data]} (try-read-edn (:payload latest))]
+(defn- result-html [wf]
+  (case (:state wf)
+    "DONE" [:pre (pr-str (try-read-edn (:result wf)))]
+    "ERROR" (let [{:keys [message class data]} (try-read-edn (:result wf))]
               [:div
                [:p [:b "Exception: "] (str class)]
                [:p message]
                (when data [:pre (pr-str data)])])
     [:p "(pending)"]))
 
-(defn- event-payload-html [{:keys [state payload]}]
+(defn- event-data-html [{:keys [state data]}]
   (case state
-    "DONE" [:pre (pr-str (try-read-edn payload))]
-    "ERROR" (let [{:keys [message class data]} (try-read-edn payload)]
+    "DONE" [:pre (pr-str (try-read-edn data))]
+    "ERROR" (let [{:keys [message class data]} (try-read-edn data)]
               [:span [:b (str class) ": "] message (when data (str " " (pr-str data)))])
     ""))
 
@@ -177,38 +174,38 @@
   (if (empty? events)
     [:p "none"]
     [:table
-     [:thead [:tr [:th "Timestamp"] [:th "Workflow"] [:th "State"] [:th "Payload"]]]
+     [:thead [:tr [:th "Timestamp"] [:th "Workflow"] [:th "State"] [:th "Data"]]]
      [:tbody
-      (for [{:keys [workflow_id wf_def state changed_at depth] :as ev} events]
-        [:tr {:class (str "state-" state) :data-tenon-wf-id workflow_id}
-         [:td changed_at]
-         [:td [:a {:href (uri :workflows workflow_id)} (indent depth) (ui/workflow-name wf_def)]]
+      (for [{:keys [current_invocation_id wf_def state state_changed_at depth] :as ev} events]
+        [:tr {:class (str "state-" state) :data-tenon-wf-id current_invocation_id}
+         [:td (ui/timestamp state_changed_at)]
+         [:td [:a {:href (uri :workflows current_invocation_id)} (indent depth) (ui/workflow-name wf_def)]]
          [:td (ui/state state)]
-         [:td (event-payload-html ev)]])]]))
+         [:td (event-data-html ev)]])]]))
 
-(defn- can-restart? [wf latest]
-  (and (contains? #{"DONE" "ERROR"} (:state latest))
+(defn- can-restart? [wf]
+  (and (contains? #{"DONE" "ERROR"} (:state wf))
        (some? (engine/lookup (symbol (:wf_def wf))))))
 
 (defn- workflow-detail-html [id]
   (when-let [wf (db/get-workflow (current-ds) id)]
-    (let [latest (db/latest-event (current-ds) id)]
+    (let [id (:invocation_id wf)]
       (layout (:wf_def wf)
               [:div
                [:p [:b "Id: "] (ui/workflow-link (uri :workflows id) id)]
-               (when-let [parent-id (:parent_workflow_id wf)]
+               (when-let [parent-id (:parent_invocation_id wf)]
                  [:p [:b "Parent: "] (ui/workflow-link (uri :workflows parent-id) parent-id)])
-               [:p [:b "State: "] (ui/state (:state latest))
-                (when (can-restart? wf latest)
+               [:p [:b "State: "] (ui/state (:state wf))
+                (when (can-restart? wf)
                   [:button {:onclick (str "tenonRestart('" (uri :workflows id :restart) "')")} "Restart"])]
-               [:h2 "Arguments"]
-               [:pre (pr-str (try-read-edn (:arguments wf)))]
+               [:h2 "Params"]
+               [:pre (pr-str (try-read-edn (:params wf)))]
                (when (:metadata wf)
                  [:div
                   [:h2 "Metadata"]
                   [:pre (pr-str (try-read-edn (:metadata wf)))]])
                [:h2 "Result"]
-               (result-html latest)
+               (result-html wf)
                [:h2 "Timeline"]
                (full-timeline-table (db/full-timeline (current-ds) id))]))))
 
@@ -235,18 +232,18 @@
       (let [state (not-empty (get query-params "state"))
             wf-def (not-empty (get query-params "wf_def"))
             show-all? (some? (get query-params "all"))
-            {:keys [page-size page_cursor]} (ui/parse-pagination query-params [:before_ts :before_id])
-            before (when-let [[ts id] page_cursor] {:created-at ts :id id})]
+            {:keys [page-size page_cursor]} (ui/parse-pagination query-params [:before_id])
+            before (some-> page_cursor first parse-long)]
         (html-response (dashboard-html state wf-def show-all? page-size before)))
 
       (and (= request-method :get) (= uri "/workflows/pending"))
       (pending!)
 
       (and (= request-method :post) (re-matches #"/workflows/[^/]+/restart" uri))
-      (restart! (second (re-matches #"/workflows/([^/]+)/restart" uri)))
+      (restart! (parse-long (second (re-matches #"/workflows/([^/]+)/restart" uri))))
 
       (and (= request-method :get) (re-matches #"/workflows/[^/]+" uri))
-      (if-let [page (workflow-detail-html (second (re-matches #"/workflows/([^/]+)" uri)))]
+      (if-let [page (workflow-detail-html (parse-long (second (re-matches #"/workflows/([^/]+)" uri))))]
         (html-response page)
         {:status 404 :body {:error "not found"}})
 

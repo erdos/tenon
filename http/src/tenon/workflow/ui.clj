@@ -12,8 +12,13 @@
 (defn workflow-name [name]
   [:code (str name)])
 
-(defn timestamp [ts]
-  [:code (str ts)])
+(defn timestamp
+  "Renders an epoch-milliseconds timestamp as UTC, e.g. 2026-01-02 03:04:05.678."
+  [epoch-ms]
+  [:code (when epoch-ms
+           (.format (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss.SSS")
+                    (java.time.LocalDateTime/ofInstant (java.time.Instant/ofEpochMilli epoch-ms)
+                                                       java.time.ZoneOffset/UTC)))])
 
 (def chip-attrs {:style "padding:3px; border-radius: 6px; border: 0.5px dashed rgba(0,0,0,0.4)"})
 

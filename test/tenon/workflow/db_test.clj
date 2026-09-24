@@ -1,54 +1,110 @@
 (ns tenon.workflow.db-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.edn :as edn]
+            [next.jdbc :as jdbc]
             [tenon.workflow.db :as db]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
 (use-fixtures :each temp-db-fixture)
 
 (deftest insert-and-fetch-workflow-test
-  (db/insert-workflow! (test-util/ds) "id-1" "test.ns/foo" (pr-str [1 2]) nil nil)
-  (let [wf (db/get-workflow (test-util/ds) "id-1")]
+  (let [id (db/insert-workflow! (test-util/ds) "test.ns/foo" (pr-str [1 2]) nil nil nil)
+        wf (db/get-workflow (test-util/ds) id)]
+    (is (integer? id))
     (is (= "test.ns/foo" (:wf_def wf)))
-    (is (= [1 2] (edn/read-string (:arguments wf))))
-    (is (nil? (:parent_workflow_id wf)))))
+    (is (= [1 2] (edn/read-string (:params wf))))
+    (is (= "STARTED" (:state wf)) "a workflow is inserted already STARTED")
+    (is (integer? (:state_changed_at wf)) "state_changed_at is supplied by the db")
+    (is (nil? (:expires_at wf)) "nil timeout-ms never expires")
+    (is (nil? (:parent_invocation_id wf)))
+    (is (nil? (:metadata wf)))))
 
-(deftest insert-workflow-4-arity-defaults-metadata-to-nil-test
-  (db/insert-workflow! (test-util/ds) "id-1b" "test.ns/no-meta" (pr-str []) nil nil)
-  (is (nil? (:metadata (db/get-workflow (test-util/ds) "id-1b")))))
+(deftest insert-workflow-dedups-on-wf-def-and-params-test
+  (let [id (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil)]
+    (is (nil? (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil))
+        "same (wf_def, params) - nothing inserted")
+    (is (some? (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [2]) nil nil nil)))
+    (is (= id (:invocation_id (db/find-by-wf-def-and-params (test-util/ds) "test.ns/dup" (pr-str [1])))))
+    (is (nil? (db/find-by-wf-def-and-params (test-util/ds) "test.ns/dup" (pr-str [3]))))))
 
-(deftest insert-workflow-stores-metadata-test
-  (db/insert-workflow! (test-util/ds) "id-1c" "test.ns/with-meta" (pr-str []) nil (pr-str {:actor-id 42}))
-  (is (= {:actor-id 42} (edn/read-string (:metadata (db/get-workflow (test-util/ds) "id-1c"))))))
+(deftest insert-workflow-stores-metadata-parent-and-lease-test
+  (let [parent (test-util/insert! "test.ns/parent")
+        child (db/insert-workflow! (test-util/ds) "test.ns/child" (pr-str []) parent (pr-str {:actor-id 42}) 1000)
+        wf (db/get-workflow (test-util/ds) child)]
+    (is (= parent (:parent_invocation_id wf)))
+    (is (= {:actor-id 42} (edn/read-string (:metadata wf))))
+    (is (= 1000 (- (:expires_at wf) (:state_changed_at wf))))))
 
-(deftest insert-workflow-stores-parent-workflow-id-test
-  (db/insert-workflow! (test-util/ds) "parent-1" "test.ns/parent" (pr-str []) nil nil)
-  (db/insert-workflow! (test-util/ds) "child-1" "test.ns/child" (pr-str []) "parent-1" nil)
-  (is (nil? (:parent_workflow_id (db/get-workflow (test-util/ds) "parent-1"))))
-  (is (= "parent-1" (:parent_workflow_id (db/get-workflow (test-util/ds) "child-1")))))
+(deftest finish-is-compare-and-set-test
+  (let [id (test-util/insert! "test.ns/finish" :timeout-ms 60000)]
+    (is (true? (db/finish! (test-util/ds) id "DONE" (pr-str 42))))
+    (is (false? (db/finish! (test-util/ds) id "ERROR" (pr-str {:message "x"})))
+        "no longer STARTED")
+    (let [wf (db/get-workflow (test-util/ds) id)]
+      (is (= "DONE" (:state wf)))
+      (is (= 42 (edn/read-string (:result wf))))
+      (is (nil? (:expires_at wf)) "the lease is cleared when leaving STARTED"))
+    (is (= [["STARTED" nil] ["DONE" (pr-str 42)]]
+           (mapv (juxt :state :data) (test-util/history (test-util/ds) id))))))
 
-(deftest insert-and-fetch-events-test
-  (db/insert-workflow! (test-util/ds) "id-2" "test.ns/bar" (pr-str []) nil nil)
-  (test-util/insert-event! (test-util/ds) "id-2" "STARTED" nil)
-  (test-util/insert-event! (test-util/ds) "id-2" "DONE" (pr-str 42))
-  (let [events (test-util/get-events (test-util/ds) "id-2")]
-    (is (= ["STARTED" "DONE"] (mapv :state events)))
-    (is (every? some? (map :changed_at events)) "changed_at is supplied by the db")
-    (is (every? #(re-matches #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}" %) (map :changed_at events))
-        "changed_at has millisecond precision")
-    (is (= 42 (edn/read-string (:payload (last events)))))))
+(deftest time-out-only-past-the-lease-test
+  (let [id (test-util/insert! "test.ns/lease" :timeout-ms 60000)]
+    (is (false? (db/time-out! (test-util/ds) id (pr-str {:message "timed out"})))
+        "lease not expired yet")
+    (test-util/expire! (test-util/ds) id)
+    (is (true? (db/time-out! (test-util/ds) id (pr-str {:message "timed out"}))))
+    (is (= "ERROR" (:state (db/get-workflow (test-util/ds) id)))))
+  (let [id (test-util/insert! "test.ns/no-lease")]
+    (is (false? (db/time-out! (test-util/ds) id (pr-str {})))
+        "no lease never expires")))
 
-(deftest latest-event-test
-  (db/insert-workflow! (test-util/ds) "id-3" "test.ns/baz" (pr-str []) nil nil)
-  (test-util/insert-event! (test-util/ds) "id-3" "STARTED" nil)
-  (is (= "STARTED" (:state (db/latest-event (test-util/ds) "id-3"))))
-  (test-util/insert-event! (test-util/ds) "id-3" "ERROR" (pr-str {:message "x"}))
-  (is (= "ERROR" (:state (db/latest-event (test-util/ds) "id-3")))))
+(deftest restart-assigns-new-invocation-id-test
+  (let [id (test-util/insert! "test.ns/restart" :metadata (pr-str {:run 1}))]
+    (is (nil? (db/restart! (test-util/ds) id nil nil)) "STARTED can not be restarted")
+    (db/finish! (test-util/ds) id "ERROR" (pr-str {:message "first"}))
+    (let [id2 (db/restart! (test-util/ds) id (pr-str {:run 2}) 5000)]
+      (is (> id2 id))
+      (is (nil? (db/restart! (test-util/ds) id nil nil))
+          "the old invocation id no longer matches - a concurrent restart loses")
+      (let [wf (db/get-workflow (test-util/ds) id2)]
+        (is (= "STARTED" (:state wf)))
+        (is (nil? (:result wf)))
+        (is (= {:run 2} (edn/read-string (:metadata wf))))
+        (is (some? (:expires_at wf))))
+      (is (= id2 (:invocation_id (db/get-workflow (test-util/ds) id)))
+          "an old invocation id resolves to the current row")
+      (db/finish! (test-util/ds) id2 "DONE" (pr-str :ok))
+      (is (= [[id "STARTED" (pr-str {:run 1})]
+              [id "ERROR" (pr-str {:message "first"})]
+              [id2 "STARTED" (pr-str {:run 2})]
+              [id2 "DONE" (pr-str :ok)]]
+             (mapv (juxt :invocation_id :state :data) (test-util/history (test-util/ds) id2)))))))
 
-(deftest find-by-wf-def-test
-  (db/insert-workflow! (test-util/ds) "id-4" "test.ns/qux" (pr-str []) nil nil)
-  (is (= 1 (count (test-util/find-by-wf-def (test-util/ds) "test.ns/qux"))))
-  (is (= 0 (count (test-util/find-by-wf-def (test-util/ds) "test.ns/nope")))))
+(deftest restart-never-reuses-invocation-ids-test
+  (let [a (test-util/insert! "test.ns/a")
+        b (test-util/insert! "test.ns/b")]
+    (db/finish! (test-util/ds) a "DONE" "1")
+    (let [a2 (db/restart! (test-util/ds) a nil nil)]
+      (db/finish! (test-util/ds) a2 "DONE" "1")
+      (let [a3 (db/restart! (test-util/ds) a2 nil nil)
+            c (test-util/insert! "test.ns/c")]
+        (is (< a b a2 a3 c) "restarts and inserts share one increasing sequence")))))
+
+(deftest lease-only-update-is-not-logged-test
+  (let [id (test-util/insert! "test.ns/renew" :timeout-ms 1000)]
+    (jdbc/execute! (test-util/ds) ["UPDATE workflow SET expires_at = expires_at + 1000 WHERE invocation_id = ?" id])
+    (is (= ["STARTED"] (mapv :state (test-util/history (test-util/ds) id))))))
+
+(deftest expires-at-must-be-cleared-outside-started-test
+  (let [id (test-util/insert! "test.ns/check")]
+    (is (thrown? Exception
+          (jdbc/execute! (test-util/ds) ["UPDATE workflow SET state = 'DONE', expires_at = 1 WHERE invocation_id = ?" id])))))
+
+(deftest history-requires-existing-workflow-test
+  (is (thrown? Exception
+        (jdbc/execute! (test-util/ds) ["INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at)
+                                        VALUES (x'00', 1, 'DONE', 0)"]))
+      "foreign keys are enforced"))
 
 (deftest top-level-workflows-seek-pagination-test
   ;; 10 rows, paged 4 at a time via :limit/:before - every page after the
@@ -57,43 +113,54 @@
   ;; gaps, no repeats), with :limit n actually returning up to n+1 rows so
   ;; the caller can tell whether a further page exists.
   (dotimes [n 10]
-    (let [id (str "seek-" n)]
-      (db/insert-workflow! (test-util/ds) id (str "test.ns/seek" n) (pr-str [n]) nil nil)
-      (test-util/insert-event! (test-util/ds) id "STARTED" nil)))
+    (test-util/insert! (str "test.ns/seek" n) :params (pr-str [n])))
   (let [page1 (db/top-level-workflows (test-util/ds) {:limit 4})
         trimmed1 (vec (take 4 page1))
-        cursor1 {:created-at (:created_at (last trimmed1)) :id (:id (last trimmed1))}
-        page2 (db/top-level-workflows (test-util/ds) {:limit 4 :before cursor1})
+        page2 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:invocation_id (last trimmed1))})
         trimmed2 (vec (take 4 page2))
-        cursor2 {:created-at (:created_at (last trimmed2)) :id (:id (last trimmed2))}
-        page3 (db/top-level-workflows (test-util/ds) {:limit 4 :before cursor2})]
+        page3 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:invocation_id (last trimmed2))})]
     (is (= 5 (count page1)) "limit+1, so the caller can detect there's a next page")
     (is (= 5 (count page2)) "still more after page 2")
     (is (<= (count page3) 4) "nothing left beyond page 3")
-    (let [all-ids (concat (map :id trimmed1) (map :id trimmed2) (map :id page3))]
+    (let [all-ids (concat (map :invocation_id trimmed1) (map :invocation_id trimmed2) (map :invocation_id page3))]
       (is (= 10 (count all-ids)) "all 10 rows covered across the 3 pages")
-      (is (= 10 (count (distinct all-ids))) "no row repeated across page boundaries"))))
+      (is (= 10 (count (distinct all-ids))) "no row repeated across page boundaries")
+      (is (= all-ids (sort > all-ids)) "newest first"))))
 
-(deftest current-time-test
-  (db/insert-workflow! (test-util/ds) "id-7" "test.ns/clock" (pr-str []) nil nil)
-  (test-util/insert-event! (test-util/ds) "id-7" "STARTED" nil)
-  (let [now (db/current-time (test-util/ds))
-        changed-at (:changed_at (db/latest-event (test-util/ds) "id-7"))]
-    (is (instance? java.time.LocalDateTime now))
-    (is (instance? java.time.LocalDateTime changed-at))
-    (is (not (.isAfter ^java.time.LocalDateTime changed-at now))
-        "same clock as changed_at, so an event is never later than current-time")))
+(deftest top-level-workflows-created-at-survives-restart-test
+  (let [id (test-util/insert! "test.ns/created")
+        created-at (:created_at (first (db/top-level-workflows (test-util/ds))))]
+    (is (= created-at (:state_changed_at (db/get-workflow (test-util/ds) id))))
+    (db/finish! (test-util/ds) id "DONE" "1")
+    (Thread/sleep 5)
+    (db/restart! (test-util/ds) id nil nil)
+    (is (= created-at (:created_at (first (db/top-level-workflows (test-util/ds)))))
+        "created_at is the start of the first invocation")))
 
-(deftest append-event-test
-  (db/insert-workflow! (test-util/ds) "id-8" "test.ns/conditional" (pr-str []) nil nil)
-  (is (nil? (db/append-event! (test-util/ds) "id-8" 12345 "STARTED" nil))
-      "no events yet, so no latest event to match")
-  (let [started-id (db/append-event! (test-util/ds) "id-8" nil "STARTED" nil)]
-    (is (some? started-id))
-    (is (nil? (db/append-event! (test-util/ds) "id-8" nil "STARTED" nil))
-        "nil expects no events, but there is one now")
-    (let [done-id (db/append-event! (test-util/ds) "id-8" started-id "DONE" (pr-str :ok))]
-      (is (= done-id (:id (db/latest-event (test-util/ds) "id-8"))))
-      (is (nil? (db/append-event! (test-util/ds) "id-8" started-id "ERROR" nil))
-          "started-id is no longer the latest event")))
-  (is (= ["STARTED" "DONE"] (mapv :state (test-util/get-events (test-util/ds) "id-8")))))
+(deftest full-timeline-follows-children-of-past-invocations-test
+  ;; A child started under the parent's first invocation keeps pointing at
+  ;; it after the parent is restarted - it must still show in the tree.
+  (let [parent (test-util/insert! "test.ns/tl-parent")
+        child (test-util/insert! "test.ns/tl-child" :parent parent)]
+    (db/finish! (test-util/ds) child "DONE" "1")
+    (db/finish! (test-util/ds) parent "DONE" "2")
+    (let [parent2 (db/restart! (test-util/ds) parent nil nil)
+          timeline (db/full-timeline (test-util/ds) parent2)]
+      (is (= 5 (count timeline)) "parent: STARTED DONE STARTED, child: STARTED DONE")
+      (is (= #{[0 "test.ns/tl-parent"] [1 "test.ns/tl-child"]}
+             (set (map (juxt :depth :wf_def) timeline))))
+      (is (= #{parent2} (set (map :current_invocation_id (filter #(zero? (:depth %)) timeline)))))
+      (is (= timeline (db/full-timeline (test-util/ds) parent))
+          "an old invocation id gives the same timeline"))))
+
+(deftest get-workflow-flags-expired-lease-test
+  (let [id (test-util/insert! "test.ns/expiry" :timeout-ms 60000)
+        wf (db/get-workflow (test-util/ds) id)]
+    (is (false? (:expired wf)))
+    (is (< (abs (- (:state_changed_at wf) (System/currentTimeMillis))) 5000) "epoch milliseconds")
+    (test-util/expire! (test-util/ds) id)
+    (is (true? (:expired (db/get-workflow (test-util/ds) id))))
+    (db/time-out! (test-util/ds) id (pr-str {}))
+    (is (false? (:expired (db/get-workflow (test-util/ds) id))) "no lease outside STARTED"))
+  (is (false? (:expired (db/get-workflow (test-util/ds) (test-util/insert! "test.ns/no-expiry"))))
+      "no lease never expires"))

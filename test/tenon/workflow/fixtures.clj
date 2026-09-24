@@ -37,7 +37,7 @@
 
 ;; Calls another #workflow fn from within its own body, so tests can prove
 ;; nested-child's workflow row records nested-parent's id as its
-;; parent_workflow_id via the real #workflow -> engine/run-invocation path.
+;; parent_invocation_id via the real #workflow -> engine/run-invocation path.
 #workflow
 (defn nested-parent [n]
   (+ 1 (nested-child n)))

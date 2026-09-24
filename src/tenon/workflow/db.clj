@@ -1,59 +1,74 @@
 (ns tenon.workflow.db
-  "The storage layer abstracted into the Storage protocol")
+  "The storage layer abstracted into the Storage protocol.
+
+   Every workflow is a single row of the workflow table holding its current
+   state. Rows are only ever INSERTed or UPDATEd with compare-and-set
+   semantics - on (invocation_id, state), where invocation_id changes on
+   every restart - and a trigger copies each replaced state into
+   workflow_history, so no method here writes the history directly.
+
+   Timestamps are UTC milliseconds since the epoch, supplied by the
+   storage's own clock - never the JVM's, so they can be compared without
+   mixing in a second clock.")
 
 (defprotocol Storage
   (init-db! [this]
     "Ensures the required schema and tables exist in the storage. Returns this.")
 
   (insert-workflow!
-    [this id wf-def arguments-edn-str parent-workflow-id metadata-edn-str]
-    "Inserts a workflow row, unless one already exists for this exact
-     (wf_def, arguments) pair, in which case nothing is inserted.")
+    [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    "Inserts a STARTED workflow row, unless one already exists for this exact
+     (wf_def, params) pair, in which case nothing is inserted. Its lease
+     expires timeout-ms after now (nil: never). Returns the new row's
+     invocation_id, or nil if nothing was inserted.")
 
-  (append-event! [this workflow-id expected-latest-event-id state payload-edn-str]
-    "Appends an event to workflow-id, but only if the id of its latest event
-     is still expected-latest-event-id (nil: it has no events yet) - a
-     compare-and-set, so of several concurrent writers that read the same
-     latest event, only one appends. Returns the new event's id, or nil if
-     the latest event had changed and nothing was appended.")
+  (finish! [this invocation-id state result-edn-str]
+    "Moves invocation-id from STARTED to state (DONE or ERROR) with
+     result-edn-str as its result - but only if it is still STARTED under
+     that same invocation_id, i.e. it was neither finished, timed out nor
+     restarted meanwhile. Returns true if the row was updated.")
 
-  (current-time [this]
-    "The storage's own current UTC time, as a java.time.LocalDateTime - the
-     clock that also supplies workflow_events.changed_at, so the two can be
-     compared without mixing in the JVM's clock.")
+  (time-out! [this invocation-id result-edn-str]
+    "Like finish! with state ERROR, but only if the lease of invocation-id
+     has also expired. Returns true if the row was updated.")
 
-  (get-workflow [this id])
+  (restart! [this invocation-id metadata-edn-str timeout-ms]
+    "Moves invocation-id from DONE or ERROR back to STARTED under a new,
+     larger invocation_id, clearing its result, replacing its metadata and
+     leasing it for timeout-ms (nil: never expires). Returns the new
+     invocation_id, or nil if invocation-id is no longer DONE or ERROR
+     (e.g. a concurrent restart got there first).")
 
-  (latest-event [this workflow-id]
-    "The most recent workflow_events row of workflow-id, or nil. Its id is
-     what append-event! expects, and its changed_at is a UTC
-     java.time.LocalDateTime.")
+  (get-workflow [this invocation-id]
+    "The workflow row invocation-id belongs to, or nil. invocation-id may
+     also be an earlier invocation_id of a since restarted workflow - its
+     current row is returned then, whose invocation_id differs. The row
+     also carries expired: true if its lease has run out (by the storage's
+     clock), so time-out! would succeed.")
 
-  (find-by-wf-def-and-arguments [this wf-def arguments-edn-str])
+  (find-by-wf-def-and-params [this wf-def params-edn-str])
 
   (top-level-workflows
     [this]
     [this filters]
-    "Workflow rows (every column), each annotated with created_at (its STARTED event's
-     timestamp) and state (its latest event's state), newest first.
-     filters is an optional map of {:state s :wf-def w :top-level-only?
-     :limit n :before {:created-at ... :id ...}}.
+    "Workflow rows (every column), each annotated with created_at (when its
+     first invocation started), newest invocation first. filters is an
+     optional map of {:state s :wf-def w :top-level-only? t :limit n
+     :before invocation-id}.
 
      :state and :wf-def, when given, restrict to rows matching exactly;
      omitting a key (or the whole map) leaves that dimension unfiltered.
-     :top-level-only? defaults to true (only parent_workflow_id IS NULL
+     :top-level-only? defaults to true (only parent_invocation_id IS NULL
      rows, i.e. hides sub-workflows nested under another invocation); pass
      false to include every workflow regardless of nesting.
 
-     :limit caps the number of rows returned - pagination is timestamp
-     seek-based, not OFFSET-based (which gets slower, and can skip/repeat
-     rows under concurrent writes, as the offset grows): pass the last
-     row of the previous page as :before (its :created_at and :id, the
-     tiebreaker for rows sharing a created_at, both required together)
-     to fetch the rows immediately after it in the newest-first order.
-     Callers asking for n rows and wanting to know whether a further page
-     exists should request :limit (inc n) and check whether they got
-     more than n back, trimming to n before display.")
+     :limit caps the number of rows returned - pagination is seek-based,
+     not OFFSET-based (which gets slower, and can skip/repeat rows under
+     concurrent writes, as the offset grows): pass the invocation_id of the
+     last row of the previous page as :before to fetch the rows
+     immediately after it. Callers asking for n rows and wanting to know
+     whether a further page exists should request :limit (inc n) and check
+     whether they got more than n back, trimming to n before display.")
 
   (top-level-wf-defs [this top-level-only?]
     "Distinct wf_def values, alphabetical - the option list for a
@@ -61,11 +76,12 @@
      wf_defs seen among top-level workflows; false includes every
      workflow regardless of nesting.")
 
-  (full-timeline [this workflow-id]
-    "Every workflow_events row belonging to workflow-id itself and every
-     workflow nested under it at any depth (sub-workflows, their own
-     sub-workflows, and so on), interleaved into a single chronological
-     sequence. Each row also carries workflow_id, wf_def, and depth (0 for
-     workflow-id itself, 1 for a direct sub-workflow, and so on), so it
-     can be attributed to whichever invocation it actually came from and
-     indented to show its nesting level."))
+  (full-timeline [this invocation-id]
+    "Every state (past ones from workflow_history and the current one) of
+     the workflow invocation-id belongs to and of every workflow nested
+     under any of its invocations at any depth, interleaved into a single
+     chronological sequence. Each row carries invocation_id (the
+     invocation it was recorded under), current_invocation_id, wf_def,
+     state, state_changed_at, data (metadata for STARTED, the result
+     otherwise) and depth (0 for the workflow itself, 1 for a direct
+     sub-workflow, and so on)."))

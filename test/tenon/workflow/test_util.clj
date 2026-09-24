@@ -16,42 +16,50 @@
   []
   (:tenon/db engine/*workflow-engine*))
 
-(defn get-events
-  "All workflow_events rows for workflow-id, oldest first. Test-only -
-   nothing in the library reads the full event list at once, only
-   latest-event (tenon.workflow.db, part of the Storage protocol)."
-  [ds workflow-id]
-  (jdbc/execute! ds ["SELECT * FROM workflow_events WHERE workflow_id = ? ORDER BY id ASC" workflow-id]
+(defn history
+  "Every state - past ones from workflow_history, then the current one - of
+   the workflow invocation-id belongs to, oldest first. Test-only - the
+   library reads it only as part of db/full-timeline."
+  [ds invocation-id]
+  (jdbc/execute! ds ["SELECT h.* FROM workflow_full_history h
+                       JOIN workflow w ON w.idempotence_key = h.idempotence_key
+                      WHERE w.invocation_id = ?
+                      ORDER BY h.id IS NULL, h.id"
+                     (:invocation_id (db/get-workflow ds invocation-id))]
                  {:builder-fn rs/as-unqualified-lower-maps}))
 
 (defn find-by-wf-def
   "Workflow rows whose wf_def is exactly wf-def. Test-only - nothing in
    the library looks workflows up by wf_def alone, only by the
-   (wf_def, arguments) pair (tenon.workflow.db/find-by-wf-def-and-arguments,
+   (wf_def, params) pair (tenon.workflow.db/find-by-wf-def-and-params,
    part of the Storage protocol)."
   [ds wf-def]
   (jdbc/execute! ds ["SELECT * FROM workflow WHERE wf_def = ?" wf-def]
                  {:builder-fn rs/as-unqualified-lower-maps}))
 
-(defn insert-event!
-  "Appends an event to workflow-id unconditionally - whatever its latest
-   event is - for tests setting up a workflow's history."
-  [ds workflow-id state payload-edn-str]
-  (db/append-event! ds workflow-id (:id (db/latest-event ds workflow-id)) state payload-edn-str))
+(defn insert!
+  "Inserts a STARTED workflow row for tests setting up a workflow's history,
+   returning its invocation id. opts: :params (an edn string, \"[]\" by
+   default), :parent, :metadata and :timeout-ms (nil by default - never
+   expires)."
+  [wf-def & {:keys [params parent metadata timeout-ms] :or {params "[]"}}]
+  (db/insert-workflow! (ds) wf-def params parent metadata timeout-ms))
 
-(defn backdate-events!
-  "Moves every workflow_events row of workflow-id far into the past, so a
-   STARTED one looks like it started long ago."
-  [ds workflow-id]
-  (jdbc/execute! ds ["UPDATE workflow_events SET changed_at = '2000-01-01 00:00:00' WHERE workflow_id = ?"
-                     workflow-id]))
+(defn expire!
+  "Moves the lease end of STARTED invocation-id into the past, so it looks
+   like it started long ago and timed out."
+  [ds invocation-id]
+  (jdbc/execute! ds ["UPDATE workflow SET state_changed_at = 0, expires_at = 1
+                       WHERE invocation_id = ? AND state = 'STARTED'"
+                     invocation-id]))
 
 (defn temp-db-fixture [f]
-  (let [file (java.io.File/createTempFile "tenon-test" ".db")]
-    (.deleteOnExit file)
+  (let [file (java.io.File/createTempFile "tenon-test" ".db")
+        path (.getAbsolutePath file)]
     (try
-      (binding [*db-path* (.getAbsolutePath file)
-                engine/*workflow-engine* (engine/init (.getAbsolutePath file))]
+      (binding [*db-path* path
+                engine/*workflow-engine* (engine/init path)]
         (f))
       (finally
-        (.delete file)))))
+        (doseq [suffix ["" "-wal" "-shm"]]
+          (.delete (java.io.File. (str path suffix))))))))

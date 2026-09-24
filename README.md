@@ -48,7 +48,7 @@ You can find the invocations in the web UI started at http://localhost:3000.
 
 ## Metadata
 
-Attach arbitrary caller-supplied data (an actor id, span id, trace id, etc) to a workflow row by binding `*workflow-meta*` around a call:
+Attach arbitrary caller-supplied data (for example, an actor id, span id, trace id, etc) to a workflow row by binding `*workflow-meta*` around a call:
 
 ```clojure
 (require '[tenon.workflow :as wf])
@@ -59,9 +59,6 @@ Attach arbitrary caller-supplied data (an actor id, span id, trace id, etc) to a
 
 ## State transitions
 
-Each invocation's `workflow_events` rows walk through the three states the
-`state` column's `CHECK` constraint allows:
-
 ```mermaid
 stateDiagram-v2
     [*] --> STARTED: run-invocation
@@ -70,21 +67,6 @@ stateDiagram-v2
     STARTED --> ERROR: timed out
     DONE --> STARTED: restart-invocation
     ERROR --> STARTED: restart-invocation
-```
-
-`restart-invocation` appends new events to the *same* workflow row rather
-than starting a new one, so a restarted invocation's full history (e.g.
-`STARTED, ERROR, STARTED, DONE`) is preserved.
-
-A call whose function and arguments match an invocation that is still
-`STARTED` waits for that invocation's result. An invocation still `STARTED`
-more than `:tenon/timeout-ms` (default 30s, `nil` for no limit) after it
-started - e.g. because the process running it died - is marked `ERROR` as
-timed out by the next such call (which then throws, as for any failed
-invocation) or by `restart-invocation` (which then restarts it):
-
-```clojure
-(tenon.workflow/init "app.db" :tenon/timeout-ms 60000)
 ```
 
 ## Build tooling
