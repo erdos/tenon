@@ -7,7 +7,6 @@
             [cheshire.core :as json]
             [tenon.workflow.http :as http]
             [tenon.workflow :as engine]
-            [tenon.workflow.db :as db]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
 (use-fixtures :each temp-db-fixture)
@@ -44,7 +43,7 @@
   (engine/register! #'http-flaky-fn http-flaky-fn)
   (is (thrown? clojure.lang.ExceptionInfo
         (engine/run-invocation #'http-flaky-fn http-flaky-fn [])))
-  (let [id (:invocation_id (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.http-test/http-flaky-fn")))]
+  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn")))]
     (engine/register! #'http-flaky-fn (fn [] :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :post (str "/workflows/" id "/restart")))
           body (json/parse-string (:body response) true)]
@@ -57,7 +56,7 @@
 
 (deftest dashboard-lists-top-level-workflows-test
   (let [id (test-util/insert! "test.ns/top" :params (pr-str [1]))]
-    (db/finish! (test-util/ds) id "DONE" (pr-str :ok))
+    (test-util/finish! id "DONE" (pr-str :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/"))]
       (is (= 200 (:status response)))
       (is (re-find #"text/html" (get-in response [:headers "Content-Type"])))
@@ -85,7 +84,7 @@
 (deftest dashboard-defaults-to-all-states-test
   (let [done-id (test-util/insert! "test.ns/done-wf")
         _ (test-util/insert! "test.ns/pending-wf")]
-    (db/finish! (test-util/ds) done-id "DONE" (pr-str :ok))
+    (test-util/finish! done-id "DONE" (pr-str :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/"))]
       (is (re-find #"test\.ns/done-wf" (:body response)))
       (is (re-find #"test\.ns/pending-wf" (:body response)))
@@ -94,7 +93,7 @@
 (deftest dashboard-filters-by-state-query-param-test
   (let [done-id (test-util/insert! "test.ns/done-wf2")
         pending-id (test-util/insert! "test.ns/pending-wf2")]
-    (db/finish! (test-util/ds) done-id "DONE" (pr-str :ok))
+    (test-util/finish! done-id "DONE" (pr-str :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/" {:state "DONE"}))]
       (is (re-find (re-pattern (str "/workflows/" done-id)) (:body response)))
       (is (not (re-find (re-pattern (str "/workflows/" pending-id)) (:body response)))
@@ -141,7 +140,7 @@
 
 (deftest workflow-detail-page-shows-params-and-result-test
   (let [id (test-util/insert! "test.ns/detail" :params (pr-str [1 2]))]
-    (db/finish! (test-util/ds) id "DONE" (pr-str 42))
+    (test-util/finish! id "DONE" (pr-str 42))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))]
       (is (= 200 (:status response)))
       (is (re-find #"\[1 2\]" (:body response)))
@@ -179,7 +178,7 @@
 
 (deftest workflow-detail-page-shows-error-test
   (let [id (test-util/insert! "test.ns/failed")]
-    (db/finish! (test-util/ds) id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))]
       (is (= 200 (:status response)))
       (is (re-find #"boom" (:body response))))))
@@ -188,10 +187,10 @@
   ;; A restarted workflow keeps the states of its earlier invocations -
   ;; the timeline must show every one of them, in order, not just the latest.
   (let [id (test-util/insert! "test.ns/timeline")]
-    (db/finish! (test-util/ds) id "ERROR" (pr-str {:message "first failure" :class "clojure.lang.ExceptionInfo" :data nil}))
-    (db/finish! (test-util/ds) (db/restart! (test-util/ds) id nil nil) "DONE" (pr-str :recovered))
+    (test-util/finish! id "ERROR" (pr-str {:message "first failure" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/finish! (test-util/restart! id) "DONE" (pr-str :recovered))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id)))
-          events (test-util/history (test-util/ds) id)]
+          events (test-util/timeline id)]
       (is (= 4 (count events)))
       (is (re-find #"first failure" (:body response)))
       (is (re-find #"recovered" (:body response)))
@@ -205,12 +204,12 @@
   (let [parent-id (test-util/insert! "test.ns/parent2")
         child-id (test-util/insert! "test.ns/child2" :parent parent-id)
         grandchild-id (test-util/insert! "test.ns/grandchild2" :parent child-id)]
-    (db/finish! (test-util/ds) grandchild-id "DONE" (pr-str :ok))
-    (db/finish! (test-util/ds) child-id "DONE" (pr-str :ok))
-    (db/finish! (test-util/ds) parent-id "DONE" (pr-str :ok))
+    (test-util/finish! grandchild-id "DONE" (pr-str :ok))
+    (test-util/finish! child-id "DONE" (pr-str :ok))
+    (test-util/finish! parent-id "DONE" (pr-str :ok))
     (let [response ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent-id)))
           body (:body response)
-          timeline (db/full-timeline (test-util/ds) parent-id)]
+          timeline (engine/full-timeline parent-id)]
       (is (= 6 (count timeline))
           "parent's own 2 events + child's 2 + grandchild's 2")
       (is (re-find (re-pattern (str "/workflows/" child-id)) body))
@@ -226,7 +225,7 @@
   ;; highlight every other row belonging to the same workflow.
   (let [parent-id (test-util/insert! "test.ns/hoverable")
         child-id (test-util/insert! "test.ns/hoverable-child" :parent parent-id)]
-    (db/finish! (test-util/ds) parent-id "DONE" (pr-str :ok))
+    (test-util/finish! parent-id "DONE" (pr-str :ok))
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent-id))))]
       (is (= 2 (count (re-seq (re-pattern (str "data-tenon-wf-id=\"" parent-id "\"")) body)))
           "both of the parent's own events carry its id")
@@ -254,7 +253,7 @@
   (engine/register! #'http-flaky-fn http-flaky-fn)
   (is (thrown? clojure.lang.ExceptionInfo
         (engine/run-invocation #'http-flaky-fn http-flaky-fn [])))
-  (let [id (:invocation_id (first (test-util/find-by-wf-def (test-util/ds) "tenon.workflow.http-test/http-flaky-fn")))
+  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn")))
         body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id))))]
     (is (re-find (re-pattern (str "tenonRestart\\(&apos;/workflows/" id "/restart&apos;\\)")) body))))
 
@@ -267,7 +266,7 @@
 
 (deftest workflow-detail-page-hides-restart-button-when-wf-def-unregistered-test
   (let [id (test-util/insert! "test.ns/never-registered-anywhere")]
-    (db/finish! (test-util/ds) id "DONE" (pr-str :ok))
+    (test-util/finish! id "DONE" (pr-str :ok))
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" id))))]
       (is (not (re-find #"<button" body))))))
 
@@ -317,8 +316,8 @@
   (let [parent1 (test-util/insert! "test.ns/reuse-parent1")
         child (test-util/insert! "test.ns/reuse-child" :parent parent1)
         parent2 (test-util/insert! "test.ns/reuse-parent2")]
-    (db/finish! (test-util/ds) child "DONE" (pr-str :ok))
-    (db/record-reuse! (test-util/ds) child parent2 nil)
+    (test-util/finish! child "DONE" (pr-str :ok))
+    (test-util/record-reuse! child parent2)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get (str "/workflows/" parent2))))]
       (is (re-find #"test\.ns/reuse-child" body))
       (is (re-find #"class=\"state-REUSED\"" body))

@@ -5,7 +5,6 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [tenon.workflow :as engine]
-            [tenon.workflow.db :as db]
             [tenon.workflow.ui :as ui]))
 
 (def ^:dynamic *uri-prefix*
@@ -17,9 +16,6 @@
   [& segments]
   (str *uri-prefix* "/" (str/join "/" (map #(if (keyword? %) (name %) (str %)) segments))))
 
-(defn- current-ds []
-  (:tenon/db engine/*workflow-engine*))
-
 (defn- workflow->response [wf]
   (try
     {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params (edn/read-string (:params wf))}
@@ -29,7 +25,7 @@
 (defn- restart! [id]
   (try
     (engine/restart-invocation id)
-    (let [wf (db/get-workflow (current-ds) id)]
+    (let [wf (engine/get-invocation id)]
       {:status 200 :body {:invocation_id (:invocation_id wf) :state (:state wf) :result (:result wf)}})
     (catch clojure.lang.ExceptionInfo e
       (if (= ::engine/precondition-failed (:type (ex-data e)))
@@ -108,7 +104,7 @@
           :style "display:flex; align-items:center; background: lightsteelblue; margin-bottom:0; padding:4px 8px; border-top-left-radius:6px; border-top-right-radius:6px"}
    (ui/select-filter "state" "State" states selected-state)
    " "
-   (ui/select-filter "wf_def" "Workflow" (db/top-level-wf-defs (current-ds) (not show-all?)) selected-wf-def)
+   (ui/select-filter "wf_def" "Workflow" (engine/list-wf-defs (not show-all?)) selected-wf-def)
    [:label {:style "margin-left:auto"}
     [:input (cond-> {:type "checkbox" :name "all" :value "1" :onchange "this.form.submit()"}
               show-all? (assoc :checked true))]
@@ -133,8 +129,7 @@
      [:span {:style "padding:4px 10px; color:#999"} "Next page →"])])
 
 (defn- dashboard-html [selected-state selected-wf-def show-all? page-size before]
-  (let [rows (db/top-level-workflows (current-ds)
-                                      {:state selected-state :wf-def selected-wf-def
+  (let [rows (engine/list-invocations {:state selected-state :wf-def selected-wf-def
                                        :top-level-only? (not show-all?)
                                        :limit page-size :before before})
         has-more? (> (count rows) page-size)
@@ -188,7 +183,7 @@
        (some? (engine/lookup (symbol (:wf_def wf))))))
 
 (defn- workflow-detail-html [id]
-  (when-let [wf (db/get-workflow (current-ds) id)]
+  (when-let [wf (engine/get-invocation id)]
     (let [id (:invocation_id wf)]
       (layout (:wf_def wf)
               [:div
@@ -207,7 +202,7 @@
                [:h2 "Result"]
                (result-html wf)
                [:h2 "Timeline"]
-               (full-timeline-table (db/full-timeline (current-ds) id))]))))
+               (full-timeline-table (engine/full-timeline id))]))))
 
 (defn- html-response [body]
   {:status 200 :headers {"Content-Type" "text/html; charset=utf-8"} :body body})
@@ -216,9 +211,8 @@
   "Ring handler for tenon's dashboard/detail pages and JSON API. engine is
    an application-state map as built by tenon.workflow/init -
    bound to engine/*workflow-engine* for the duration of the request, so
-   every db-touching helper (here and in tenon.workflow, for
-   restart-invocation/list-pending) can reach it without engine threaded
-   through their own argument lists. prefix is the URI prefix tenon is
+   the tenon.workflow functions called here reach it without engine
+   threaded through every helper's argument list. prefix is the URI prefix tenon is
    mounted under - request's :uri is expected to already be relative to
    it (i.e. with prefix stripped, as wrap-handler does), and every
    link/URL this handler's HTML generates gets prefix prepended back on
