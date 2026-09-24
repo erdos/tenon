@@ -25,7 +25,7 @@
 
 (def ^:private schema
   ["CREATE TABLE IF NOT EXISTS workflow (
-      invocation_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      invocation_id        INTEGER PRIMARY KEY,
       idempotence_key      BLOB    NOT NULL UNIQUE,
       wf_def               TEXT    NOT NULL,
       params               TEXT    NOT NULL,
@@ -40,6 +40,9 @@
    ;; parent_invocation_id has no foreign key: it names the parent's
    ;; invocation at the time the child started, which a restart of the
    ;; parent moves into workflow_history.
+   ;; No AUTOINCREMENT: rows are never deleted and a restart only moves a
+   ;; row to max + 1, so max(invocation_id) is always the largest id ever
+   ;; handed out, and inserts (max(rowid) + 1) and restarts never reuse one.
    ;; Every index ends in the rowid (invocation_id / id) implicitly, so
    ;; none lists it: equality on the indexed column still yields rows in
    ;; invocation_id order. NULL keys included, this one serves both the
@@ -84,13 +87,6 @@
       VALUES (OLD.idempotence_key, OLD.invocation_id, OLD.state, OLD.state_changed_at,
               CASE OLD.state WHEN 'STARTED' THEN OLD.metadata ELSE OLD.result END,
               OLD.parent_invocation_id);
-    END"
-   ;; AUTOINCREMENT only advances sqlite_sequence on INSERT - without this,
-   ;; an invocation_id assigned by a restart could be handed out again.
-   "CREATE TRIGGER IF NOT EXISTS workflow_bump_sequence AFTER UPDATE OF invocation_id ON workflow
-    WHEN NEW.invocation_id > OLD.invocation_id
-    BEGIN
-      UPDATE sqlite_sequence SET seq = max(seq, NEW.invocation_id) WHERE name = 'workflow';
     END"])
 
 (def ^:private key-of-invocation
@@ -155,7 +151,7 @@
   (restart! [this invocation-id metadata-edn-str timeout-ms]
     (:invocation_id
      (jdbc/execute-one! this [(str "UPDATE workflow
-                                       SET invocation_id = (SELECT seq + 1 FROM sqlite_sequence WHERE name = 'workflow'),
+                                       SET invocation_id = (SELECT max(invocation_id) + 1 FROM workflow),
                                            state = 'STARTED', result = NULL, metadata = ?,
                                            state_changed_at = " now-ms ", expires_at = " (expires-at) "
                                      WHERE invocation_id = ? AND state IN ('DONE', 'ERROR')
