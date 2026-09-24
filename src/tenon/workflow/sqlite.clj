@@ -32,6 +32,7 @@
       parent_invocation_id INTEGER,
       state                TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR')),
       state_changed_at     INTEGER NOT NULL,
+      state_seq            INTEGER NOT NULL,
       expires_at           INTEGER,
       metadata             TEXT,
       result               TEXT,
@@ -62,6 +63,7 @@
       wf_invocation_id INTEGER NOT NULL,
       state            TEXT    NOT NULL,
       state_changed_at INTEGER NOT NULL,
+      state_seq        INTEGER NOT NULL,
       data             TEXT,
       parent_invocation_id INTEGER
     ) STRICT"
@@ -82,12 +84,32 @@
    "CREATE TRIGGER IF NOT EXISTS workflow_log_history AFTER UPDATE ON workflow
     WHEN OLD.state IS NOT NEW.state OR OLD.invocation_id IS NOT NEW.invocation_id
     BEGIN
-      INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at, data,
-                                    parent_invocation_id)
-      VALUES (OLD.idempotence_key, OLD.invocation_id, OLD.state, OLD.state_changed_at,
+      INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at,
+                                    state_seq, data, parent_invocation_id)
+      VALUES (OLD.idempotence_key, OLD.invocation_id, OLD.state, OLD.state_changed_at, OLD.state_seq,
               CASE OLD.state WHEN 'STARTED' THEN OLD.metadata ELSE OLD.result END,
               OLD.parent_invocation_id);
     END"])
+
+;; state_seq orders the states entered within the same millisecond, which
+;; state_changed_at alone can't. Every history row is inserted at the
+;; moment of a state change (the trigger logs the state being left while
+;; its successor is entered; record-reuse! logs REUSED as it is entered),
+;; so max(workflow_history.id) counts the state changes so far. Entering a
+;; state stores it doubled, plus one for the changes that insert a
+;; history row themselves: at most one of those sees each count before
+;; bumping it, while the inserts in between (a new workflow's STARTED,
+;; which logs nothing) share the even value and follow invocation_id.
+
+(def ^:private insert-seq
+  "SQL expression for the state_seq of a newly inserted workflow's STARTED."
+  "(SELECT 2 * COALESCE(max(id), 0) FROM workflow_history)")
+
+(def ^:private change-seq
+  "SQL expression for the state_seq of a state entered by a change that
+   also inserts a history row - an update logging the state it replaces,
+   or a REUSED row."
+  "(SELECT 2 * COALESCE(max(id), 0) + 1 FROM workflow_history)")
 
 (def ^:private key-of-invocation
   "SQL expression for the idempotence_key of the workflow the bound
@@ -123,8 +145,10 @@
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
     (:invocation_id
      (jdbc/execute-one! this [(str "INSERT INTO workflow (idempotence_key, wf_def, params, parent_invocation_id,
-                                                          metadata, state, state_changed_at, expires_at)
-                                    VALUES (?, ?, ?, ?, ?, 'STARTED', " now-ms ", " (expires-at) ")
+                                                          metadata, state, state_changed_at, state_seq,
+                                                          expires_at)
+                                    VALUES (?, ?, ?, ?, ?, 'STARTED', " now-ms ", " insert-seq ", "
+                                            (expires-at) ")
                                     ON CONFLICT (idempotence_key) DO NOTHING
                                     RETURNING invocation_id")
                                (idempotence-key wf-def params-edn-str) wf-def params-edn-str
@@ -134,7 +158,7 @@
   (finish! [this invocation-id state result-edn-str]
     (-> (jdbc/execute-one! this [(str "UPDATE workflow
                                           SET state = ?, result = ?, expires_at = NULL,
-                                              state_changed_at = " now-ms "
+                                              state_changed_at = " now-ms ", state_seq = " change-seq "
                                         WHERE invocation_id = ? AND state = 'STARTED'")
                                  state result-edn-str invocation-id])
         :next.jdbc/update-count pos?))
@@ -142,7 +166,7 @@
   (time-out! [this invocation-id result-edn-str]
     (-> (jdbc/execute-one! this [(str "UPDATE workflow
                                           SET state = 'ERROR', result = ?, expires_at = NULL,
-                                              state_changed_at = " now-ms "
+                                              state_changed_at = " now-ms ", state_seq = " change-seq "
                                         WHERE invocation_id = ? AND state = 'STARTED'
                                           AND expires_at <= " now-ms)
                                  result-edn-str invocation-id])
@@ -153,7 +177,8 @@
      (jdbc/execute-one! this [(str "UPDATE workflow
                                        SET invocation_id = (SELECT max(invocation_id) + 1 FROM workflow),
                                            state = 'STARTED', result = NULL, metadata = ?,
-                                           state_changed_at = " now-ms ", expires_at = " (expires-at) "
+                                           state_changed_at = " now-ms ", state_seq = " change-seq ",
+                                           expires_at = " (expires-at) "
                                      WHERE invocation_id = ? AND state IN ('DONE', 'ERROR')
                                      RETURNING invocation_id")
                                metadata-edn-str timeout-ms timeout-ms invocation-id]
@@ -161,8 +186,10 @@
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
     (jdbc/execute-one! this [(str "INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state,
-                                                                 state_changed_at, data, parent_invocation_id)
-                                   VALUES (" key-of-invocation ", ?, 'REUSED', " now-ms ", ?, ?)")
+                                                                 state_changed_at, state_seq, data,
+                                                                 parent_invocation_id)
+                                   VALUES (" key-of-invocation ", ?, 'REUSED', " now-ms ", " change-seq ",
+                                           ?, ?)")
                              invocation-id invocation-id invocation-id metadata-edn-str parent-invocation-id])
     nil)
 
@@ -216,14 +243,18 @@
     ;; A child references whichever invocation of its parent it started
     ;; under, so descending the tree goes through every invocation_id
     ;; (current and past) of each workflow - one recursive step for each.
-    ;; A REUSED history row links its workflow as a child of the reusing
-    ;; parent too, so the same two steps are repeated over workflow_history.
-    ;; UNION (not UNION ALL) drops the duplicate (key, depth) rows reached
-    ;; via several past invocations. CROSS JOIN makes SQLite start from the (small) tree
-    ;; instead of scanning workflow_history for rows matching it.
-    ;; Within the same millisecond, REUSED rows go after the states: a
-    ;; reuse is logged only once the state it reused was entered, while
-    ;; history ids alone would put it before the current row.
+    ;; A child has a single parent workflow, so it's reached at a single
+    ;; depth; UNION (not UNION ALL) drops the duplicates reached via
+    ;; several past invocations of it. A reused workflow didn't run under
+    ;; the reusing one, so it isn't part of the tree - only the REUSED row
+    ;; logged for the reuse is, a level below the reusing invocation.
+    ;; The workflow's own REUSED rows stay in its timeline wherever the
+    ;; reuse came from - they are its history - but a sub-workflow's are
+    ;; only there when the reuse came from within the tree (the root's
+    ;; too then, a level below the reusing invocation, not at depth 0).
+    ;; CROSS JOIN makes SQLite start from the (small) tree instead of
+    ;; scanning workflow_history for rows matching it. state_seq orders the
+    ;; states entered within the same millisecond.
     (jdbc/execute! this
       [(str "WITH RECURSIVE tree(idempotence_key, depth) AS (
           SELECT idempotence_key, 0 FROM workflow
@@ -238,32 +269,40 @@
             FROM tree t
             JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
             JOIN workflow c ON c.parent_invocation_id = h.wf_invocation_id
+        ),
+        invocation(invocation_id, depth) AS (
+          SELECT w.invocation_id, t.depth
+            FROM tree t CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key
           UNION
-          SELECT c.idempotence_key, t.depth + 1
-            FROM tree t
-            JOIN workflow p ON p.idempotence_key = t.idempotence_key
-            JOIN workflow_history c ON c.parent_invocation_id = p.invocation_id AND c.state = 'REUSED'
-          UNION
-          SELECT c.idempotence_key, t.depth + 1
-            FROM tree t
-            JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
-            JOIN workflow_history c ON c.parent_invocation_id = h.wf_invocation_id AND c.state = 'REUSED'
+          SELECT h.wf_invocation_id, t.depth
+            FROM tree t CROSS JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
+           WHERE h.state = 'STARTED'
         )
         SELECT invocation_id, current_invocation_id, parent_invocation_id, wf_def, state,
                state_changed_at, data, depth
           FROM (SELECT h.wf_invocation_id AS invocation_id, w.invocation_id AS current_invocation_id,
-                       h.parent_invocation_id, w.wf_def, h.state, h.state_changed_at, h.data, t.depth,
-                       h.id AS history_id
+                       h.parent_invocation_id, w.wf_def, h.state, h.state_changed_at, h.state_seq,
+                       h.data, t.depth
                   FROM tree t
                   CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key
                   CROSS JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
+                 WHERE h.state <> 'REUSED'
+                    OR (t.depth = 0 AND (h.parent_invocation_id IS NULL
+                                         OR h.parent_invocation_id NOT IN (SELECT invocation_id FROM invocation)))
+                UNION ALL
+                SELECT h.wf_invocation_id, w.invocation_id, h.parent_invocation_id, w.wf_def, h.state,
+                       h.state_changed_at, h.state_seq, h.data, i.depth + 1
+                  FROM invocation i
+                  CROSS JOIN workflow_history h ON h.parent_invocation_id = i.invocation_id
+                                               AND h.state = 'REUSED'
+                  CROSS JOIN workflow w ON w.idempotence_key = h.idempotence_key
                 UNION ALL
                 SELECT w.invocation_id, w.invocation_id, w.parent_invocation_id, w.wf_def, w.state,
-                       w.state_changed_at,
-                       CASE w.state WHEN 'STARTED' THEN w.metadata ELSE w.result END, t.depth, NULL
+                       w.state_changed_at, w.state_seq,
+                       CASE w.state WHEN 'STARTED' THEN w.metadata ELSE w.result END, t.depth
                   FROM tree t
                   CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key)
-         ORDER BY state_changed_at ASC, state = 'REUSED' ASC, history_id IS NULL ASC, history_id ASC")
+         ORDER BY state_changed_at ASC, state_seq ASC, invocation_id ASC")
        invocation-id invocation-id]
       opts)))
 

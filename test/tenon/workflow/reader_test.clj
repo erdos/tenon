@@ -101,3 +101,46 @@
             [0 parent nil "tenon.workflow.fixtures/say-hi-twice" "DONE" (pr-str "Hello Bob")]]
            (mapv (juxt :depth :invocation_id :parent_invocation_id :wf_def :state :data)
                  (engine/full-timeline parent))))))
+
+(deftest tagged-defn-fibonacci-full-timeline-test
+  ;; fib(4) runs fib(3), which runs fib(2), which runs fib(1) and fib(0).
+  ;; fib(3)'s own (fibonacci 1) and fib(4)'s (fibonacci 2) then reuse the
+  ;; stored results, so each shows up as a REUSED row under its caller.
+  (is (= 3 (fixtures/fibonacci 4)))
+  (let [id (fn [n] (:invocation_id (test-util/find-by-wf-def-and-params
+                                    "tenon.workflow.fixtures/fibonacci" (pr-str [n]))))
+        [f0 f1 f2 f3 f4] (map id (range 5))
+        fib "tenon.workflow.fixtures/fibonacci"]
+    (is (= [[0 f4 nil fib "STARTED" nil]
+            [1 f3 f4 fib "STARTED" nil]
+            [2 f2 f3 fib "STARTED" nil]
+            [3 f1 f2 fib "STARTED" nil]
+            [3 f1 f2 fib "DONE" (pr-str 1)]
+            [3 f0 f2 fib "STARTED" nil]
+            [3 f0 f2 fib "DONE" (pr-str 0)]
+            [2 f2 f3 fib "DONE" (pr-str 1)]
+            [2 f1 f3 fib "REUSED" nil]
+            [1 f3 f4 fib "DONE" (pr-str 2)]
+            [1 f2 f4 fib "REUSED" nil]
+            [0 f4 nil fib "DONE" (pr-str 3)]]
+           (mapv (juxt :depth :invocation_id :parent_invocation_id :wf_def :state :data)
+                 (engine/full-timeline f4))))))
+
+(deftest tagged-defn-fibonacci-reuses-earlier-call-full-timeline-test
+  ;; (fibonacci 3) runs first, as a workflow of its own. (fibonacci 4) then
+  ;; reuses its stored fib(3) and fib(2) results instead of running them
+  ;; again - so fib(4)'s timeline is just its own states plus a REUSED row
+  ;; for each. fib(3) and fib(2) ran under the earlier call, so their own
+  ;; states stay in its timeline, not fib(4)'s.
+  (is (= 2 (fixtures/fibonacci 3)))
+  (is (= 3 (fixtures/fibonacci 4)))
+  (let [id (fn [n] (:invocation_id (test-util/find-by-wf-def-and-params
+                                    "tenon.workflow.fixtures/fibonacci" (pr-str [n]))))
+        [f2 f3 f4] (map id [2 3 4])
+        fib "tenon.workflow.fixtures/fibonacci"]
+    (is (= [[0 f4 nil fib "STARTED" nil]
+            [1 f3 f4 fib "REUSED" nil]
+            [1 f2 f4 fib "REUSED" nil]
+            [0 f4 nil fib "DONE" (pr-str 3)]]
+           (mapv (juxt :depth :invocation_id :parent_invocation_id :wf_def :state :data)
+                 (engine/full-timeline f4))))))

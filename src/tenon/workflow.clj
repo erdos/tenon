@@ -208,8 +208,10 @@
 
 (defn full-timeline
   "Every state - past and current - of the workflow invocation-id belongs
-   to and of all its sub-workflows at any depth (reused ones included),
-   as a vector of maps in chronological order:
+   to and of all its sub-workflows at any depth, plus a REUSED state for
+   each stored result any of them reused (not the reused workflow's own
+   states - it didn't run under them), as a vector of maps in
+   chronological order:
 
      :invocation_id         long - the invocation the state was recorded under
      :current_invocation_id long - the workflow's current invocation id

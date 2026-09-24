@@ -102,8 +102,8 @@
 
 (deftest history-requires-existing-workflow-test
   (is (thrown? Exception
-        (jdbc/execute! (test-util/ds) ["INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at)
-                                        VALUES (x'00', 1, 'DONE', 0)"]))
+        (jdbc/execute! (test-util/ds) ["INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at, state_seq)
+                                        VALUES (x'00', 1, 'DONE', 0, 0)"]))
       "foreign keys are enforced"))
 
 (deftest top-level-workflows-seek-pagination-test
@@ -204,16 +204,20 @@
     (db/finish! (test-util/ds) child "DONE" "1")
     (db/record-reuse! (test-util/ds) child parent2 nil)
     (let [timeline (db/full-timeline (test-util/ds) parent2)]
-      (is (= [[0 "test.ns/rt-parent2" "STARTED"]
-              [1 "test.ns/rt-child" "STARTED"]
-              [1 "test.ns/rt-child" "DONE"]
-              [1 "test.ns/rt-child" "REUSED"]]
-             (sort-by (juxt first #({"STARTED" 0 "DONE" 1 "REUSED" 2} (nth % 2)))
-                      (map (juxt :depth :wf_def :state) timeline))))
-      (is (= [child] (map :invocation_id (filter #(= "REUSED" (:state %)) timeline))))
-      (is (= {"STARTED" parent1 "DONE" parent1 "REUSED" parent2}
-             (into {} (map (juxt :state :parent_invocation_id) (filter #(= 1 (:depth %)) timeline))))
-          "the child's own states keep the parent it ran under, the REUSED row the reusing one"))
+      (is (= [[0 parent2 nil "test.ns/rt-parent2" "STARTED"]
+              [1 child parent2 "test.ns/rt-child" "REUSED"]]
+             (map (juxt :depth :invocation_id :parent_invocation_id :wf_def :state) timeline))
+          "only the REUSED row - the child ran under parent1, so its own states aren't in parent2's timeline"))
+    (is (= [[0 child parent1 "STARTED"]
+            [0 child parent1 "DONE"]
+            [0 child parent2 "REUSED"]]
+           (->> (db/full-timeline (test-util/ds) child)
+                (map (juxt :depth :invocation_id :parent_invocation_id :state))
+                (sort-by #({"STARTED" 0 "DONE" 1 "REUSED" 2} (peek %)))))
+        "the child's own timeline still has its reuse")
+    (is (= #{"test.ns/rt-parent1" "test.ns/rt-child"}
+           (set (map :wf_def (db/full-timeline (test-util/ds) parent1))))
+        "the child's states stay in the timeline of the parent it ran under")
     (db/finish! (test-util/ds) parent2 "DONE" "2")
     (is (some #(= "REUSED" (:state %))
               (db/full-timeline (test-util/ds) (db/restart! (test-util/ds) parent2 nil nil)))

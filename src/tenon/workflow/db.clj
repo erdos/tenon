@@ -98,4 +98,7 @@
      state_changed_at, data (metadata for STARTED and REUSED, the result
      otherwise) and depth (0 for the workflow itself, 1 for a direct
      sub-workflow, and so on). A workflow whose result an invocation reused
-     counts as its sub-workflow too, with its whole history included."))
+     didn't run under it, so it isn't part of the tree: only the REUSED
+     row is, a level below the reusing invocation. The workflow's own
+     REUSED rows are part of its history wherever the reuse came from,
+     at depth 0."))
