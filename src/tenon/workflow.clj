@@ -168,6 +168,63 @@
   ([] (list-pending *workflow-engine*))
   ([engine] (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})))
 
+(defn get-invocation
+  "The workflow invocation-id belongs to, or nil. invocation-id may also
+   be a past invocation id of a since restarted workflow - the returned
+   :invocation_id is its current one then. Returns a map of:
+
+     :invocation_id        long - the current invocation id
+     :idempotence_key      byte[] - SHA-256 of wf_def and params
+     :wf_def               string - the workflow fn's qualified symbol
+     :params               string - EDN vector of the args
+     :parent_invocation_id long - the invocation it ran nested under
+                           (as of when it first started), nil if top-level
+     :state                string - \"STARTED\", \"DONE\" or \"ERROR\"
+     :state_changed_at     long - epoch ms of entering state
+     :expires_at           long - epoch ms its STARTED lease ends, nil if
+                           not STARTED or never expiring
+     :metadata             string - EDN of *workflow-meta* when started, or nil
+     :result               string - EDN of the return value (DONE) or of
+                           {:message :class :data} of the failure (ERROR),
+                           nil while STARTED
+     :expired              boolean - whether the STARTED lease has run out"
+  ([invocation-id] (get-invocation *workflow-engine* invocation-id))
+  ([engine invocation-id] (db/get-workflow (:tenon/db engine) invocation-id)))
+
+(defn list-invocations
+  "Workflows matching filters, newest invocation first. filters is a map
+   of {:state s :wf-def w :top-level-only? t :limit n :before invocation-id}
+   - see tenon.workflow.db/top-level-workflows. Returns a vector of maps
+   with the keys of get-invocation except :expired, plus:
+
+     :created_at long - epoch ms its first invocation started"
+  ([filters] (list-invocations *workflow-engine* filters))
+  ([engine filters] (db/top-level-workflows (:tenon/db engine) filters)))
+
+(defn list-wf-defs
+  "Vector of the distinct wf_def strings (qualified fn symbols),
+   alphabetical - only those of top-level workflows if top-level-only?."
+  ([top-level-only?] (list-wf-defs *workflow-engine* top-level-only?))
+  ([engine top-level-only?] (db/top-level-wf-defs (:tenon/db engine) top-level-only?)))
+
+(defn full-timeline
+  "Every state - past and current - of the workflow invocation-id belongs
+   to and of all its sub-workflows at any depth (reused ones included),
+   as a vector of maps in chronological order:
+
+     :invocation_id         long - the invocation the state was recorded under
+     :current_invocation_id long - the workflow's current invocation id
+     :wf_def                string - the workflow fn's qualified symbol
+     :state                 string - \"STARTED\", \"DONE\", \"ERROR\" or
+                            \"REUSED\" (a caller got its stored outcome)
+     :state_changed_at      long - epoch ms of entering state
+     :data                  string - EDN of the metadata (STARTED, REUSED)
+                            or of the result (DONE, ERROR), or nil
+     :depth                 long - 0 for the workflow itself, 1 for a
+                            direct sub-workflow, and so on"
+  ([invocation-id] (full-timeline *workflow-engine* invocation-id))
+  ([engine invocation-id] (db/full-timeline (:tenon/db engine) invocation-id)))
+
 
 (defn restart-invocation
   "Restarts the workflow invocation-id belongs to (any of its current or

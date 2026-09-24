@@ -40,14 +40,19 @@
    ;; parent_invocation_id has no foreign key: it names the parent's
    ;; invocation at the time the child started, which a restart of the
    ;; parent moves into workflow_history.
-   "CREATE INDEX IF NOT EXISTS idx_workflow_parent
-      ON workflow(parent_invocation_id) WHERE parent_invocation_id IS NOT NULL"
-   "CREATE INDEX IF NOT EXISTS idx_workflow_top_level
-      ON workflow(invocation_id) WHERE parent_invocation_id IS NULL"
+   ;; Every index ends in the rowid (invocation_id / id) implicitly, so
+   ;; none lists it: equality on the indexed column still yields rows in
+   ;; invocation_id order. NULL keys included, this one serves both the
+   ;; child lookup and the newest-first top-level listing.
+   "CREATE INDEX IF NOT EXISTS idx_workflow_parent_invocation
+      ON workflow(parent_invocation_id)"
    "CREATE INDEX IF NOT EXISTS idx_workflow_wf_def
-      ON workflow(wf_def, invocation_id)"
-   "CREATE INDEX IF NOT EXISTS idx_workflow_state
-      ON workflow(state, invocation_id)"
+      ON workflow(wf_def)"
+   ;; Only the few STARTED rows (list-pending) - DONE and ERROR listings
+   ;; walk the table newest first instead, so finishing a workflow doesn't
+   ;; have to maintain an index entry for it.
+   "CREATE INDEX IF NOT EXISTS idx_workflow_started
+      ON workflow(invocation_id) WHERE state = 'STARTED'"
    "CREATE TABLE IF NOT EXISTS workflow_history (
       id               INTEGER PRIMARY KEY,
       idempotence_key  BLOB    NOT NULL REFERENCES workflow(idempotence_key),
@@ -58,11 +63,17 @@
       parent_invocation_id INTEGER
     ) STRICT"
    "CREATE INDEX IF NOT EXISTS idx_workflow_history_key
-      ON workflow_history(idempotence_key, id)"
-   "CREATE INDEX IF NOT EXISTS idx_workflow_history_invocation
-      ON workflow_history(wf_invocation_id)"
-   "CREATE INDEX IF NOT EXISTS idx_workflow_history_parent
-      ON workflow_history(parent_invocation_id) WHERE parent_invocation_id IS NOT NULL"
+      ON workflow_history(idempotence_key)"
+   ;; Every past invocation was STARTED once and left it logging a
+   ;; STARTED row, so those rows alone map past invocation ids to their
+   ;; workflow (key-of-invocation).
+   "CREATE INDEX IF NOT EXISTS idx_workflow_history_started
+      ON workflow_history(wf_invocation_id) WHERE state = 'STARTED'"
+   ;; Only REUSED rows link a workflow under a parent it wasn't started
+   ;; under - the other rows repeat the workflow row's parent_invocation_id,
+   ;; which never changes (full-timeline).
+   "CREATE INDEX IF NOT EXISTS idx_workflow_history_reused
+      ON workflow_history(parent_invocation_id) WHERE state = 'REUSED'"
    ;; Logs the replaced state - lease-only updates (neither state nor
    ;; invocation_id changes) are not state changes.
    "CREATE TRIGGER IF NOT EXISTS workflow_log_history AFTER UPDATE ON workflow
@@ -95,7 +106,8 @@
    invocation id - current or past - belongs to. Takes two parameters,
    both the invocation id."
   "COALESCE((SELECT idempotence_key FROM workflow WHERE invocation_id = ?),
-            (SELECT idempotence_key FROM workflow_history WHERE wf_invocation_id = ? LIMIT 1))")
+            (SELECT idempotence_key FROM workflow_history
+              WHERE wf_invocation_id = ? AND state = 'STARTED' LIMIT 1))")
 
 (def ^:private select-workflow-with-created-at
   "SELECT w.*,
@@ -177,13 +189,17 @@
     ([this]
      (db/top-level-workflows this nil))
     ([this {:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
-     (let [conditions (cond-> []
+     ;; STARTED is spelled out, not bound: SQLite only uses the partial
+     ;; idx_workflow_started for a literal matching its WHERE clause.
+     (let [started? (= "STARTED" state)
+           conditions (cond-> []
                         top-level-only? (conj "w.parent_invocation_id IS NULL")
-                        state (conj "w.state = ?")
+                        started? (conj "w.state = 'STARTED'")
+                        (and state (not started?)) (conj "w.state = ?")
                         wf-def (conj "w.wf_def = ?")
                         before (conj "w.invocation_id < ?"))
            params (cond-> []
-                    state (conj state)
+                    (and state (not started?)) (conj state)
                     wf-def (conj wf-def)
                     before (conj before)
                     limit (conj (inc limit)))]
@@ -214,6 +230,9 @@
     ;; can't push the join key into that view, so it would scan both
     ;; tables in full. CROSS JOIN makes SQLite start from the (small) tree
     ;; instead of scanning workflow_history for rows matching it.
+    ;; Within the same millisecond, REUSED rows go after the states: a
+    ;; reuse is logged only once the state it reused was entered, while
+    ;; history ids alone would put it before the current row.
     (jdbc/execute! this
       [(str "WITH RECURSIVE tree(idempotence_key, depth) AS (
           SELECT idempotence_key, 0 FROM workflow
@@ -232,12 +251,12 @@
           SELECT c.idempotence_key, t.depth + 1
             FROM tree t
             JOIN workflow p ON p.idempotence_key = t.idempotence_key
-            JOIN workflow_history c ON c.parent_invocation_id = p.invocation_id
+            JOIN workflow_history c ON c.parent_invocation_id = p.invocation_id AND c.state = 'REUSED'
           UNION
           SELECT c.idempotence_key, t.depth + 1
             FROM tree t
             JOIN workflow_history h ON h.idempotence_key = t.idempotence_key
-            JOIN workflow_history c ON c.parent_invocation_id = h.wf_invocation_id
+            JOIN workflow_history c ON c.parent_invocation_id = h.wf_invocation_id AND c.state = 'REUSED'
         )
         SELECT invocation_id, current_invocation_id, wf_def, state, state_changed_at, data, depth
           FROM (SELECT h.wf_invocation_id AS invocation_id, w.invocation_id AS current_invocation_id,
@@ -250,7 +269,7 @@
                        CASE w.state WHEN 'STARTED' THEN w.metadata ELSE w.result END, t.depth, NULL
                   FROM tree t
                   CROSS JOIN workflow w ON w.idempotence_key = t.idempotence_key)
-         ORDER BY state_changed_at ASC, history_id IS NULL ASC, history_id ASC")
+         ORDER BY state_changed_at ASC, state = 'REUSED' ASC, history_id IS NULL ASC, history_id ASC")
        invocation-id invocation-id]
       opts)))
 

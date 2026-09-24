@@ -28,14 +28,23 @@
                      (:invocation_id (db/get-workflow ds invocation-id))]
                  {:builder-fn rs/as-unqualified-lower-maps}))
 
+(defn timeline
+  "The states of the workflow invocation-id belongs to - not those of its
+   sub-workflows - oldest first, via the public tenon.workflow/full-timeline."
+  [invocation-id]
+  (filterv #(zero? (:depth %)) (engine/full-timeline invocation-id)))
+
 (defn find-by-wf-def
-  "Workflow rows whose wf_def is exactly wf-def. Test-only - nothing in
-   the library looks workflows up by wf_def alone, only by the
-   (wf_def, params) pair (tenon.workflow.db/find-by-wf-def-and-params,
-   part of the Storage protocol)."
-  [ds wf-def]
-  (jdbc/execute! ds ["SELECT * FROM workflow WHERE wf_def = ?" wf-def]
-                 {:builder-fn rs/as-unqualified-lower-maps}))
+  "Workflows (of any nesting) whose wf_def is exactly wf-def, newest
+   first, via the public tenon.workflow/list-invocations."
+  [wf-def]
+  (engine/list-invocations {:wf-def wf-def :top-level-only? false}))
+
+(defn find-by-wf-def-and-params
+  "The workflow run with exactly this wf-def and params (an edn string), or
+   nil."
+  [wf-def params]
+  (first (filter #(= params (:params %)) (find-by-wf-def wf-def))))
 
 (defn insert!
   "Inserts a STARTED workflow row for tests setting up a workflow's history,
@@ -44,6 +53,24 @@
    expires)."
   [wf-def & {:keys [params parent metadata timeout-ms] :or {params "[]"}}]
   (db/insert-workflow! (ds) wf-def params parent metadata timeout-ms))
+
+(defn finish!
+  "Moves STARTED invocation-id to state (DONE or ERROR) with result, an edn
+   string - as if the run it belongs to ended."
+  [invocation-id state result]
+  (db/finish! (ds) invocation-id state result))
+
+(defn restart!
+  "Moves DONE or ERROR invocation-id back to STARTED under a new
+   invocation id, which it returns - without running anything."
+  [invocation-id]
+  (db/restart! (ds) invocation-id nil nil))
+
+(defn record-reuse!
+  "Logs that a caller under parent-invocation-id reused invocation-id's
+   result."
+  [invocation-id parent-invocation-id]
+  (db/record-reuse! (ds) invocation-id parent-invocation-id nil))
 
 (defn expire!
   "Moves the lease end of STARTED invocation-id into the past, so it looks
