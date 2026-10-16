@@ -15,22 +15,7 @@
     (catch Throwable _
       {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params_raw (:params wf)})))
 
-(defn- error-response [status body]
-  (-> (response/response body) (response/status status)))
-
-(defn- restart! [id]
-  (try
-    (engine/restart-invocation id)
-    (let [wf (engine/get-invocation id)]
-      (response/response {:invocation_id (:invocation_id wf) :state (:state wf) :result (:result wf)}))
-    (catch clojure.lang.ExceptionInfo e
-      (if (= ::engine/precondition-failed (:type (ex-data e)))
-        (error-response 409 {:error (ex-message e) :data (dissoc (ex-data e) :type)})
-        (error-response 500 {:error (ex-message e)})))
-    (catch Throwable e
-      (error-response 500 {:error (ex-message e)}))))
-
-(defn- restart-from-form!
+(defn- restart!
   "Restarts workflow id from the detail page's restart form, then redirects
    (303) back to the page - with the failure as a restart_error query
    param if it failed, which the page shows."
@@ -46,13 +31,14 @@
   (try
     (response/response (mapv workflow->response (engine/list-pending)))
     (catch Throwable e
-      (error-response 500 {:error (ex-message e)}))))
+      (-> (response/response {:error (ex-message e)}) (response/status 500)))))
 
 (defn- html-response [body]
   (-> (response/response body) (response/content-type "text/html; charset=utf-8")))
 
 (defn handler
-  "Ring handler for tenon's dashboard/detail pages and JSON API. engine is
+  "Ring handler for tenon's dashboard/detail pages, restart form and
+   pending-workflows JSON endpoint. engine is
    an application-state map as built by tenon.workflow/init -
    bound to engine/*workflow-engine* for the duration of the request, so
    the tenon.workflow functions called here reach it without engine
@@ -62,30 +48,19 @@
    link/URL this handler's HTML generates gets prefix prepended back on
    via ui/*uri-prefix*, also bound here. Pass \"\" to mount unprefixed at the
    app's own root."
-  [engine prefix {:keys [request-method uri query-params form-params]}]
+  [engine prefix {:keys [request-method uri query-params]}]
   (binding [ui/*uri-prefix* prefix
             engine/*workflow-engine* engine]
-    (cond
-      (and (= request-method :get) (= uri "/"))
-      (html-response (listing-page/html query-params))
-
-      (and (= request-method :get) (= uri "/workflows/pending"))
-      (pending!)
-
-      (and (= request-method :post) (re-matches #"/workflows/[^/]+/restart" uri))
-      (let [id (parse-long (second (re-matches #"/workflows/([^/]+)/restart" uri)))]
-        (if (and id (= "form" (get form-params "via")))
-          (restart-from-form! id)
-          (restart! id)))
-
-      (and (= request-method :get) (re-matches #"/workflows/[^/]+" uri))
-      (if-let [page (details-page/html (parse-long (second (re-matches #"/workflows/([^/]+)" uri)))
-                                       (not-empty (get query-params "restart_error")))]
-        (html-response page)
-        (response/not-found {:error "not found"}))
-
-      :else
-      (response/not-found {:error "not found"}))))
+    (let [[_ id restart] (re-matches #"/workflows/(\d+)(/restart)?" uri)
+          id (some-> id parse-long)
+          get? (= :get request-method)]
+      (or (cond
+            (and get? (= uri "/")) (html-response (listing-page/html query-params))
+            (and get? (= uri "/workflows/pending")) (pending!)
+            (and id restart (= :post request-method)) (restart! id)
+            (and id get? (not restart)) (some-> (details-page/html id (not-empty (get query-params "restart_error")))
+                                                html-response))
+          (response/not-found {:error "not found"})))))
 
 (defn- strip-prefix
   "request-uri relative to prefix, or nil if request-uri isn't actually
@@ -121,9 +96,8 @@
          (original-handler request)))
       ([{:keys [uri] :as request} respond raise]
        (if-let [relative-uri (strip-prefix prefix uri)]
-         (when-let [resp (try (handler engine prefix (assoc request :uri relative-uri))
-                              (catch Throwable t (raise t) nil))]
-           (respond resp))
+         (try (respond (handler engine prefix (assoc request :uri relative-uri)))
+              (catch Throwable t (raise t)))
          (original-handler request respond raise))))))
 
 (defn- not-found-handler

@@ -1,15 +1,11 @@
 (ns tenon.workflow.http.details-page
   "The page of a single workflow (/workflows/{id}): its summary, params,
    result and metadata, and the timeline of it and its sub-workflows."
-  (:require [clojure.edn :as edn]
-            [tenon.workflow :as engine]
+  (:require [tenon.workflow :as engine]
             [tenon.workflow.ui :as ui]))
 
-(defn- try-read-edn [s]
-  (try (edn/read-string s) (catch Throwable _ ::unreadable)))
-
 (defn- params-html [params-str]
-  (let [params (try-read-edn params-str)]
+  (let [params (ui/read-edn params-str)]
     (cond
       (not (sequential? params)) (ui/panel {:title "Params"} (ui/edn-block params-str))
       (empty? params) (ui/panel {:title "Params" :subtitle "no arguments"})
@@ -19,7 +15,7 @@
                                        [[:code (str "%" (inc i))] (ui/folded-pre (ui/pretty arg))]))))))
 
 (defn- metadata-html [metadata-str]
-  (let [metadata (try-read-edn metadata-str)]
+  (let [metadata (ui/read-edn metadata-str)]
     (ui/panel {:title "Metadata"}
               (if (and (map? metadata) (seq metadata))
                 (ui/key-values (for [[k v] (sort-by (comp str key) metadata)]
@@ -29,7 +25,7 @@
 (defn- result-html [wf]
   (case (:state wf)
     "DONE" (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:result wf)))
-    "ERROR" (let [{:keys [message class data] :as error} (try-read-edn (:result wf))]
+    "ERROR" (let [{:keys [message class data] :as error} (ui/read-edn (:result wf))]
               (ui/panel {:title "Error"}
                         (if (map? error)
                           (ui/error-details class message
@@ -88,7 +84,7 @@
 (defn- error-title
   "\"class: message\" of an ERROR event, for a chip's tooltip."
   [ev]
-  (let [{:keys [message class]} (try-read-edn (:data ev))]
+  (let [{:keys [message class]} (ui/read-edn (:data ev))]
     (str class ": " message)))
 
 (defn- problem?
@@ -133,8 +129,8 @@
    (tree-offset start ev (when restart? "Restarted"))
    (when-let [caller (and (reused? ev) root? (:parent_invocation_id ev))]
      [:span.tree-reuse
-      "from " (ui/workflow-link (ui/uri :workflows (:invocation_id ev)) (:invocation_id ev))
-      " for " (ui/workflow-link (ui/uri :workflows caller) caller)])
+      "from " (ui/workflow-link (:invocation_id ev))
+      " for " (ui/workflow-link caller)])
    (tree-columns
     nil
     nil
@@ -148,9 +144,9 @@
   [:li.tree-leaf.state-REUSED
    (tree-offset start ev "Invoked")
    (ui/workflow-name wf_def)
-   (ui/workflow-link (ui/uri :workflows current_invocation_id) current_invocation_id)
+   (ui/workflow-link current_invocation_id)
    (when (not= invocation_id current_invocation_id)
-     [:span.tree-reuse "from " (ui/workflow-link (ui/uri :workflows invocation_id) invocation_id)])
+     [:span.tree-reuse "from " (ui/workflow-link invocation_id)])
    (tree-columns
     nil
     nil
@@ -170,15 +166,15 @@
       (timeline-tree-reuse start (second (first events)))
     [:li
      [:details (when (or (= [:root] k) (problem? nodes children k)) {:open true})
-      [:summary {:class (str "tree-node state-" state)}
+      [:summary {:class (str "state-" state)}
        [:span.tree-verb "Invoked"]
        (ui/workflow-name wf_def)
        (when-not (= [:root] k)
-         (ui/workflow-link (ui/uri :workflows current_invocation_id) current_invocation_id))
+         (ui/workflow-link current_invocation_id))
        (tree-columns
         duration
         (when (pos? reuses)
-          [:span.tree-reuses {:title (str "result reused " (ui/pluralize reuses "time"))}
+          [:span {:title (str "result reused " (ui/pluralize reuses "time"))}
            (str "\u21BA " reuses)])
         (ui/state-with-tooltip state (when (= "ERROR" state) (some-> last-error error-title))))]
       [:ul
@@ -228,16 +224,15 @@
                (ui/panel-toggle-btn
                 [:button "\u21BB Restart"]
                 [:form.restart {:method "post" :action (ui/uri :workflows id :restart)}
-                 [:input {:type "hidden" :name "via" :value "form"}]
                  [:span "Run it again with the same params, under a new invocation id?"]
                  [:button.btn.danger {:type "submit"} "Yes, restart"]]))]
       :error (when restart-error ["Restart failed: " restart-error])
       :note (when (not= requested-id id)
               ["Invocation " (ui/workflow-id requested-id)
                " was restarted - showing the workflow's current invocation."])}
-     (ui/fact "Id" (ui/workflow-link (ui/uri :workflows id) id))
+     (ui/fact "Id" (ui/workflow-link id))
      (ui/fact "Parent" (if-let [parent-id (:parent_invocation_id wf)]
-                         (ui/workflow-link (ui/uri :workflows parent-id) parent-id)
+                         (ui/workflow-link parent-id)
                          "\u2014 (top level)"))
      (ui/fact "Started" (ui/timestamp-with-relative started-at now))
      (ui/fact (if (= "STARTED" (:state wf)) "Last change" "Finished")

@@ -1,19 +1,10 @@
 (ns tenon.workflow.http.listing-page
   "The workflow listing page (the dashboard at tenon's root): top-level
    workflows, newest first, filterable by state and workflow, paginated."
-  (:require [clojure.string :as str]
-            [tenon.workflow :as engine]
+  (:require [tenon.workflow :as engine]
             [tenon.workflow.ui :as ui]))
 
 (def ^:private refresh-seconds 10)
-
-(defn- split-name
-  "A workflow's qualified name with the namespace part muted, so the fn
-   name stands out."
-  [wf-def]
-  (if-let [i (str/last-index-of wf-def "/")]
-    [:code [:span.wf-ns (subs wf-def 0 (inc i))] [:b (subs wf-def (inc i))]]
-    (ui/workflow-name wf-def)))
 
 (defn- call-duration
   "How long the call ran - from its first start to its outcome, or while
@@ -47,11 +38,11 @@
             :let [href (ui/uri :workflows invocation_id)]]
         [:tr {:class (str "state-" (if reused "REUSED" (:state row)))}
          [:td [:a {:href href} (ui/timestamp created_at)]]
-         [:td (ui/workflow-link href invocation_id)]
-         [:td [:a {:href href} (split-name wf_def)]]
+         [:td (ui/workflow-link invocation_id)]
+         [:td [:a {:href href} (ui/workflow-name wf_def)]]
          (when show-all?
            [:td (if parent_invocation_id
-                  (ui/workflow-link (ui/uri :workflows parent_invocation_id) parent_invocation_id)
+                  (ui/workflow-link parent_invocation_id)
                   [:a {:href href} (ui/muted "—")])])
          [:td.duration [:a {:href href} (call-duration row now)]]
          [:td [:a {:href href} (call-state row now)]]])]

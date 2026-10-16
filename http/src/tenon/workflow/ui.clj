@@ -1,6 +1,7 @@
 (ns tenon.workflow.ui
   "HTML UI components"
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [hiccup2.core :as hiccup]
@@ -48,6 +49,11 @@
       (str "+" mm-ss)
       (format "+%02d:%s" (quot ms 3600000) mm-ss))))
 
+(defn read-edn
+  "The value EDN string s holds, or ::unreadable if it can't be read."
+  [s]
+  (try (edn/read-string s) (catch Throwable _ ::unreadable)))
+
 (defn pretty
   "value pretty-printed as EDN."
   [value]
@@ -59,20 +65,27 @@
 
 (defn workflow-link
   "A link to workflow id's page: a link icon in front of the id."
-  ([id] (workflow-link (str "/workflows/" id) id))
-  ([href id]
-   [:a {:href href :style "color:#0645ad; text-decoration:underline"} "\u29C9 " (workflow-id id)]))
+  [id]
+  [:a.wf-link {:href (uri :workflows id)} "\u29C9 " (workflow-id id)])
 
-(defn workflow-name [name]
-  [:code (str name)])
+(defn workflow-name
+  "A workflow's qualified fn name, its namespace muted so the fn name
+   stands out."
+  [wf-def]
+  (let [wf-def (str wf-def)]
+    (if-let [i (str/last-index-of wf-def "/")]
+      [:code [:span.wf-ns (subs wf-def 0 (inc i))] [:b (subs wf-def (inc i))]]
+      [:code wf-def])))
+
+(def ^:private timestamp-format
+  (.withZone (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss.SSS")
+             java.time.ZoneOffset/UTC))
 
 (defn timestamp-str
   "Formats an epoch-milliseconds timestamp as UTC, e.g. 2026-01-02 03:04:05.678."
   [epoch-ms]
   (when epoch-ms
-    (.format (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss.SSS")
-             (java.time.LocalDateTime/ofInstant (java.time.Instant/ofEpochMilli epoch-ms)
-                                                java.time.ZoneOffset/UTC))))
+    (.format timestamp-format (java.time.Instant/ofEpochMilli epoch-ms))))
 
 (defn timestamp
   "Renders an epoch-milliseconds timestamp as UTC, e.g. 2026-01-02 03:04:05.678."
@@ -95,7 +108,10 @@
       (pos? diff) (str amount " ago")
       :else (str "in " amount))))
 
-(declare muted)
+(defn muted
+  "Secondary text: small and grey."
+  [& content]
+  (into [:span.panel-muted] content))
 
 (defn timestamp-with-relative
   "An epoch-milliseconds timestamp in UTC, labelled as such, followed by
@@ -114,23 +130,15 @@
     "REUSED" "\u21BA"
     "?"))
 
-(defn state [state]
-  (case state
-    "ERROR" [:span.chip.state-ERROR "Error"]
-    "STARTED" [:span.chip.state-STARTED "Started"]
-    "DONE" [:span.chip.state-DONE "Done"]
-    "REUSED" [:span.chip.state-REUSED "Reused"]
-    [:span.chip (str state)]))
+(defn state
+  "A state's chip: its name, coloured by the state."
+  [state]
+  [:span {:class (str "chip state-" state)} (str/capitalize (str state))])
 
 (defn state-with-tooltip
   "A state's chip, with title as its tooltip if not nil."
   [state-name title]
   [:span (cond-> {:class "tree-state-chip"} title (assoc :title title)) (state state-name)])
-
-(defn muted
-  "Secondary text: small and grey."
-  [& content]
-  (into [:span.panel-muted] content))
 
 (defn breadcrumb
   "A trail of links, e.g. to a page's ancestors: items are [label href]
@@ -165,7 +173,7 @@
   "An EDN string pretty-printed (folded if large, see folded-pre), or shown
    raw if it can't be read."
   [edn-str]
-  (let [value (try (edn/read-string edn-str) (catch Throwable _ ::unreadable))]
+  (let [value (read-edn edn-str)]
     (if (= ::unreadable value)
       [:div (muted "unreadable EDN, shown raw:") (folded-pre (str edn-str))]
       (folded-pre (pretty value)))))
@@ -228,132 +236,15 @@
    (into [:dl.wf-facts] facts)])
 
 (def page-style
-  "body{font-family:sans-serif;margin:2em}
-   table{border-collapse:collapse;width:100%}
-   td,th{padding:6px 10px;border:1px solid #ccc;text-align:left}
-   tr.state-DONE{background:#d4f7d4}
-   tr.state-STARTED{background:#fdf6c9}
-   tr.state-ERROR{background:#f7d4d4}
-   tr.state-REUSED{background:#dde8f7}
-   span.chip{display:inline-block;padding:0 .7em;border-radius:999px;font-size:.8em;font-weight:600;
-             font-variant-caps:all-small-caps;letter-spacing:.06em;line-height:1.7;white-space:nowrap;
-             background:#ced4da;color:#1a1a1a}
-   span.chip.state-DONE{background:#69db7c}
-   span.chip.state-ERROR{background:#ff8787}
-   span.chip.state-STARTED{background:#fcc419}
-   span.chip.state-REUSED{background:#91a7ff}
-   tr:hover{filter:brightness(0.95)}
-   form.filters{display:flex;flex-wrap:wrap;align-items:center;gap:.5em 1.2em;margin:0;padding:8px 12px;
-                background:#fafafa;border:1px solid #ccc;border-bottom:none;border-radius:8px 8px 0 0;font-size:.9em}
-   form.filters label,.pager label{display:inline-flex;align-items:center;gap:.4em}
-   form.filters select,.pager select{font:inherit;padding:3px 6px;border:1px solid rgba(0,0,0,.25);border-radius:6px;background:#fff}
-   .filters-right{margin-left:auto;display:flex;align-items:center;gap:1.2em}
-   .btn.on{background:#e7f5ff;border-color:#74c0fc}
-   .btn.disabled{color:#999;cursor:default}
-   .btn.disabled:hover{background:#fff}
-   .pager{display:flex;align-items:center;gap:1em;font-size:.9em}
-   .pager form{margin:0}
-   table.workflows span.chip{background:none;padding:0}
-   table.workflows .wf-expired{font-size:.8em}
-   table.workflows td.duration{white-space:nowrap;font-size:.9em;color:#333}
-   .pager a.btn{display:inline-block}
-   .wf-ns{color:#777}
-   a{color:inherit;text-decoration:none}
-   td a{display:block}
-   header.page-head{display:flex;align-items:center;gap:1em;flex-wrap:wrap}
-   header.page-head h1{min-width:0;overflow-wrap:anywhere}
-   a.back{margin-left:auto;white-space:nowrap;padding:4px 12px;border:1px solid rgba(0,0,0,.25);
-          border-radius:6px;background:#fff;font-size:.9em}
-   a.back:hover{background:#f0f0f0}
-   pre{background:#f5f5f5;padding:1em;overflow-x:auto;white-space:pre-wrap}
-   section.wf-summary{border:1px solid #ddd;border-left:6px solid #ced4da;border-radius:8px;
-                      padding:12px 16px;margin-bottom:1.5em;background:#fafafa}
-   section.wf-summary.state-DONE{border-left-color:#69db7c}
-   section.wf-summary.state-ERROR{border-left-color:#ff8787}
-   section.wf-summary.state-STARTED{border-left-color:#fcc419}
-   .wf-summary-head{display:flex;align-items:center;gap:.75em;margin-bottom:10px}
-   .wf-summary-head span.chip{font-size:.95em}
-   .wf-summary-duration{color:#555}
-   .btn,a.back,label{-webkit-user-select:none;user-select:none}
-   .btn{display:inline-block;padding:4px 12px;border:1px solid rgba(0,0,0,.25);border-radius:6px;
-        background:#fff;color:inherit;cursor:pointer;font:inherit;font-size:.9em;list-style:none}
-   .btn:hover{background:#f0f0f0}
-   .btn.danger{background:#ffe3e3;border-color:#ff8787}
-   .btn.danger:hover{background:#ffc9c9}
-   details.panel-toggle{position:relative}
-   details.panel-toggle>summary::-webkit-details-marker{display:none}
-   details.panel-toggle[open]>summary{background:#eee}
-   .panel-toggle-panel{position:absolute;right:0;top:calc(100% + 6px);z-index:1;width:max-content;max-width:22em;
-                       padding:10px 12px;background:#fff;border:1px solid #ccc;border-radius:8px;
-                       box-shadow:0 4px 12px rgba(0,0,0,.12)}
-   .wf-summary-head details.panel-toggle{margin-left:auto}
-   form.restart{display:flex;flex-direction:column;gap:8px;margin:0}
-   .wf-summary-error{background:#ffe3e3;color:#a51d1d}
-   nav.breadcrumb{margin:-.5em 0 1em;font-size:.9em;color:#555;display:flex;flex-wrap:wrap;gap:.4em;align-items:center}
-   nav.breadcrumb a{color:#0645ad;text-decoration:underline}
-   nav.breadcrumb .breadcrumb-sep{color:#999}
-   nav.breadcrumb .breadcrumb-current{font-weight:600}
-   details.fold>summary{list-style:none;cursor:pointer}
-   details.fold>summary::-webkit-details-marker{display:none}
-   details.fold .fold-preview{margin:0;-webkit-mask-image:linear-gradient(#000 70%,transparent);mask-image:linear-gradient(#000 70%,transparent)}
-   details.fold .fold-more,details.fold .fold-less{display:inline-block;margin-top:4px;font-size:.85em;color:#0645ad;text-decoration:underline}
-   details.fold .fold-less,details.fold[open] .fold-more,details.fold[open] .fold-preview{display:none}
-   details.fold[open] .fold-less{display:inline-block;margin:0 0 4px}
-   .wf-summary-note{margin:0 0 10px;padding:6px 10px;background:#fff3bf;border-radius:4px;font-size:.9em}
-   dl.wf-facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(13em,1fr));gap:10px 24px;margin:0}
-   dl.wf-facts dt{font-size:.75em;text-transform:uppercase;letter-spacing:.06em;color:#777}
-   dl.wf-facts dd{margin:2px 0 0}
-   dl.wf-facts a{display:inline}
-   .wf-expired{color:#c92a2a;font-weight:600}
-   div.panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(22em,1fr));gap:16px;align-items:start;margin-bottom:1.5em}
-   section.panel{border:1px solid #ddd;border-radius:8px;background:#fff;overflow:hidden;min-width:0}
-   .panel-head{display:flex;align-items:baseline;gap:.75em;padding:8px 14px;background:#fafafa;border-bottom:1px solid #eee}
-   .panel-head h2{margin:0;font-size:1em}
-   .panel-body{padding:10px 14px}
-   .panel-body pre{margin:0;padding:8px 10px;font-size:.9em}
-   .panel-muted{color:#777;font-size:.85em}
-   dl.kv{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 12px;margin:0;align-items:baseline}
-   dl.kv>div{display:contents}
-   dl.kv dt{color:#555}
-   dl.kv dd{margin:0;min-width:0}
-   .error-class{color:#555;font-size:.9em}
-   .error-message{margin:6px 0 10px;font-size:1.1em;font-weight:600;color:#a51d1d;white-space:pre-wrap}
-   ul.tree,ul.tree ul{list-style:none;margin:0;padding:0}
-   ul.tree ul{margin-left:.6em;padding-left:1.2em;border-left:1px dashed #aaa}
-   ul.tree li{margin:4px 0}
-   ul.tree summary{cursor:pointer;padding:4px 8px;border-radius:4px;display:flex;align-items:center;gap:.5em;list-style:none}
-   ul.tree summary::-webkit-details-marker{display:none}
-   ul.tree summary::before{content:'\\25B8';display:inline-block;width:1em;text-align:center;transition:transform .15s}
-   ul.tree details[open]>summary::before{transform:rotate(90deg)}
-   ul.tree summary a{display:inline}
-   ul.tree details:not([open])>summary{box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}
-   ul.tree li.tree-event{padding:2px 8px;border-radius:4px;display:flex;align-items:center;gap:.5em;min-height:1.6em}
-   ul.tree li.tree-leaf{padding:4px 8px;border-radius:4px;display:flex;align-items:center;gap:.5em}
-   ul.tree li.tree-leaf::before{content:'\\2022';width:1em;text-align:center;color:#888}
-   ul.tree li.tree-leaf a{display:inline}
-   ul.tree .tree-cols{margin-left:auto;display:flex;align-items:center;gap:.8em;flex:none}
-   ul.tree .tree-cols>span{flex:none;white-space:nowrap}
-   ul.tree .tree-time{width:8.5em;text-align:right;color:#555;font-size:.85em;font-variant-numeric:tabular-nums}
-   ul.tree .tree-offset{min-width:6.5em;color:#555;font:inherit;font-size:.85em;font-variant-numeric:tabular-nums}
-   ul.tree .tree-verb{color:#333;font-size:.9em}
-   ul.tree .tree-count{width:3em;text-align:right;color:#333;font-size:.85em}
-   ul.tree .tree-state{width:5.5em;text-align:right}
-   ul.tree .tree-state span.chip{background:none;padding:0}
-   ul.tree .tree-reuse{color:#555;font-size:.85em}
-   ul.tree .tree-reuse a{display:inline}
-   ul.tree [title]{cursor:help}
-   ul.tree summary.state-DONE,ul.tree li.state-DONE{background:#d4f7d4}
-   ul.tree summary.state-STARTED,ul.tree li.state-STARTED{background:#fdf6c9}
-   ul.tree summary.state-ERROR,ul.tree li.state-ERROR{background:#f7d4d4}
-   ul.tree summary.state-REUSED,ul.tree li.state-REUSED{background:#dde8f7}")
+  "The stylesheet every page inlines."
+  (slurp (io/resource "tenon/workflow/ui.css")))
 
 (def page-sizes [100 500 1000 5000])
 (def default-page-size 100)
 
 (defn select-filter [param-name label options selected]
-  [:span.filter
-   [:label {:for param-name} label ": "]
-   [:select {:name param-name :id param-name :onchange "this.form.submit()"}
+  [:label label ": "
+   [:select {:name param-name :onchange "this.form.submit()"}
     [:option (cond-> {:value ""} (nil? selected) (assoc :selected true)) "All"]
     (for [o options]
       [:option (cond-> {:value o} (= o selected) (assoc :selected true)) o])]])
@@ -380,7 +271,7 @@
           [:header.page-head
            [:h1 title]
            (when-let [[href label] back]
-             [:a.back {:href href} "\u2190 " label])]
+             [:a.btn.back {:href href} "\u2190 " label])]
           body]]
         (hiccup/html {:mode :html})
         (str))))

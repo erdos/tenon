@@ -37,20 +37,27 @@
   (is (= ["x" "y"]
          (:page_cursor (ui/parse-pagination {"after_a" "x" "after_b" "y"} [:after_a :after_b])))))
 
-(deftest workflow-link-defaults-href-to-plain-workflows-path-test
-  (is (= "<a href=\"/workflows/abc\" style=\"color:#0645ad; text-decoration:underline\">\u29C9 <code>abc</code></a>"
-         (str (hiccup/html (ui/workflow-link "abc"))))))
-
-(deftest workflow-link-accepts-an-explicit-href-test
-  (is (= "<a href=\"/tenon/workflows/abc\" style=\"color:#0645ad; text-decoration:underline\">\u29C9 <code>abc</code></a>"
-         (str (hiccup/html (ui/workflow-link "/tenon/workflows/abc" "abc"))))))
-
-(deftest workflow-link-looks-like-a-link-test
-  (let [html (str (hiccup/html (ui/workflow-link "abc")))]
-    (is (re-find #"color:#0645ad" html))
-    (is (re-find #"text-decoration:underline" html))))
-
 (defn- html [hiccup] (str (hiccup/html hiccup)))
+
+(deftest workflow-link-test
+  (is (= "<a class=\"wf-link\" href=\"/workflows/12\">\u29C9 <code>12</code></a>"
+         (str (hiccup/html (ui/workflow-link 12)))))
+  (binding [ui/*uri-prefix* "/tenon"]
+    (is (= "<a class=\"wf-link\" href=\"/tenon/workflows/12\">\u29C9 <code>12</code></a>"
+           (str (hiccup/html (ui/workflow-link 12))))
+        "the link honours the mount prefix")))
+
+(deftest workflow-name-test
+  (is (= "<code><span class=\"wf-ns\">a.b/</span><b>run</b></code>" (str (hiccup/html (ui/workflow-name "a.b/run")))))
+  (is (= "<code>plain</code>" (str (hiccup/html (ui/workflow-name "plain"))))))
+
+(deftest state-test
+  (is (= "<span class=\"chip state-STARTED\">Started</span>" (str (hiccup/html (ui/state "STARTED")))))
+  (is (= "<span class=\"chip state-\"></span>" (str (hiccup/html (ui/state nil))))))
+
+(deftest read-edn-test
+  (is (= [1 2] (ui/read-edn "[1 2]")))
+  (is (= ::ui/unreadable (ui/read-edn "(1 2"))))
 
 (deftest panel-test
   (is (= (str "<section class=\"panel\"><div class=\"panel-head\"><h2>Result</h2>"
