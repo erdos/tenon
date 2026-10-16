@@ -310,6 +310,35 @@
         app (wrapped-app "" original)]
     (is (re-find #"<h1>Workflows</h1>" (:body (app (mock/request :get "/")))))))
 
+(defn- async-call
+  "Calls app's async (3-arity) handler and returns what it responded with,
+   or throws what it raised."
+  [app request]
+  (let [result (promise)]
+    (app request #(deliver result {:response %}) #(deliver result {:error %}))
+    (let [{:keys [response error]} (deref result 1000 {:error (ex-info "timeout" {})})]
+      (if error (throw error) response))))
+
+(deftest wrap-handler-async-delegates-non-prefixed-uris-test
+  (let [original (fn [_request respond _raise] (respond {:status 200 :body "from the original app"}))
+        app (wrapped-app "/tenon" original)]
+    (is (= "from the original app" (:body (async-call app (mock/request :get "/other")))))))
+
+(deftest wrap-handler-async-routes-prefixed-uris-to-tenon-test
+  (let [original (fn [_request _respond raise] (raise (ex-info "unreachable" {})))
+        app (wrapped-app "/tenon" original)]
+    (is (re-find #"<h1>Workflows</h1>" (:body (async-call app (mock/request :get "/tenon")))))))
+
+(deftest app-async-not-found-test
+  (let [response (async-call (http/app engine/*workflow-engine*) (mock/request :get "/no/such/route"))]
+    (is (= 404 (:status response)))
+    (is (= {:error "not found"} (json/parse-string (:body response) true)))))
+
+(deftest app-not-found-test
+  (let [response ((http/app engine/*workflow-engine*) (mock/request :get "/no/such/route"))]
+    (is (= 404 (:status response)))
+    (is (= {:error "not found"} (json/parse-string (:body response) true)))))
+
 (deftest workflow-detail-page-shows-reused-sub-workflow-test
   ;; A child whose result another parent reused shows under that parent's
   ;; timeline too, with its REUSED row labelled.

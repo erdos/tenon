@@ -1,6 +1,7 @@
 (ns tenon.workflow.http
   (:require [ring.middleware.json :refer [wrap-json-response]]
             [ring.middleware.params :refer [wrap-params]]
+            [ring.util.response :as response]
             [hiccup2.core :as hiccup]
             [clojure.edn :as edn]
             [clojure.string :as str]
@@ -268,16 +269,29 @@
 
    engine is an application-state map as built by
    tenon.workflow/init - passed through to handler for every
-   request tenon serves."
+   request tenon serves.
+
+   The returned handler supports both the synchronous (1-arity) and the
+   asynchronous (3-arity) ring handler protocols. Tenon's own routes are
+   computed synchronously either way; in the async arity non-tenon
+   requests are passed on to original-handler's async arity."
   [engine tenon-uri-prefix original-handler]
   (let [prefix (if (= "/" tenon-uri-prefix) "" tenon-uri-prefix)]
-    (fn [{:keys [uri] :as request}]
-      (if-let [relative-uri (strip-prefix prefix uri)]
-        (handler engine prefix (assoc request :uri relative-uri))
-        (original-handler request)))))
+    (fn
+      ([{:keys [uri] :as request}]
+       (if-let [relative-uri (strip-prefix prefix uri)]
+         (handler engine prefix (assoc request :uri relative-uri))
+         (original-handler request)))
+      ([{:keys [uri] :as request} respond raise]
+       (if-let [relative-uri (strip-prefix prefix uri)]
+         (when-let [resp (try (handler engine prefix (assoc request :uri relative-uri))
+                              (catch Throwable t (raise t) nil))]
+           (respond resp))
+         (original-handler request respond raise))))))
 
-(def ^:private not-found-handler
-  (constantly {:status 404 :body {:error "not found"}}))
+(defn- not-found-handler
+  ([_request] (response/not-found {:error "not found"}))
+  ([request respond _raise] (respond (not-found-handler request))))
 
 (defn app
   "The standalone, unprefixed (mounted at \"/\") ring app."
