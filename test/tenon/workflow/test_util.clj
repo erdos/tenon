@@ -86,9 +86,13 @@
   (let [file (java.io.File/createTempFile "tenon-test" ".db")
         path (.getAbsolutePath file)]
     (try
-      (binding [*db-path* path
-                engine/*workflow-engine* (engine/init path)]
-        (f))
+      (let [engine (engine/init path)]
+        (try
+          (binding [*db-path* path
+                    engine/*workflow-engine* engine]
+            (f))
+          (finally
+            (.close ^java.io.Closeable (:tenon/db engine)))))
       (finally
         (doseq [suffix ["" "-wal" "-shm"]]
           (.delete (java.io.File. (str path suffix))))))))
