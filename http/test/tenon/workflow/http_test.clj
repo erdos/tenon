@@ -130,7 +130,7 @@
         row-count (fn [body] (count (re-seq #"class=\"state-STARTED\"" body)))]
     (is (= 100 (row-count body1)) "capped at the requested page size")
     (is (re-find #"<option selected value=\"100\">100</option>" body1))
-    (let [[_ href] (re-find #"<a href=\"([^\"]*before_id[^\"]*)\"" body1)]
+    (let [[_ href] (re-find #"<a [^>]*href=\"([^\"]*before_id[^\"]*)\"" body1)]
       (is (some? href) "a next-page link with a before_id cursor is present")
       (let [href (str/replace href "&amp;" "&")
             [path qs] (str/split href #"\?" 2)
@@ -588,9 +588,11 @@
     (test-util/finish! id "DONE" (pr-str 7))
     (test-util/record-reuse! id nil)
     (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get "/")))]
-      (is (= 2 (count (re-seq #"class=\"state-DONE\"" body))))
-      (is (= 2 (count (re-seq #"test\.ns/reused-top</code>" body))))
-      (is (re-find #"Reused" body) "the reusing call is marked as such"))))
+      (is (= 1 (count (re-seq #"<tr class=\"state-DONE\"" body))))
+      (is (= 1 (count (re-seq #"<tr class=\"state-REUSED\"" body))) "the reusing call is marked as such")
+      (is (= 2 (count (re-seq #"<b>reused-top</b></code>" body))))
+      (is (not (str/includes? (re-find #"<tr class=\"state-REUSED\">.*?</tr>" body) "Done"))
+          "a reuse shows just Reused, not the producer's Done too"))))
 
 (deftest dashboard-lists-nested-reuse-only-with-all-checkbox-test
   (let [parent-id (test-util/insert! "test.ns/reuse-parent")
@@ -599,5 +601,40 @@
     (test-util/record-reuse! child-id parent-id)
     (let [top ((http/app engine/*workflow-engine*) (mock/request :get "/"))
           all ((http/app engine/*workflow-engine*) (mock/request :get "/" {:all "1"}))]
-      (is (not (re-find #"test\.ns/reuse-child</code>" (:body top))))
-      (is (= 2 (count (re-seq #"test\.ns/reuse-child</code>" (:body all))))))))
+      (is (not (re-find #"<b>reuse-child</b>" (:body top))))
+      (is (= 2 (count (re-seq #"<b>reuse-child</b>" (:body all))))))))
+
+(deftest dashboard-row-columns-test
+  ;; Id, the name with its namespace muted, how long it ran, and in
+  ;; sub-workflow mode the parent.
+  (let [parent (test-util/insert! "test.ns/cols-parent")
+        child (test-util/insert! "test.ns/cols-child" :parent parent)]
+    (test-util/finish! child "DONE" (pr-str 1))
+    (let [top (:body ((http/app engine/*workflow-engine*) (mock/request :get "/")))
+          all (:body ((http/app engine/*workflow-engine*) (mock/request :get "/" {:all "1"})))]
+      (is (re-find (re-pattern (str "<td><a href=\"/workflows/" parent "\"[^>]*>⧉ <code>" parent "</code></a></td>")) top))
+      (is (str/includes? top "<code><span class=\"wf-ns\">test.ns/</span><b>cols-parent</b></code>"))
+      (is (re-find #"<td class=\"duration\"><a [^>]*><span title=\"running for [^\"]+\">running " top))
+      (is (not (str/includes? top "<th>Parent</th>")) "no parent column for top-level workflows only")
+      (is (str/includes? all "<th>Parent</th>"))
+      (is (re-find (re-pattern (str "(?s)<b>cols-child</b>.*?⧉ <code>" parent "</code>.*?</tr>")) all)
+          "a sub-workflow links to its parent")
+      (is (re-find #"<td class=\"duration\"><a [^>]*>\d+ms</a>" all) "a finished one shows how long it ran"))))
+
+(deftest dashboard-flags-expired-lease-test
+  (let [id (test-util/insert! "test.ns/stuck" :timeout-ms 60000)
+        ok (test-util/insert! "test.ns/fresh" :timeout-ms 60000)]
+    (test-util/expire! (test-util/ds) id)
+    (let [body (:body ((http/app engine/*workflow-engine*) (mock/request :get "/")))]
+      (is (= 1 (count (re-seq #"lease expired</span>" body))))
+      (is (re-find #"(?s)<b>stuck</b>.*?lease expired</span>" body)))))
+
+(deftest dashboard-auto-refresh-test
+  (let [off (:body ((http/app engine/*workflow-engine*) (mock/request :get "/" {:state "STARTED"})))
+        on (:body ((http/app engine/*workflow-engine*) (mock/request :get "/" {:state "STARTED" :refresh "1"})))]
+    (is (not (str/includes? off "http-equiv")))
+    (is (str/includes? off "href=\"/?state=STARTED&amp;refresh=1\""))
+    (is (str/includes? on "<meta content=\"10\" http-equiv=\"refresh\">"))
+    (is (str/includes? on "href=\"/?state=STARTED\"") "the toggle turns it off again, keeping the filters")
+    (is (str/includes? on "<input name=\"refresh\" type=\"hidden\" value=\"1\">")
+        "changing a filter keeps refreshing")))

@@ -1,7 +1,6 @@
 (ns tenon.workflow.http
   (:require [ring.middleware.json :refer [wrap-json-response]]
             [ring.middleware.params :refer [wrap-params]]
-            [ring.util.codec :as codec]
             [ring.util.response :as response]
             [clojure.edn :as edn]
             [clojure.string :as str]
@@ -41,9 +40,7 @@
                 nil
                 (catch Throwable e (or (ex-message e) (str (class e)))))
         current (or (:invocation_id (some-> id engine/get-invocation)) id)]
-    (response/redirect (cond-> (ui/uri :workflows current)
-                         error (str "?" (codec/form-encode {"restart_error" error})))
-                       :see-other)))
+    (response/redirect (ui/uri :workflows current {:restart_error error}) :see-other)))
 
 (defn- pending! []
   (try

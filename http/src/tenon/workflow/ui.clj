@@ -3,7 +3,8 @@
   (:require [clojure.edn :as edn]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [hiccup2.core :as hiccup]))
+            [hiccup2.core :as hiccup]
+            [ring.util.codec :as codec]))
 
 (def ^:dynamic *uri-prefix*
   "The URI prefix of tenon routes - bound per request by
@@ -11,9 +12,17 @@
   "")
 
 (defn uri
-  "Builds a prefix-relative URI from path segments."
+  "Builds a prefix-relative URI from path segments. A map as the last
+   argument is the query string's params - ones with a nil value left
+   out, and no ? at all if none is left: (uri :workflows 1 {:a 2 :b nil})
+   is \"/workflows/1?a=2\"."
   [& segments]
-  (str *uri-prefix* "/" (str/join "/" (map #(if (keyword? %) (name %) (str %)) segments))))
+  (let [[segments params] (if (map? (last segments))
+                            [(butlast segments) (last segments)]
+                            [segments nil])
+        qs (codec/form-encode (into {} (for [[k v] params :when (some? v)] [(name k) v])))]
+    (cond-> (str *uri-prefix* "/" (str/join "/" (map #(if (keyword? %) (name %) (str %)) segments)))
+      (seq qs) (str "?" qs))))
 
 (defn pluralize
   "n and word, plural for any n but 1: 1 time, 2 times."
@@ -234,6 +243,21 @@
    span.chip.state-STARTED{background:#fcc419}
    span.chip.state-REUSED{background:#91a7ff}
    tr:hover{filter:brightness(0.95)}
+   form.filters{display:flex;flex-wrap:wrap;align-items:center;gap:.5em 1.2em;margin:0;padding:8px 12px;
+                background:#fafafa;border:1px solid #ccc;border-bottom:none;border-radius:8px 8px 0 0;font-size:.9em}
+   form.filters label,.pager label{display:inline-flex;align-items:center;gap:.4em}
+   form.filters select,.pager select{font:inherit;padding:3px 6px;border:1px solid rgba(0,0,0,.25);border-radius:6px;background:#fff}
+   .filters-right{margin-left:auto;display:flex;align-items:center;gap:1.2em}
+   .btn.on{background:#e7f5ff;border-color:#74c0fc}
+   .btn.disabled{color:#999;cursor:default}
+   .btn.disabled:hover{background:#fff}
+   .pager{display:flex;align-items:center;gap:1em;font-size:.9em}
+   .pager form{margin:0}
+   table.workflows span.chip{background:none;padding:0}
+   table.workflows .wf-expired{font-size:.8em}
+   table.workflows td.duration{white-space:nowrap;font-size:.9em;color:#333}
+   .pager a.btn{display:inline-block}
+   .wf-ns{color:#777}
    a{color:inherit;text-decoration:none}
    td a{display:block}
    header.page-head{display:flex;align-items:center;gap:1em;flex-wrap:wrap}
@@ -250,7 +274,7 @@
    .wf-summary-head{display:flex;align-items:center;gap:.75em;margin-bottom:10px}
    .wf-summary-head span.chip{font-size:.95em}
    .wf-summary-duration{color:#555}
-   .btn,a.back{-webkit-user-select:none;user-select:none}
+   .btn,a.back,label{-webkit-user-select:none;user-select:none}
    .btn{display:inline-block;padding:4px 12px;border:1px solid rgba(0,0,0,.25);border-radius:6px;
         background:#fff;color:inherit;cursor:pointer;font:inherit;font-size:.9em;list-style:none}
    .btn:hover{background:#f0f0f0}
@@ -327,7 +351,7 @@
 (def default-page-size 100)
 
 (defn select-filter [param-name label options selected]
-  [:span {:style "margin-right: 1em"}
+  [:span.filter
    [:label {:for param-name} label ": "]
    [:select {:name param-name :id param-name :onchange "this.form.submit()"}
     [:option (cond-> {:value ""} (nil? selected) (assoc :selected true)) "All"]
@@ -344,11 +368,14 @@
 (defn layout
   "A whole HTML page, as a string, titled title. Options: back, an
    [href label] link shown at the top right to the page this one belongs
-   under, and tab-title, the browser tab's title if not title."
+   under, tab-title, the browser tab's title if not title, and refresh,
+   seconds after which the browser reloads the page."
   ([title body] (layout title {} body))
-  ([title {:keys [back tab-title]} body]
+  ([title {:keys [back tab-title refresh]} body]
    (->> [:html
-         [:head [:title (or tab-title title)] [:style (hiccup/raw page-style)]]
+         [:head [:title (or tab-title title)]
+          (when refresh [:meta {:http-equiv "refresh" :content (str refresh)}])
+          [:style (hiccup/raw page-style)]]
          [:body
           [:header.page-head
            [:h1 title]

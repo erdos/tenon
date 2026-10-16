@@ -4,6 +4,15 @@
             [hiccup2.core :as hiccup]
             [tenon.workflow.ui :as ui]))
 
+(deftest uri-test
+  (is (= "/" (ui/uri)))
+  (is (= "/workflows/12/restart" (ui/uri :workflows 12 :restart)))
+  (is (= "/workflows/12?a=1&b=x+y%26z" (ui/uri :workflows 12 {:a 1 :b "x y&z"})))
+  (is (= "/?state=DONE" (ui/uri {:state "DONE" :wf_def nil})) "nil params are left out")
+  (is (= "/workflows/12" (ui/uri :workflows 12 {:restart_error nil})) "no ? without params")
+  (binding [ui/*uri-prefix* "/tenon"]
+    (is (= "/tenon/workflows/1?a=1" (ui/uri :workflows 1 {:a 1})))))
+
 (deftest parse-pagination-defaults-page-size-when-absent-test
   (is (= {:page-size 100 :page_cursor nil}
          (ui/parse-pagination {} [:before_ts :before_id]))))
