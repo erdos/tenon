@@ -1,10 +1,13 @@
 /* tenon's HTML UI - inlined into every page by tenon.workflow.ui/layout */
 
-/* Per-state colours: --tint for row backgrounds, --strong for chips and edges. */
+/* Per-state colours: --tint for light fills, --strong for chips and edges. */
 .state-DONE{--tint:#d4f7d4;--strong:#69db7c}
 .state-STARTED{--tint:#fdf6c9;--strong:#fcc419}
 .state-ERROR{--tint:#f7d4d4;--strong:#ff8787}
 .state-REUSED{--tint:#dde8f7;--strong:#91a7ff}
+/* Row background: a pastel gradient of the state's colours. */
+[class*="state-"]{--row-bg:linear-gradient(90deg,color-mix(in srgb,var(--tint) 80%,var(--strong)),
+                  color-mix(in srgb,var(--tint) 80%,#ddd) 30%,color-mix(in srgb,var(--tint) 55%,#eee))}
 
 body{font-family:sans-serif;margin:2em}
 a{color:inherit;text-decoration:none}
@@ -41,9 +44,12 @@ form.filters select,.pager select{font:inherit;padding:3px 6px;border:1px solid 
 table{border-collapse:collapse;width:100%}
 td,th{padding:6px 10px;border:1px solid #ccc;text-align:left}
 td a{display:block}
-tbody tr{background:var(--tint)}
+tbody tr{background:var(--row-bg)}
 tr:hover{filter:brightness(0.95)}
+table.workflows{border-collapse:separate;border-spacing:1px;border:1px solid #ccc}
+table.workflows td,table.workflows th{border:none}
 table.workflows .wf-expired{font-size:.8em}
+table.workflows .state{text-align:right}
 table.workflows td.duration{white-space:nowrap;font-size:.9em;color:#333}
 .pager{display:flex;align-items:center;gap:1em;font-size:.9em}
 .pager form{margin:0}
@@ -108,7 +114,7 @@ ul.tree ul>li::before,ul.tree ul>li:not(:last-child)::after{content:'';position:
 ul.tree ul>li::before{top:-4px;width:1em;height:calc(.95em + 4px);border-bottom:1px dashed #aaa}
 ul.tree ul>li:not(:last-child)::after{top:calc(.95em + 1px);bottom:-4px}
 ul.tree summary,ul.tree li.tree-event,ul.tree li.tree-leaf{padding:4px 8px;border-radius:4px;display:flex;
-                                                          align-items:center;gap:.5em;background:var(--tint)}
+                                                          align-items:center;gap:.5em;background:var(--row-bg)}
 ul.tree li.tree-event{padding:2px 8px;min-height:1.6em}
 ul.tree summary{cursor:pointer;list-style:none}
 ul.tree summary::-webkit-details-marker{display:none}

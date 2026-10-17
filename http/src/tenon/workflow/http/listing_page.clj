@@ -32,7 +32,7 @@
     [:p "none"]
     [:table.workflows
      [:thead [:tr [:th "Timestamp"] [:th "Id"] [:th "Workflow"] (when show-all? [:th "Parent"])
-              [:th "Duration"] [:th "State"]]]
+              [:th "Duration"] [:th.state "State"]]]
      [:tbody
       (for [{:keys [invocation_id wf_def created_at reused parent_invocation_id] :as row} rows
             :let [href (ui/uri :workflows invocation_id)]]
@@ -45,7 +45,7 @@
                   (ui/workflow-link parent_invocation_id)
                   [:a {:href href} (ui/muted "—")])])
          [:td.duration [:a {:href href} (call-duration row now)]]
-         [:td [:a {:href href} (call-state row now)]]])]
+         [:td.state [:a {:href href} (call-state row now)]]])]
      [:tfoot [:tr [:td {:colspan (if show-all? 6 5)} footer]]]]))
 
 (def ^:private states ["STARTED" "DONE" "ERROR"])
