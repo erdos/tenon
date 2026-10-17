@@ -99,8 +99,14 @@ details.fold[open] .fold-less{display:inline-block;margin:0 0 4px}
 
 /* Details: timeline tree */
 ul.tree,ul.tree ul{list-style:none;margin:0;padding:0}
-ul.tree ul{margin-left:.6em;padding-left:1.2em;border-left:1px dashed #aaa}
-ul.tree li{margin:4px 0}
+ul.tree ul{margin-left:.6em;padding-left:1.2em}
+ul.tree li{margin:4px 0;position:relative}
+/* Tree connectors: an elbow into each child row (ending mid-row), and a
+   line on down past its subtree for all but the last child. */
+ul.tree ul>li::before,ul.tree ul>li:not(:last-child)::after{content:'';position:absolute;left:-1.2em;
+                                                          border-left:1px dashed #aaa}
+ul.tree ul>li::before{top:-4px;width:1em;height:calc(.95em + 4px);border-bottom:1px dashed #aaa}
+ul.tree ul>li:not(:last-child)::after{top:calc(.95em + 1px);bottom:-4px}
 ul.tree summary,ul.tree li.tree-event,ul.tree li.tree-leaf{padding:4px 8px;border-radius:4px;display:flex;
                                                           align-items:center;gap:.5em;background:var(--tint)}
 ul.tree li.tree-event{padding:2px 8px;min-height:1.6em}
@@ -109,7 +115,7 @@ ul.tree summary::-webkit-details-marker{display:none}
 ul.tree summary::before{content:'\25B8';display:inline-block;width:1em;text-align:center;transition:transform .15s}
 ul.tree details[open]>summary::before{transform:rotate(90deg)}
 ul.tree details:not([open])>summary{box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}
-ul.tree li.tree-leaf::before{content:'\2022';width:1em;text-align:center;color:#888}
+ul.tree .tree-bullet{width:1em;text-align:center;color:#888}
 ul.tree .tree-cols{margin-left:auto;display:flex;align-items:center;gap:.8em;flex:none}
 ul.tree .tree-cols>span{flex:none;white-space:nowrap}
 ul.tree .tree-time{width:8.5em;text-align:right;color:#555;font-size:.85em;font-variant-numeric:tabular-nums}

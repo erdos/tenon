@@ -142,6 +142,7 @@
    isn't the reused workflow's current one (it was restarted since)."
   [start {:keys [current_invocation_id invocation_id wf_def] :as ev}]
   [:li.tree-leaf.state-REUSED
+   [:span.tree-bullet "\u2022"]
    (tree-offset start ev "Invoked")
    (ui/workflow-name wf_def)
    (ui/workflow-link current_invocation_id)
