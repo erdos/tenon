@@ -10,6 +10,8 @@
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                       ring/ring-mock {:mvn/version "0.4.0"}
+                      kerodon/kerodon {:mvn/version "0.9.1"
+                                       :exclusions [ring-mock/ring-mock]}
                       ring/ring-jetty-adapter {:mvn/version "1.13.0"}
                       ring/ring-devel {:mvn/version "1.13.0"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "test"]}}}

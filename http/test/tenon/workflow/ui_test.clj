@@ -1,8 +1,11 @@
 (ns tenon.workflow.ui-test
-  (:require [clojure.test :refer [deftest is]]
-            [clojure.string :as str]
-            [hiccup2.core :as hiccup]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
+            [kerodon.core :refer [within]]
+            [kerodon.test :refer [has text? attr? missing? heading?]]
+            [tenon.workflow.kerodon-util :as ku :refer [render count? present? texts? attrs?]]
             [tenon.workflow.ui :as ui]))
+
+(use-fixtures :each ku/html5-fixture)
 
 (deftest uri-test
   (is (= "/" (ui/uri)))
@@ -37,54 +40,72 @@
   (is (= ["x" "y"]
          (:page_cursor (ui/parse-pagination {"after_a" "x" "after_b" "y"} [:after_a :after_b])))))
 
-(defn- html [hiccup] (str (hiccup/html hiccup)))
-
 (deftest workflow-link-test
-  (is (= "<a class=\"wf-link\" href=\"/workflows/12\">\u29C9 <code>12</code></a>"
-         (str (hiccup/html (ui/workflow-link 12)))))
+  (-> (render (ui/workflow-link 12))
+      (has (attr? [:a.wf-link] :href "/workflows/12"))
+      (has (texts? [:a.wf-link] ["⧉ 12"]))
+      (has (texts? [:a.wf-link :code] ["12"]) "the id is shown as code"))
   (binding [ui/*uri-prefix* "/tenon"]
-    (is (= "<a class=\"wf-link\" href=\"/tenon/workflows/12\">\u29C9 <code>12</code></a>"
-           (str (hiccup/html (ui/workflow-link 12))))
-        "the link honours the mount prefix")))
+    (-> (render (ui/workflow-link 12))
+        (has (attr? [:a.wf-link] :href "/tenon/workflows/12") "the link honours the mount prefix"))))
 
 (deftest workflow-name-test
-  (is (= "<code><span class=\"wf-ns\">a.b/</span><b>run</b></code>" (str (hiccup/html (ui/workflow-name "a.b/run")))))
-  (is (= "<code>plain</code>" (str (hiccup/html (ui/workflow-name "plain"))))))
+  (-> (render (ui/workflow-name "a.b/run"))
+      (has (texts? [:code] ["a.b/run"]))
+      (has (texts? [:code :span.wf-ns] ["a.b/"]) "the namespace is muted")
+      (has (texts? [:code :b] ["run"]) "the fn name stands out"))
+  (-> (render (ui/workflow-name "plain"))
+      (has (texts? [:code] ["plain"]))
+      (has (missing? [:code :span]))
+      (has (missing? [:code :b]))))
 
 (deftest state-test
-  (is (= "<span class=\"chip state-STARTED\">Started</span>" (str (hiccup/html (ui/state "STARTED")))))
-  (is (= "<span class=\"chip state-\"></span>" (str (hiccup/html (ui/state nil))))))
+  (-> (render (ui/state "STARTED"))
+      (has (attr? [:span.chip] :class "chip state-STARTED"))
+      (has (texts? [:span.chip] ["Started"])))
+  (-> (render (ui/state nil))
+      (has (attr? [:span.chip] :class "chip state-"))
+      (has (texts? [:span.chip] [""]))))
 
 (deftest read-edn-test
   (is (= [1 2] (ui/read-edn "[1 2]")))
   (is (= ::ui/unreadable (ui/read-edn "(1 2"))))
 
 (deftest panel-test
-  (is (= (str "<section class=\"panel\"><div class=\"panel-head\"><h2>Result</h2>"
-              "<span class=\"panel-muted\">2 items</span></div><div class=\"panel-body\"><p>body</p></div></section>")
-         (html (ui/panel {:title "Result" :subtitle "2 items"} [:p "body"]))))
-  (is (= "<section class=\"panel\"><div class=\"panel-head\"><h2>Params</h2></div><div class=\"panel-body\"></div></section>"
-         (html (ui/panel {:title "Params"})))
-      "no subtitle"))
+  (-> (render (ui/panel {:title "Result" :subtitle "2 items"} [:p "body"]))
+      (has (present? (ku/panel "Result")))
+      (within [:section.panel :div.panel-head]
+        (has (texts? [:h2] ["Result"]))
+        (has (texts? [:span.panel-muted] ["2 items"])))
+      (has (texts? [:section.panel :div.panel-body :p] ["body"])))
+  (-> (render (ui/panel {:title "Params"}))
+      (has (heading? "Params"))
+      (has (missing? [:span.panel-muted]) "no subtitle")
+      (has (texts? [:section.panel :div.panel-body] [""]) "no body")))
 
 (deftest key-values-test
-  (is (= "<dl class=\"kv\"><div><dt>a</dt><dd>1</dd></div><div><dt>b</dt><dd>2</dd></div></dl>"
-         (html (ui/key-values [["a" "1"] ["b" "2"]])))))
+  (-> (render (ui/key-values [["a" "1"] ["b" "2"]]))
+      (has (texts? [:dl.kv :dt] ["a" "b"]))
+      (has (texts? (ku/dd-of "a") ["1"]))
+      (has (texts? (ku/dd-of "b") ["2"]))))
 
 (deftest error-details-test
-  (is (= (str "<div><div class=\"error-class\"><code>java.lang.Exception</code></div>"
-              "<p class=\"error-message\">boom</p><pre>extra</pre></div>")
-         (html (ui/error-details "java.lang.Exception" "boom" [:pre "extra"])))))
+  (-> (render (ui/error-details "java.lang.Exception" "boom" [:pre "extra"]))
+      (has (texts? [:div.error-class :code] ["java.lang.Exception"]))
+      (has (texts? [:p.error-message] ["boom"]))
+      (has (texts? [:pre] ["extra"]))))
 
 (deftest summary-card-test
-  (is (= (str "<section class=\"wf-summary state-DONE\"><div class=\"wf-summary-head\">"
-              "<span class=\"chip state-DONE\">Done</span><span>1s</span></div>"
-              "<p class=\"wf-summary-note\">a <b>note</b></p>"
-              "<dl class=\"wf-facts\"><div><dt>Id</dt><dd>7</dd></div></dl></section>")
-         (html (ui/summary-card {:state "DONE" :head [[:span "1s"]] :note ["a " [:b "note"]]}
-                                (ui/fact "Id" "7")))))
-  (is (not (re-find #"wf-summary-note" (html (ui/summary-card {:state "DONE"}))))
-      "no note"))
+  (-> (render (ui/summary-card {:state "DONE" :head [[:span "1s"]] :note ["a " [:b "note"]]}
+                               (ui/fact "Id" "7")))
+      (has (attr? [:section.wf-summary] :class "wf-summary state-DONE"))
+      (has (texts? [:div.wf-summary-head :> :span] ["Done" "1s"]) "the state's chip, then the head")
+      (has (attr? [:div.wf-summary-head :span.chip] :class "chip state-DONE"))
+      (has (texts? [:p.wf-summary-note] ["a note"]))
+      (has (texts? [:p.wf-summary-note :b] ["note"]))
+      (has (texts? (ku/dd-of "Id") ["7"])))
+  (-> (render (ui/summary-card {:state "DONE"}))
+      (has (missing? [:p.wf-summary-note]) "no note")))
 
 (deftest relative-time-test
   (is (= "just now" (ui/relative-time 1000 3000)))
@@ -96,24 +117,32 @@
   (is (= "in 3 min" (ui/relative-time (* 3 60 1000) 0))))
 
 (deftest timestamp-with-relative-test
-  (is (= "<span><code>1970-01-01 00:00:00.000 UTC</code> <span class=\"panel-muted\">(42s ago)</span></span>"
-         (html (ui/timestamp-with-relative 0 42000))))
+  (-> (render (ui/timestamp-with-relative 0 42000))
+      (has (texts? [:code] ["1970-01-01 00:00:00.000 UTC"]))
+      (has (texts? [:span.panel-muted] ["(42s ago)"]))
+      (within [:body]
+        (has (text? "1970-01-01 00:00:00.000 UTC (42s ago)"))))
   (is (nil? (ui/timestamp-with-relative nil 0))))
 
 (deftest breadcrumb-test
-  (is (= (str "<nav class=\"breadcrumb\"><a href=\"/a\">A</a><span class=\"breadcrumb-sep\">\u203A</span>"
-              "<span class=\"breadcrumb-current\">B</span></nav>")
-         (html (ui/breadcrumb [["A" "/a"] ["B" nil]])))))
+  (-> (render (ui/breadcrumb [["A" "/a"] ["B" nil]]))
+      (within [:nav.breadcrumb]
+        (has (text? "A›B")))
+      (has (attrs? [:nav.breadcrumb :a] :href ["/a"]))
+      (has (texts? [:nav.breadcrumb :a] ["A"]))
+      (has (texts? [:nav.breadcrumb :span.breadcrumb-sep] ["›"]))
+      (has (texts? [:nav.breadcrumb :span.breadcrumb-current] ["B"]) "the current page is no link")))
 
 (deftest folded-pre-test
-  (is (= "<pre>short</pre>" (html (ui/folded-pre "short"))))
-  (let [folded (html (ui/folded-pre "1\n2\n3\n4" {:max-lines 2}))]
-    (is (str/includes? folded "<pre class=\"fold-preview\">1\n2\n\u2026</pre>"))
-    (is (str/includes? folded "Show all 4 lines"))
-    (is (str/ends-with? folded "<pre>1\n2\n3\n4</pre></details>")))
-  (is (str/includes? (html (ui/folded-pre (apply str (repeat 50 "x")) {:max-chars 10}))
-                     "<pre class=\"fold-preview\">xxxxxxxxxx\n\u2026</pre>")
-      "a single very long line is cut too"))
+  (-> (render (ui/folded-pre "short"))
+      (has (texts? [:pre] ["short"]))
+      (has (missing? [:details])))
+  (-> (render (ui/folded-pre "1\n2\n3\n4" {:max-lines 2}))
+      (has (texts? [:details.fold :summary :pre.fold-preview] ["1 2 …"]) "the first max-lines lines")
+      (has (texts? [:details.fold :summary :span.fold-more] ["Show all 4 lines (7 chars)"]))
+      (has (texts? [:details.fold :> :pre] ["1 2 3 4"]) "the full text, a click away"))
+  (-> (render (ui/folded-pre (apply str (repeat 50 "x")) {:max-chars 10}))
+      (has (texts? [:pre.fold-preview] ["xxxxxxxxxx …"]) "a single very long line is cut too")))
 
 (deftest pluralize-test
   (is (= "0 times" (ui/pluralize 0 "time")))
@@ -140,23 +169,34 @@
   (is (= "nil" (ui/pretty nil))))
 
 (deftest edn-block-test
-  (is (= "<pre>[1 2]</pre>" (html (ui/edn-block "[1 2]"))))
-  (is (= "<pre>nil</pre>" (html (ui/edn-block "nil"))))
-  (is (= "<div><span class=\"panel-muted\">unreadable EDN, shown raw:</span><pre>#object[Foo]</pre></div>"
-         (html (ui/edn-block "#object[Foo]")))))
+  (-> (render (ui/edn-block "[1 2]"))
+      (has (texts? [:pre] ["[1 2]"])))
+  (-> (render (ui/edn-block "nil"))
+      (has (texts? [:pre] ["nil"])))
+  (-> (render (ui/edn-block "#object[Foo]"))
+      (has (texts? [:div :span.panel-muted] ["unreadable EDN, shown raw:"]))
+      (has (texts? [:div :pre] ["#object[Foo]"]))))
 
 (deftest state-with-tooltip-test
-  (is (= "<span class=\"tree-state-chip\" title=\"boom\"><span class=\"chip state-ERROR\">Error</span></span>"
-         (html (ui/state-with-tooltip "ERROR" "boom"))))
-  (is (= "<span class=\"tree-state-chip\"><span class=\"chip state-DONE\">Done</span></span>"
-         (html (ui/state-with-tooltip "DONE" nil)))))
+  (-> (render (ui/state-with-tooltip "ERROR" "boom"))
+      (has (attr? [:span.tree-state-chip] :title "boom"))
+      (has (attr? [:span.tree-state-chip :span.chip] :class "chip state-ERROR"))
+      (has (texts? [:span.tree-state-chip] ["Error"])))
+  (-> (render (ui/state-with-tooltip "DONE" nil))
+      (has (attr? [:span.tree-state-chip] :title nil) "no tooltip")
+      (has (texts? [:span.tree-state-chip :span.chip.state-DONE] ["Done"]))))
 
 (deftest panel-toggle-btn-test
-  (is (= (str "<details class=\"panel-toggle\"><summary class=\"btn\">Open</summary>"
-              "<div class=\"panel-toggle-panel\"><p>panel</p></div></details>")
-         (html (ui/panel-toggle-btn [:button "Open"] [:p "panel"]))))
-  (is (= "<summary class=\"btn primary extra\" title=\"t\">Go <b>!</b></summary>"
-         (re-find #"<summary.*</summary>"
-                  (html (ui/panel-toggle-btn [:button.primary {:class "extra" :title "t" :type "button"} "Go " [:b "!"]]
-                                             [:p "panel"]))))
-      "the button's classes, attributes (but type) and content move onto the summary"))
+  (-> (render (ui/panel-toggle-btn [:button "Open"] [:p "panel"]))
+      (has (attr? [:details.panel-toggle :> :summary] :class "btn"))
+      (has (texts? [:details.panel-toggle :> :summary] ["Open"]))
+      (has (texts? [:details.panel-toggle :> :div.panel-toggle-panel :p] ["panel"]))
+      (has (missing? [:button])))
+  (-> (render (ui/panel-toggle-btn [:button.primary {:class "extra" :title "t" :type "button"} "Go " [:b "!"]]
+                                   [:p "panel"]))
+      (has (attr? [:summary] :class "btn primary extra") "the button's classes move onto the summary")
+      (has (attr? [:summary] :title "t") "so do its attributes")
+      (has (attr? [:summary] :type nil) "but its type")
+      (has (texts? [:summary] ["Go !"]) "and its content")
+      (has (texts? [:summary :b] ["!"]))
+      (has (count? [:button] 0))))

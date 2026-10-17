@@ -5,13 +5,18 @@
             [ring.middleware.params :refer [wrap-params]]
             [ring.middleware.json :refer [wrap-json-response]]
             [cheshire.core :as json]
+            [kerodon.core :as k :refer [within]]
+            [kerodon.test :refer [has status? some-text? regex?
+                                  attr? value? missing? heading? link?]]
+            [net.cgrand.enlive-html :as enlive]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [tenon.workflow.http :as http]
             [tenon.workflow :as engine]
+            [tenon.workflow.kerodon-util :as ku :refer [count? present? texts? attrs? dd-of panel with-text]]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
-(use-fixtures :each temp-db-fixture)
+(use-fixtures :each temp-db-fixture ku/html5-fixture)
 
 (defn- call [req] ((http/app engine/*workflow-engine*) req))
 
@@ -19,6 +24,32 @@
   "The app's response to a mock request (see ring.mock.request/request)."
   [& args]
   (call (apply mock/request args)))
+
+(defn- visit
+  "A kerodon session of the app, having visited uri."
+  ([uri] (visit (http/app engine/*workflow-engine*) uri))
+  ([app uri] (-> (k/session app) (k/visit uri))))
+
+(defn- href [id] (str "/workflows/" id))
+
+(defn- row-of
+  "Selector: the listing's row of workflow id - the one whose first
+   cell links to it."
+  [id]
+  [:table.workflows :tbody
+   [:tr (enlive/has [[:td enlive/first-child] [:a (enlive/attr= :href (href id))]])]])
+
+(def ^:private rows [:table.workflows :tbody :tr])
+
+(defn- selected-option
+  "Selector: the selected <option> of the <select> named select-name."
+  [select-name]
+  [[:select (enlive/attr= :name select-name)] [:option (enlive/attr? :selected)]])
+
+(defn- tree-node
+  "Selector step: the timeline tree's node summary of workflow wf-name."
+  [wf-name]
+  [:summary (enlive/has [[:b (with-text wf-name)]])])
 
 (def ^:private http-flaky-fn (fn [] (throw (ex-info "fail" {}))))
 
@@ -51,58 +82,60 @@
 (deftest dashboard-lists-top-level-workflows-test
   (let [id (test-util/insert! "test.ns/top" :params (pr-str [1]))]
     (test-util/finish! id "DONE" (pr-str :ok))
-    (let [response (request :get "/")]
-      (is (= 200 (:status response)))
-      (is (re-find #"text/html" (get-in response [:headers "Content-Type"])))
-      (is (re-find #"test\.ns/top" (:body response)))
-      (is (re-find (re-pattern (str "/workflows/" id)) (:body response))))))
+    (let [state (-> (visit "/")
+                    (has (status? 200))
+                    (has (heading? "Workflows"))
+                    (has (count? rows 1))
+                    (has (texts? (conj (row-of id) :td :code :span.wf-ns) ["test.ns/"]))
+                    (has (texts? (conj (row-of id) :td :code :b) ["top"]))
+                    (has (attrs? (conj (row-of id) :a.wf-link) :href [(href id)])))]
+      (is (str/starts-with? (get-in state [:response :headers "Content-Type"]) "text/html")))))
 
 (deftest dashboard-excludes-nested-workflows-test
   (let [parent-id (test-util/insert! "test.ns/parent")
-        _ (test-util/insert! "test.ns/child" :parent parent-id)
-        response (request :get "/")]
-    (is (re-find #"test\.ns/parent" (:body response)))
-    (is (not (re-find #"test\.ns/child" (:body response))))))
+        child-id (test-util/insert! "test.ns/child" :parent parent-id)]
+    (-> (visit "/")
+        (has (present? (row-of parent-id)))
+        (has (missing? (row-of child-id))))))
 
 (deftest dashboard-shows-nested-workflows-with-all-checkbox-test
   (let [parent-id (test-util/insert! "test.ns/parent4")
-        _ (test-util/insert! "test.ns/child4" :parent parent-id)
-        response (request :get "/" {:all "1"})
-        body (:body response)]
-    (is (re-find #"test\.ns/parent4" body))
-    (is (re-find #"test\.ns/child4" body)
-        "checked all=1 must include sub-workflows too")
-    (is (re-find #"<input checked name=\"all\"" body)
-        "the checkbox itself must reflect the checked state")))
+        child-id (test-util/insert! "test.ns/child4" :parent parent-id)]
+    (-> (visit "/?all=1")
+        (has (present? (row-of parent-id)))
+        (has (present? (row-of child-id)) "checked all=1 must include sub-workflows too")
+        (has (present? [[:input (enlive/attr= :name "all") (enlive/attr? :checked)]])
+             "the checkbox itself must reflect the checked state"))))
 
 (deftest dashboard-defaults-to-all-states-test
   (let [done-id (test-util/insert! "test.ns/done-wf")
-        _ (test-util/insert! "test.ns/pending-wf")]
+        pending-id (test-util/insert! "test.ns/pending-wf")]
     (test-util/finish! done-id "DONE" (pr-str :ok))
-    (let [response (request :get "/")]
-      (is (re-find #"test\.ns/done-wf" (:body response)))
-      (is (re-find #"test\.ns/pending-wf" (:body response)))
-      (is (re-find #"<option selected value=\"\">All</option>" (:body response))))))
+    (-> (visit "/")
+        (has (present? (row-of done-id)))
+        (has (present? (row-of pending-id)))
+        (has (texts? (selected-option "state") ["All"]))
+        (has (attr? (selected-option "state") :value "")))))
 
 (deftest dashboard-filters-by-state-query-param-test
   (let [done-id (test-util/insert! "test.ns/done-wf2")
         pending-id (test-util/insert! "test.ns/pending-wf2")]
     (test-util/finish! done-id "DONE" (pr-str :ok))
-    (let [response (request :get "/" {:state "DONE"})]
-      (is (re-find (re-pattern (str "/workflows/" done-id)) (:body response)))
-      (is (not (re-find (re-pattern (str "/workflows/" pending-id)) (:body response)))
-          "the STARTED row must be filtered out of the table - it may still appear as a dropdown option")
-      (is (re-find #"<option selected value=\"DONE\">DONE</option>" (:body response))))))
+    (-> (visit "/?state=DONE")
+        (has (present? (row-of done-id)))
+        (has (missing? (row-of pending-id)) "the STARTED row is filtered out of the table")
+        (has (attr? (selected-option "state") :value "DONE")))))
 
 (deftest dashboard-filters-by-wf-def-query-param-test
   (let [a-id (test-util/insert! "test.ns/name-a")
-        b-id (test-util/insert! "test.ns/name-b")
-        response (request :get "/" {:wf_def "test.ns/name-a"})]
-    (is (re-find (re-pattern (str "/workflows/" a-id)) (:body response)))
-    (is (not (re-find (re-pattern (str "/workflows/" b-id)) (:body response))))
-    (is (re-find #"<option selected value=\"test\.ns/name-a\">test\.ns/name-a</option>" (:body response)))
-    (is (re-find #"<option value=\"test\.ns/name-b\">test\.ns/name-b</option>" (:body response))
-        "the other name still appears as an unselected dropdown option")))
+        b-id (test-util/insert! "test.ns/name-b")]
+    (-> (visit "/?wf_def=test.ns/name-a")
+        (has (present? (row-of a-id)))
+        (has (missing? (row-of b-id)))
+        (has (texts? (selected-option "wf_def") ["test.ns/name-a"]))
+        (has (present? [[:select (enlive/attr= :name "wf_def")]
+                        [:option (enlive/attr= :value "test.ns/name-b") (enlive/but (enlive/attr? :selected))]])
+             "the other name still appears as an unselected dropdown option"))))
 
 (defn- insert-n-workflows! [n prefix]
   (dotimes [i n]
@@ -110,71 +143,79 @@
 
 (deftest dashboard-defaults-to-page-size-100-with-no-next-page-link-for-small-result-sets-test
   (insert-n-workflows! 5 "small")
-  (let [response (request :get "/")]
-    (is (re-find #"<option selected value=\"100\">100</option>" (:body response)))
-    (is (not (re-find #"before_id" (:body response)))
-        "fewer rows than the page size - no next page")))
+  (-> (visit "/")
+      (has (attr? (selected-option "page_size") :value "100"))
+      (has (count? rows 5))
+      (has (missing? [[:a (enlive/attr-contains :href "before_id")]])
+           "fewer rows than the page size - no next page")
+      (has (texts? [:div.pager :span.btn.disabled] ["Next page \u2192"]))))
 
 (deftest dashboard-paginates-with-seek-based-next-page-link-test
   (insert-n-workflows! 105 "page")
-  (let [page1 (request :get "/" {:page_size "100"})
-        body1 (:body page1)
-        row-count (fn [body] (count (re-seq #"class=\"state-STARTED\"" body)))]
-    (is (= 100 (row-count body1)) "capped at the requested page size")
-    (is (re-find #"<option selected value=\"100\">100</option>" body1))
-    (let [[_ href] (re-find #"<a [^>]*href=\"([^\"]*before_id[^\"]*)\"" body1)]
-      (is (some? href) "a next-page link with a before_id cursor is present")
-      (let [href (str/replace href "&amp;" "&")
-            [path qs] (str/split href #"\?" 2)
-            page2 (call (assoc (mock/request :get path) :query-string qs))
-            body2 (:body page2)]
-        (is (= 5 (row-count body2)) "the remaining rows, none repeated or skipped")
-        (is (not (re-find #"before_id" body2))
-            "no further next-page link once the last page is reached")))))
+  (-> (visit "/?page_size=100")
+      (has (count? [:table.workflows :tbody :tr.state-STARTED] 100) "capped at the requested page size")
+      (has (attr? (selected-option "page_size") :value "100"))
+      (has (present? [:div.pager [:a (enlive/attr-contains :href "before_id")]])
+           "a next-page link with a before_id cursor is present")
+      (k/follow "Next page \u2192")
+      (has (status? 200))
+      (has (count? [:table.workflows :tbody :tr.state-STARTED] 5) "the remaining rows, none repeated or skipped")
+      (has (missing? [[:a (enlive/attr-contains :href "before_id")]])
+           "no further next-page link once the last page is reached")))
 
 (deftest workflow-detail-page-shows-params-and-result-test
   (let [id (test-util/insert! "test.ns/detail" :params (pr-str [1 2]))]
     (test-util/finish! id "DONE" (pr-str 42))
-    (let [response (request :get (str "/workflows/" id))]
-      (is (= 200 (:status response)))
-      (is (str/includes? (:body response) "2 arguments"))
-      (is (str/includes? (:body response) "<dt><code>%1</code></dt><dd><pre>1</pre></dd>"))
-      (is (str/includes? (:body response) "<dt><code>%2</code></dt><dd><pre>2</pre></dd>"))
-      (is (re-find #"(?s)<section class=\"panel\">.*<h2>Result</h2><span class=\"panel-muted\">done</span>.*<pre>42</pre>" (:body response))))))
+    (-> (visit (href id))
+        (has (status? 200))
+        (within (panel "Params")
+          (has (texts? [:span.panel-muted] ["2 arguments"]))
+          (has (texts? [:dt] ["%1" "%2"]))
+          (has (texts? (conj (dd-of "%1") :pre) ["1"]))
+          (has (texts? (conj (dd-of "%2") :pre) ["2"])))
+        (within (panel "Result")
+          (has (texts? [:span.panel-muted] ["done"]))
+          (has (texts? [:pre] ["42"]))))))
 
 (deftest workflow-detail-page-shows-no-arguments-and-pending-result-test
-  (let [id (test-util/insert! "test.ns/no-args" :params (pr-str []))
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (str/includes? body "no arguments"))
-    (is (str/includes? body "Pending \u2014 no result yet."))))
+  (let [id (test-util/insert! "test.ns/no-args" :params (pr-str []))]
+    (-> (visit (href id))
+        (has (texts? (conj (panel "Params") :span.panel-muted) ["no arguments"]))
+        (has (texts? (conj (panel "Result") :div.panel-body) ["Pending \u2014 no result yet."])))))
 
 (deftest workflow-detail-page-shows-unreadable-params-raw-test
-  (let [id (test-util/insert! "test.ns/unreadable" :params "[#object[Foo 0x1 \"x\"]]")
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (str/includes? body "unreadable EDN, shown raw:"))
-    (is (str/includes? body "#object[Foo"))))
+  (let [id (test-util/insert! "test.ns/unreadable" :params "[#object[Foo 0x1 \"x\"]]")]
+    (-> (visit (href id))
+        (within (panel "Params")
+          (has (texts? [:span.panel-muted] ["unreadable EDN, shown raw:"]))
+          (has (texts? [:pre] ["[#object[Foo 0x1 \"x\"]]"]))))))
 
 (deftest workflow-detail-page-shows-error-panel-test
   (let [id (test-util/insert! "test.ns/error-panel")]
     (test-util/finish! id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data {:k 1}}))
-    (let [body (:body (request :get (str "/workflows/" id)))]
-      (is (str/includes? body "<section class=\"panel\"><div class=\"panel-head\"><h2>Error</h2>"))
-      (is (str/includes? body "<div class=\"error-class\"><code>clojure.lang.ExceptionInfo</code></div>"))
-      (is (str/includes? body "<p class=\"error-message\">boom</p>"))
-      (is (str/includes? body "<pre>{:k 1}</pre>")))))
+    (-> (visit (href id))
+        (within (panel "Error")
+          (has (texts? [:div.error-class :code] ["clojure.lang.ExceptionInfo"]))
+          (has (texts? [:p.error-message] ["boom"]))
+          (has (texts? [:pre] ["{:k 1}"]))))))
 
 (deftest workflow-detail-page-id-line-is-a-real-link-test
-  (let [id (test-util/insert! "test.ns/id-link")
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (re-find (re-pattern (str "<dt>Id</dt><dd><a class=\"wf-link\" href=\"/workflows/" id "\""))
-                 body))
-    (is (re-find #"text-decoration:underline" body))))
+  (let [id (test-util/insert! "test.ns/id-link")]
+    (-> (visit (href id))
+        (has (attrs? (conj (dd-of "Id") :a.wf-link) :href [(href id)]))
+        (has (texts? (conj (dd-of "Id") :a.wf-link) [(str "\u29C9 " id)]))
+        (within [:style]
+          (has (some-text? "text-decoration:underline"))))))
 
 (deftest workflow-detail-page-links-to-parent-workflow-test
   (let [parent-id (test-util/insert! "test.ns/parent-link")
-        child-id (test-util/insert! "test.ns/child-link" :parent parent-id)
-        body (:body (request :get (str "/workflows/" child-id)))]
-    (is (re-find (re-pattern (str "<dt>Parent</dt><dd><a class=\"wf-link\" href=\"/workflows/" parent-id "\"")) body))))
+        child-id (test-util/insert! "test.ns/child-link" :parent parent-id)]
+    (-> (visit (href child-id))
+        (has (attrs? (conj (dd-of "Parent") :a.wf-link) :href [(href parent-id)]))
+        (within (dd-of "Parent")
+          (k/follow [:a.wf-link]))
+        (has (status? 200))
+        (has (texts? [:header.page-head :h1] ["test.ns/parent-link"])))))
 
 (deftest workflow-detail-page-summary-card-test
   ;; Started -> Error, restarted -> Done, with a sub-workflow, reused once:
@@ -187,37 +228,43 @@
       (test-util/finish! child "DONE" (pr-str :ok))
       (test-util/finish! current "DONE" (pr-str :ok))
       (test-util/record-reuse! current nil)
-      (let [body (:body (request :get (str "/workflows/" id)))]
-        (is (str/includes? body "<section class=\"wf-summary state-DONE\">"))
-        (is (str/includes? body "<dt>Attempts</dt><dd>2</dd>"))
-        (is (not (str/includes? body "Sub-workflows")))
-        (is (str/includes? body "<dt>Reused</dt><dd>1 time</dd>"))
-        (is (str/includes? body "<dt>Finished</dt>"))
-        (is (str/includes? body "\u2014 (top level)"))
-        (is (re-find (re-pattern (str "Invocation <code>" id "</code> was restarted")) body))))))
+      (-> (visit (href id))
+          (has (attr? [:section.wf-summary] :class "wf-summary state-DONE"))
+          (has (texts? (dd-of "Attempts") ["2"]))
+          (has (missing? (dd-of "Sub-workflows")))
+          (has (texts? (dd-of "Reused") ["1 time"]))
+          (has (present? (dd-of "Finished")))
+          (has (texts? (dd-of "Parent") ["\u2014 (top level)"]))
+          (has (texts? [:section.wf-summary :p.wf-summary-note]
+                       [(str "Invocation " id " was restarted - showing the workflow's current invocation.")]))
+          (has (texts? (dd-of "Id") [(str "\u29C9 " current)]))))))
 
 (deftest workflow-detail-page-hides-parent-link-for-top-level-workflow-test
-  (let [id (test-util/insert! "test.ns/top-level-no-parent")
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (str/includes? body "<dt>Parent</dt><dd>\u2014 (top level)</dd>"))))
+  (let [id (test-util/insert! "test.ns/top-level-no-parent")]
+    (-> (visit (href id))
+        (has (texts? (dd-of "Parent") ["\u2014 (top level)"]))
+        (has (missing? (conj (dd-of "Parent") :a))))))
 
 (deftest workflow-detail-page-shows-metadata-test
-  (let [id (test-util/insert! "test.ns/with-meta" :params (pr-str [1 2]) :metadata (pr-str {:actor-id 42}))
-        response (request :get (str "/workflows/" id))]
-    (is (re-find #"<h2>Metadata</h2>" (:body response)))
-    (is (str/includes? (:body response) "<dt><code>:actor-id</code></dt><dd><pre>42</pre></dd>"))))
+  (let [id (test-util/insert! "test.ns/with-meta" :params (pr-str [1 2]) :metadata (pr-str {:actor-id 42}))]
+    (-> (visit (href id))
+        (has (heading? "Metadata"))
+        (within (panel "Metadata")
+          (has (texts? [:dt] [":actor-id"]))
+          (has (texts? (conj (dd-of ":actor-id") :pre) ["42"]))))))
 
 (deftest workflow-detail-page-hides-metadata-section-when-absent-test
-  (let [id (test-util/insert! "test.ns/no-meta" :params (pr-str [1 2]))
-        response (request :get (str "/workflows/" id))]
-    (is (not (re-find #"<h2>Metadata</h2>" (:body response))))))
+  (let [id (test-util/insert! "test.ns/no-meta" :params (pr-str [1 2]))]
+    (-> (visit (href id))
+        (has (missing? (panel "Metadata"))))))
 
 (deftest workflow-detail-page-shows-error-test
   (let [id (test-util/insert! "test.ns/failed")]
     (test-util/finish! id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))
-    (let [response (request :get (str "/workflows/" id))]
-      (is (= 200 (:status response)))
-      (is (re-find #"boom" (:body response))))))
+    (-> (visit (href id))
+        (has (status? 200))
+        (has (attr? [:section.wf-summary] :class "wf-summary state-ERROR"))
+        (has (texts? (conj (panel "Error") :p.error-message) ["boom"])))))
 
 (deftest workflow-detail-page-shows-full-timeline-test
   ;; A restarted workflow keeps the states of its earlier invocations -
@@ -225,13 +272,15 @@
   (let [id (test-util/insert! "test.ns/timeline")]
     (test-util/finish! id "ERROR" (pr-str {:message "first failure" :class "clojure.lang.ExceptionInfo" :data nil}))
     (test-util/finish! (test-util/restart! id) "DONE" (pr-str :recovered))
-    (let [response (request :get (str "/workflows/" id))
-          events (test-util/timeline id)]
-      (is (= 4 (count events)))
-      (is (re-find #"first failure" (:body response)))
-      (is (re-find #"recovered" (:body response)))
-      (is (= 4 (count (re-seq #"class=\"tree-event state-(?:STARTED|DONE|ERROR)\"" (:body response))))
-          "one timeline entry per event"))))
+    (is (= 4 (count (test-util/timeline id))))
+    (-> (visit (href id))
+        (has (attrs? [:ul.tree :li.tree-event] :class
+                     ["tree-event state-STARTED" "tree-event state-ERROR"
+                      "tree-event state-STARTED" "tree-event state-DONE"])
+             "one timeline entry per event, in order")
+        (has (attr? [:ul.tree :li.tree-event.state-ERROR :span.tree-state-chip] :title
+                    "clojure.lang.ExceptionInfo: first failure"))
+        (has (texts? (conj (panel "Result") :pre) [":recovered"])))))
 
 (deftest workflow-detail-page-interleaves-sub-workflow-timeline-test
   ;; Sub-workflow events (recursively, at any depth) must appear in the
@@ -243,18 +292,15 @@
     (test-util/finish! grandchild-id "DONE" (pr-str :ok))
     (test-util/finish! child-id "DONE" (pr-str :ok))
     (test-util/finish! parent-id "DONE" (pr-str :ok))
-    (let [response (request :get (str "/workflows/" parent-id))
-          body (:body response)
-          timeline (engine/full-timeline parent-id)]
-      (is (= 6 (count timeline))
-          "parent's own 2 events + child's 2 + grandchild's 2")
-      (is (re-find (re-pattern (str "/workflows/" child-id)) body))
-      (is (re-find (re-pattern (str "/workflows/" grandchild-id)) body)
-          "the grandchild's events are pulled in too, not just direct children")
-      (is (re-find #"<b>child2</b>" body))
-      (is (re-find #"<b>grandchild2</b>" body))
-      (is (= 6 (count (re-seq #"class=\"tree-event state-(?:STARTED|DONE|ERROR)\"" body)))
-          "a single merged timeline, not a separate sub-workflows section"))))
+    (is (= 6 (count (engine/full-timeline parent-id)))
+        "parent's own 2 events + child's 2 + grandchild's 2")
+    (-> (visit (href parent-id))
+        (has (link? :href (href child-id)))
+        (has (link? :href (href grandchild-id))
+             "the grandchild's events are pulled in too, not just direct children")
+        (has (texts? [:ul.tree :summary :b] ["parent2" "child2" "grandchild2"]))
+        (has (count? [:ul.tree] 1) "a single merged timeline, not a separate sub-workflows section")
+        (has (count? [:ul.tree :li.tree-event] 6)))))
 
 (deftest workflow-detail-page-shows-timeline-tree-test
   ;; Below the table, the same events are shown as a foldable tree - one
@@ -266,23 +312,24 @@
     (test-util/finish! grandchild-id "DONE" (pr-str :ok))
     (test-util/finish! child-id "DONE" (pr-str :ok))
     (test-util/finish! parent-id "DONE" (pr-str :ok))
-    (let [body (:body (request :get (str "/workflows/" parent-id)))
-          tree (subs body (str/index-of body "<ul class=\"tree\">"))]
-      (is (= 3 (count (re-seq #"<details[ >]" tree))) "one node per workflow")
-      (is (= 1 (count (re-seq #"<details open>" tree))) "finished sub-workflows start folded")
-      (is (= 6 (count (re-seq #"class=\"tree-event state-" tree))) "one leaf per event")
-      (is (re-find (re-pattern (str "(?s)tree-parent.*<details>.*tree-child.*<details>.*tree-grandchild")) tree)
-          "sub-workflows are nested inside their parent's node")
-      (is (re-find (re-pattern (str "<summary[^>]*><span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\\.ns/</span><b>tree-child</b></code><a class=\"wf-link\" "
-                                    "href=\"/workflows/" child-id "\"[^>]*>\u29C9 <code>" child-id "</code></a>"))
-                   tree)
-          "the name is plain text, so clicking it folds - a link next to it opens the workflow")
-      (is (re-find #"<summary[^>]*><span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\.ns/</span><b>tree-parent</b></code><span" tree)
-          "no link on the top-level node - that's the page we're on"))))
-
-(defn- tree-of [id]
-  (let [body (:body (request :get (str "/workflows/" id)))]
-    (subs body (str/index-of body "<ul class=\"tree\">"))))
+    (-> (visit (href parent-id))
+        (within [:ul.tree]
+          (has (count? [:details] 3) "one node per workflow")
+          (has (count? [[:details (enlive/attr? :open)]] 1) "finished sub-workflows start folded")
+          (has (count? [:li.tree-event] 6) "one leaf per event")
+          (has (texts? [:details :> :summary :b] ["tree-parent" "tree-child" "tree-grandchild"]))
+          (has (texts? [:details :details :> :summary :b] ["tree-child" "tree-grandchild"])
+               "sub-workflows are nested inside their parent's node")
+          (has (texts? [:details :details :details :> :summary :b] ["tree-grandchild"]))
+          (within [(tree-node "tree-child")]
+            (has (texts? [:span.tree-verb] ["Invoked"]))
+            (has (texts? [:code :span.wf-ns] ["test.ns/"]))
+            (has (missing? [:a :b]) "the name is plain text, so clicking it folds")
+            (has (attrs? [:a.wf-link] :href [(href child-id)]) "a link next to it opens the workflow")
+            (has (texts? [:a.wf-link] [(str "\u29C9 " child-id)])))
+          (within [(tree-node "tree-parent")]
+            (has (texts? [:span.tree-verb] ["Invoked"]))
+            (has (missing? [:a]) "no link on the top-level node - that's the page we're on"))))))
 
 (deftest timeline-tree-labels-later-starts-as-restarts-test
   ;; Started -> Error -> Started -> Done: the first start is the call, the
@@ -290,9 +337,8 @@
   (let [id (test-util/insert! "test.ns/tree-restarted")]
     (test-util/finish! id "ERROR" (pr-str {:message "x" :class "java.lang.Exception" :data nil}))
     (test-util/finish! (test-util/restart! id) "DONE" (pr-str :ok))
-    (let [tree (tree-of id)
-          verbs (map second (re-seq #"<span class=\"tree-verb\">([^<]+)</span>" tree))]
-      (is (= ["Invoked" "Called" "Failed" "Restarted" "Completed"] verbs)))))
+    (-> (visit (href id))
+        (has (texts? [:ul.tree :span.tree-verb] ["Invoked" "Called" "Failed" "Restarted" "Completed"])))))
 
 (deftest timeline-tree-shows-run-state-and-reuse-count-test
   ;; Started -> Done -> Reused -> Reused: the node shows Done (the run's
@@ -304,12 +350,16 @@
     (test-util/finish! id "DONE" (pr-str :ok))
     (test-util/record-reuse! id caller1)
     (test-util/record-reuse! id caller2)
-    (let [tree (tree-of id)]
-      (is (str/includes? tree "<summary class=\"state-DONE\">"))
-      (is (re-find #"title=\"result reused 2 times\">\u21BA 2<" tree))
-      (is (= 2 (count (re-seq (re-pattern (str "from <a class=\"wf-link\" href=\"/workflows/" id "\"")) tree))))
-      (is (str/includes? tree (str "for <a class=\"wf-link\" href=\"/workflows/" caller1 "\"")))
-      (is (str/includes? tree (str "for <a class=\"wf-link\" href=\"/workflows/" caller2 "\""))))))
+    (-> (visit (href id))
+        (within [:ul.tree]
+          (has (attrs? [:summary] :class ["state-DONE"]))
+          (has (texts? [:summary :span.tree-count] ["\u21BA 2"]))
+          (has (attr? [:summary :span.tree-count :span] :title "result reused 2 times"))
+          (has (texts? [:span.tree-reuse]
+                       [(str "from \u29C9 " id " for \u29C9 " caller1)
+                        (str "from \u29C9 " id " for \u29C9 " caller2)]))
+          (has (attrs? [:span.tree-reuse :a.wf-link] :href
+                       [(href id) (href caller1) (href id) (href caller2)]))))))
 
 (deftest timeline-tree-top-level-reuse-names-no-producer-test
   ;; Reused by a top-level call: there's no caller to name, and the
@@ -317,10 +367,10 @@
   (let [id (test-util/insert! "test.ns/tree-reused-top")]
     (test-util/finish! id "DONE" (pr-str :ok))
     (test-util/record-reuse! id nil)
-    (let [tree (tree-of id)]
-      (is (str/includes? tree "tree-event state-REUSED"))
-      (is (not (str/includes? tree "tree-reuse\"")))
-      (is (not (str/includes? tree "from <a"))))))
+    (-> (visit (href id))
+        (within [:ul.tree]
+          (has (count? [:li.tree-event.state-REUSED] 1))
+          (has (missing? [:span.tree-reuse]))))))
 
 (deftest timeline-tree-reuse-within-tree-is-a-leaf-test
   ;; A reuse within the tree is a single REUSED row - a flat leaf, not a
@@ -329,25 +379,30 @@
         parent (test-util/insert! "test.ns/tree-reusing-parent")]
     (test-util/finish! child "DONE" (pr-str :ok))
     (test-util/record-reuse! child parent)
-    (let [tree (tree-of parent)]
-      (is (re-find (re-pattern (str "<li class=\"tree-leaf state-REUSED\"><code class=\"tree-offset\"[^>]*>[^<]*</code>"
-                                    "<span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\\.ns/</span><b>tree-produced</b></code>"
-                                    "<a class=\"wf-link\" href=\"/workflows/" child "\""))
-                   tree))
-      (is (= 1 (count (re-seq #"<details" tree))) "only the reusing parent is foldable")
-      (is (not (str/includes? tree "tree-event state-REUSED")) "no Reused event nested in it")
-      (is (not (str/includes? tree "from <a")) "the producer is the linked invocation - no need to repeat it")
-      (is (not (str/includes? tree "\u21BA")) "a reuse leaf gets no reuse badge"))))
+    (-> (visit (href parent))
+        (within [:ul.tree]
+          (within [:li.tree-leaf.state-REUSED]
+            (has (present? [:code.tree-offset]))
+            (has (texts? [:span.tree-verb] ["Invoked"]))
+            (has (texts? [:code :b] ["tree-produced"]))
+            (has (attrs? [:a.wf-link] :href [(href child)]))
+            (has (texts? [:span.tree-state-chip] ["Reused"]))
+            (has (missing? [:span.tree-reuse])
+                 "the producer is the linked invocation - no need to repeat it")
+            (has (texts? [:span.tree-count] [""]) "a reuse leaf gets no reuse badge"))
+          (has (count? [:details] 1) "only the reusing parent is foldable")
+          (has (missing? [:li.tree-event.state-REUSED]) "no Reused event nested in it")))))
 
 (deftest timeline-tree-reuse-leaf-names-a-since-restarted-producer-test
   (let [child (test-util/insert! "test.ns/tree-produced-then-restarted")
         parent (test-util/insert! "test.ns/tree-reusing-parent2")]
     (test-util/finish! child "DONE" (pr-str :ok))
     (test-util/record-reuse! child parent)
-    (let [current (test-util/restart! child)
-          tree (tree-of parent)]
-      (is (str/includes? tree (str "<a class=\"wf-link\" href=\"/workflows/" current "\"")))
-      (is (str/includes? tree (str "from <a class=\"wf-link\" href=\"/workflows/" child "\""))))))
+    (let [current (test-util/restart! child)]
+      (-> (visit (href parent))
+          (within [:ul.tree :li.tree-leaf.state-REUSED]
+            (has (attrs? [:a.wf-link] :href [(href current) (href child)]))
+            (has (texts? [:span.tree-reuse] [(str "from \u29C9 " child)])))))))
 
 (deftest timeline-tree-opens-failed-and-running-subtrees-test
   ;; parent (running) > failing (error) > ok (done), and a finished sibling:
@@ -359,92 +414,117 @@
     (test-util/finish! ok "DONE" (pr-str :ok))
     (test-util/finish! sibling "DONE" (pr-str :ok))
     (test-util/finish! failing "ERROR" (pr-str {:message "kaboom" :class "clojure.lang.ExceptionInfo" :data nil}))
-    (let [tree (tree-of parent)]
-      (is (re-find #"<details open><summary class=\"state-STARTED\"><span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\.ns/</span><b>tree-p<" tree))
-      (is (re-find #"<details open><summary class=\"state-ERROR\"><span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\.ns/</span><b>tree-failing<" tree))
-      (is (re-find #"<details><summary class=\"state-DONE\"><span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\.ns/</span><b>tree-ok<" tree))
-      (is (re-find #"<details><summary class=\"state-DONE\"><span class=\"tree-verb\">Invoked</span><code><span class=\"wf-ns\">test\.ns/</span><b>tree-sibling<" tree))
-      (is (re-find #"title=\"clojure\.lang\.ExceptionInfo: kaboom\"" tree)
-          "the error chip's tooltip carries the exception")
-      (is (str/includes? tree "title=\"running for ") "a running node shows how long it has been running"))))
+    (-> (visit (href parent))
+        (within [:ul.tree]
+          (has (texts? [:summary :b] ["tree-p" "tree-failing" "tree-ok" "tree-sibling"]))
+          (has (attrs? [:summary] :class ["state-STARTED" "state-ERROR" "state-DONE" "state-DONE"]))
+          (has (texts? [[:details (enlive/attr? :open)] :> :summary :b] ["tree-p" "tree-failing"]))
+          (has (texts? [[:details (enlive/but (enlive/attr? :open))] :> :summary :b] ["tree-ok" "tree-sibling"]))
+          (has (attr? [(tree-node "tree-failing") :span.tree-state-chip] :title "clojure.lang.ExceptionInfo: kaboom")
+               "the error chip's tooltip carries the exception")
+          (has (present? [(tree-node "tree-p") :span.tree-time [:span (enlive/attr-starts :title "running for ")]])
+               "a running node shows how long it has been running")))))
 
 (deftest timeline-tree-shows-offsets-and-durations-test
   (let [id (test-util/insert! "test.ns/tree-timed")]
     (test-util/finish! id "DONE" (pr-str :ok))
-    (let [tree (tree-of id)]
-      (is (re-find #"<code class=\"tree-offset\" title=\"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} UTC\">\+00:00\.000</code><span class=\"tree-verb\">Called</span>" tree)
-          "the first event is at +00:00.000, its absolute time in the tooltip")
-      (is (re-find #"\+\d\d:\d\d\.\d{3}</code><span class=\"tree-verb\">Completed</span>" tree)
-          "each event row says what happened")
-      (is (re-find #"<span class=\"tree-time\">\d+ms</span>" tree)))))
+    (-> (visit (href id))
+        (within [:ul.tree]
+          (has (texts? [:li.tree-event :span.tree-verb] ["Called" "Completed"]) "each event row says what happened")
+          (has (texts? [[:li.tree-event enlive/first-of-type] :code.tree-offset] ["+00:00.000"])
+               "the first event is at +00:00.000")
+          (has (present? [[:li.tree-event enlive/first-of-type]
+                          [:code.tree-offset (ku/with-attr-matching :title #"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} UTC")]])
+               "its absolute time is in the tooltip")
+          (within [[:li.tree-event enlive/last-of-type] :code.tree-offset]
+            (has (regex? "\\+\\d\\d:\\d\\d\\.\\d{3}")))
+          (within [:summary :span.tree-time]
+            (has (regex? "\\d+ms")))))))
 
 (deftest page-style-is-not-html-escaped-test
   ;; Browsers don't decode entities inside <style>, so escaped quotes or >
   ;; would silently drop rules (e.g. the timeline tree's fold chevrons).
-  (let [id (test-util/insert! "test.ns/styled")
-        body (:body (request :get (str "/workflows/" id)))
-        style (second (re-find #"(?s)<style>(.*?)</style>" body))]
-    (is (str/includes? style "details[open]>summary::before"))
-    (is (not (re-find #"&(?:apos|gt|lt|quot|amp);" style)))))
+  (let [id (test-util/insert! "test.ns/styled")]
+    (-> (visit (href id))
+        (within [:style]
+          (has (some-text? "details[open]>summary::before"))
+          (has (regex? "(?s)(?!.*&(?:apos|gt|lt|quot|amp);).*") "no HTML entities")))))
 
 (deftest workflow-detail-page-404-for-unknown-id-test
-  (let [response (request :get "/workflows/does-not-exist")]
-    (is (= 404 (:status response)))))
+  (-> (visit "/workflows/does-not-exist")
+      (has (status? 404))))
+
+(defn- flaky-invocation!
+  "Registers http-flaky-fn, runs it to an ERROR and returns its invocation id."
+  []
+  (engine/register! #'http-flaky-fn http-flaky-fn)
+  (is (thrown? clojure.lang.ExceptionInfo
+        (engine/run-invocation #'http-flaky-fn http-flaky-fn [])))
+  (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn"))))
 
 (deftest workflow-detail-page-shows-restart-button-when-restartable-test
-  (engine/register! #'http-flaky-fn http-flaky-fn)
-  (is (thrown? clojure.lang.ExceptionInfo
-        (engine/run-invocation #'http-flaky-fn http-flaky-fn [])))
-  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn")))
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (str/includes? body (str "<form action=\"/workflows/" id "/restart\" class=\"restart\" method=\"post\">")))
-    (is (str/includes? body "<details class=\"panel-toggle\"><summary class=\"btn\">\u21BB Restart</summary>"))
-    (is (not (str/includes? body "<script")) "no script needed")))
+  (let [id (flaky-invocation!)]
+    (-> (visit (href id))
+        (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
+        (has (attr? [:details.panel-toggle :form.restart] :action (str (href id) "/restart")))
+        (has (attr? [:form.restart] :method "post"))
+        (has (texts? [:form.restart [:button (enlive/attr= :type "submit")]] ["Yes, restart"]))
+        (has (missing? [:script]) "no script needed"))))
 
 (deftest restart-form-redirects-back-to-the-detail-page-test
-  (engine/register! #'http-flaky-fn http-flaky-fn)
-  (is (thrown? clojure.lang.ExceptionInfo
-        (engine/run-invocation #'http-flaky-fn http-flaky-fn [])))
-  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn")))]
-    (engine/register! #'http-flaky-fn (fn [] :ok))
-    (let [response (request :post (str "/workflows/" id "/restart"))
-          current (:invocation_id (engine/get-invocation id))]
-      (is (= 303 (:status response)))
-      (is (not= id current) "restarted under a new invocation id")
-      (is (= (str "/workflows/" current) (get-in response [:headers "Location"]))))))
+  (let [id (flaky-invocation!)
+        _ (engine/register! #'http-flaky-fn (fn [] :ok))
+        state (-> (visit (href id))
+                  (k/press "Yes, restart")
+                  (has (status? 303)))
+        current (:invocation_id (engine/get-invocation id))]
+    (is (not= id current) "restarted under a new invocation id")
+    (is (= (href current) (get-in state [:response :headers "Location"])))
+    (-> state
+        k/follow-redirect
+        (has (status? 200))
+        (has (attr? [:section.wf-summary] :class "wf-summary state-DONE"))
+        (has (texts? (dd-of "Id") [(str "\u29C9 " current)])))))
 
 (deftest restart-form-failure-is-shown-on-the-detail-page-test
   (let [id (test-util/insert! "test.ns/still-running-restart")
-        response (request :post (str "/workflows/" id "/restart"))
-        location (get-in response [:headers "Location"])]
-    (is (= 303 (:status response)))
-    (is (str/starts-with? location (str "/workflows/" id "?restart_error=")))
-    (let [[path qs] (str/split location #"\?" 2)
-          body (:body (call (assoc (mock/request :get path) :query-string qs)))]
-      (is (str/includes? body "<p class=\"wf-summary-note wf-summary-error\">Restart failed: Cannot restart: workflow is not DONE or ERROR</p>")))))
+        state (-> (k/session (http/app engine/*workflow-engine*))
+                  (k/visit (str (href id) "/restart") :request-method :post)
+                  (has (status? 303)))]
+    (is (str/starts-with? (get-in state [:response :headers "Location"])
+                          (str (href id) "?restart_error=")))
+    (-> state
+        k/follow-redirect
+        (has (texts? [:p.wf-summary-note.wf-summary-error]
+                     ["Restart failed: Cannot restart: workflow is not DONE or ERROR"])))))
 
 (deftest workflow-detail-page-hides-restart-button-when-pending-test
-  (let [id (test-util/insert! "test.ns/still-running")
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (not (str/includes? body "/restart\"")))))
+  (let [id (test-util/insert! "test.ns/still-running")]
+    (-> (visit (href id))
+        (has (missing? [:form.restart]))
+        (has (missing? [:details.panel-toggle])))))
 
 (deftest workflow-detail-page-hides-restart-button-when-wf-def-unregistered-test
   (let [id (test-util/insert! "test.ns/never-registered-anywhere")]
     (test-util/finish! id "DONE" (pr-str :ok))
-    (let [body (:body (request :get (str "/workflows/" id)))]
-      (is (not (str/includes? body "/restart\""))))))
+    (-> (visit (href id))
+        (has (missing? [:form.restart])))))
 
 (deftest workflow-detail-page-shows-ancestry-breadcrumb-test
   (let [root (test-util/insert! "test.ns/crumb-root")
         mid (test-util/insert! "test.ns/crumb-mid" :parent root)
-        leaf (test-util/insert! "test.ns/crumb-leaf" :parent mid)
-        page #(:body (request :get (str "/workflows/" %)))]
-    (is (re-find (re-pattern (str "(?s)<nav class=\"breadcrumb\">"
-                                  "<a href=\"/workflows/" root "\">.*crumb-root.*</a>.*\u203A.*"
-                                  "<a href=\"/workflows/" mid "\">.*crumb-mid.*</a>.*\u203A.*"
-                                  "<span class=\"breadcrumb-current\">.*crumb-leaf.*</nav>"))
-                 (page leaf)))
-    (is (not (str/includes? (page root) "<nav class=\"breadcrumb\"")) "a top-level workflow has no ancestors to show")))
+        leaf (test-util/insert! "test.ns/crumb-leaf" :parent mid)]
+    (-> (visit (href leaf))
+        (within [:nav.breadcrumb]
+          (has (attrs? [:a] :href [(href root) (href mid)]))
+          (has (texts? [:a] [(str "test.ns/crumb-root " root) (str "test.ns/crumb-mid " mid)]))
+          (has (count? [:span.breadcrumb-sep] 2))
+          (has (texts? [:span.breadcrumb-current] [(str "test.ns/crumb-leaf " leaf)])))
+        (within [:nav.breadcrumb]
+          (k/follow [:a (enlive/attr= :href (href mid))]))
+        (has (texts? [:header.page-head :h1] ["test.ns/crumb-mid"])))
+    (-> (visit (href root))
+        (has (missing? [:nav.breadcrumb]) "a top-level workflow has no ancestors to show"))))
 
 (deftest workflow-detail-page-summary-duration-is-the-last-attempt-test
   ;; Started at 0, Error at 10s, restarted at 60s, Done at 61.5s: the card
@@ -457,26 +537,30 @@
       (is (= 4 (count ids)))
       (doseq [[hid at] (map vector ids [0 10000 60000 61500])]
         (jdbc/execute! (test-util/ds) ["UPDATE workflow_history SET state_changed_at = ? WHERE id = ?" at hid])))
-    (let [body (:body (request :get (str "/workflows/" id)))]
-      (is (str/includes? body "<span class=\"wf-summary-duration\">1.50s</span>"))
-      (is (str/includes? body "<span class=\"tree-time\">1m 01s</span>")))))
+    (-> (visit (href id))
+        (has (texts? [:span.wf-summary-duration] ["1.50s"]))
+        (has (texts? [:ul.tree :summary :span.tree-time] ["1m 01s"])))))
 
 (deftest workflow-detail-page-tab-title-test
   (let [id (test-util/insert! "test.ns/tab")]
     (test-util/finish! id "ERROR" (pr-str {:message "x" :class "java.lang.Exception" :data nil}))
-    (is (str/includes? (:body (request :get (str "/workflows/" id)))
-                       (str "<title>\u2717 test.ns/tab \u00B7 " id "</title>")))))
+    (-> (visit (href id))
+        (has (texts? [:head :title] [(str "\u2717 test.ns/tab \u00B7 " id)])))))
 
 (deftest workflow-detail-page-summary-times-are-utc-and-relative-test
-  (let [id (test-util/insert! "test.ns/times")
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (re-find #"<dt>Started</dt><dd><span><code>[^<]+ UTC</code> <span class=\"panel-muted\">\(just now\)</span>" body))))
+  (let [id (test-util/insert! "test.ns/times")]
+    (-> (visit (href id))
+        (within (dd-of "Started")
+          (has (regex? "\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d{3} UTC \\(just now\\)")))
+        (has (texts? (conj (dd-of "Started") :span.panel-muted) ["(just now)"])))))
 
 (deftest workflow-detail-page-folds-large-values-test
-  (let [id (test-util/insert! "test.ns/big" :params (pr-str [(vec (range 2000))]))
-        body (:body (request :get (str "/workflows/" id)))]
-    (is (str/includes? body "<details class=\"fold\">"))
-    (is (re-find #"Show all \d+ lines" body))))
+  (let [id (test-util/insert! "test.ns/big" :params (pr-str [(vec (range 2000))]))]
+    (-> (visit (href id))
+        (within (panel "Params")
+          (has (count? [:details.fold] 1))
+          (within [:details.fold :summary :span.fold-more]
+            (has (regex? "Show all \\d+ lines \\(\\d+ chars\\)")))))))
 
 (defn- wrapped-app [prefix original-handler]
   (-> (http/wrap-handler engine/*workflow-engine* prefix original-handler) wrap-params wrap-json-response))
@@ -497,7 +581,9 @@
 (deftest wrap-handler-routes-prefixed-uris-to-tenon-test
   (let [original (constantly {:status 200 :body "from the original app"})
         app (wrapped-app "/tenon" original)]
-    (is (re-find #"<h1>Workflows</h1>" (:body (app (mock/request :get "/tenon")))))
+    (-> (visit app "/tenon")
+        (has (status? 200))
+        (has (texts? [:h1] ["Workflows"])))
     (let [id (test-util/insert! "test.ns/prefixed")
           body (:body (app (mock/request :get "/tenon/workflows/pending")))]
       (is (some #(= id (:invocation_id %)) (json/parse-string body true))))))
@@ -505,27 +591,34 @@
 (deftest wrap-handler-generates-prefixed-links-test
   (let [original (constantly {:status 200 :body "unreachable"})
         app (wrapped-app "/tenon" original)
-        id (test-util/insert! "test.ns/prefixed-link")
-        dashboard-body (:body (app (mock/request :get "/tenon")))
-        detail-body (:body (app (mock/request :get (str "/tenon/workflows/" id))))]
-    (is (re-find (re-pattern (str "href=\"/tenon/workflows/" id "\"")) dashboard-body))
-    (is (re-find #"action=\"/tenon/\"" dashboard-body))
-    (is (re-find (re-pattern (str "href=\"/tenon/workflows/" id "\"")) detail-body)
-        "the workflow's own timeline row also links back through the prefix")))
+        id (test-util/insert! "test.ns/prefixed-link")]
+    (-> (visit app "/tenon")
+        (has (link? :href (str "/tenon/workflows/" id)))
+        (has (attrs? [:form] :action ["/tenon/" "/tenon/"]))
+        (k/follow [:a.wf-link])
+        (has (status? 200))
+        (has (texts? [:header.page-head :h1] ["test.ns/prefixed-link"]))
+        (has (attrs? (conj (dd-of "Id") :a) :href [(str "/tenon/workflows/" id)])
+             "the workflow's own links go through the prefix too"))))
 
 (deftest workflow-detail-page-links-back-to-listing-test
-  (let [id (test-util/insert! "test.ns/back")
-        body (:body (request :get (str "/workflows/" id)))
-        prefixed (:body ((wrapped-app "/tenon" (constantly nil)) (mock/request :get (str "/tenon/workflows/" id))))]
-    (is (str/includes? body "<h1>test.ns/back</h1><a class=\"btn back\" href=\"/\">\u2190 Workflows</a></header>"))
-    (is (str/includes? prefixed "<a class=\"btn back\" href=\"/tenon/\">"))
-    (is (not (str/includes? (:body (request :get "/")) "class=\"back\""))
-        "the listing itself has no back link")))
+  (let [id (test-util/insert! "test.ns/back")]
+    (-> (visit (href id))
+        (within [:header.page-head]
+          (has (texts? [:h1] ["test.ns/back"]))
+          (has (attrs? [:a.btn.back] :href ["/"]))
+          (has (texts? [:a.btn.back] ["\u2190 Workflows"])))
+        (k/follow "\u2190 Workflows")
+        (has (texts? [:h1] ["Workflows"]))
+        (has (missing? [:a.back]) "the listing itself has no back link"))
+    (-> (visit (wrapped-app "/tenon" (constantly nil)) (str "/tenon/workflows/" id))
+        (has (attrs? [:header.page-head :a.btn.back] :href ["/tenon/"])))))
 
 (deftest wrap-handler-with-empty-prefix-behaves-like-root-mount-test
   (let [original (constantly {:status 200 :body "unreachable"})
         app (wrapped-app "" original)]
-    (is (re-find #"<h1>Workflows</h1>" (:body (app (mock/request :get "/")))))))
+    (-> (visit app "/")
+        (has (texts? [:h1] ["Workflows"])))))
 
 (defn- async-call
   "Calls app's async (3-arity) handler and returns what it responded with,
@@ -544,7 +637,9 @@
 (deftest wrap-handler-async-routes-prefixed-uris-to-tenon-test
   (let [original (fn [_request _respond raise] (raise (ex-info "unreachable" {})))
         app (wrapped-app "/tenon" original)]
-    (is (re-find #"<h1>Workflows</h1>" (:body (async-call app (mock/request :get "/tenon")))))))
+    (-> (visit #(async-call app %) "/tenon")
+        (has (status? 200))
+        (has (texts? [:h1] ["Workflows"])))))
 
 (deftest app-async-not-found-test
   (let [response (async-call (http/app engine/*workflow-engine*) (mock/request :get "/no/such/route"))]
@@ -564,10 +659,10 @@
         parent2 (test-util/insert! "test.ns/reuse-parent2")]
     (test-util/finish! child "DONE" (pr-str :ok))
     (test-util/record-reuse! child parent2)
-    (let [body (:body (request :get (str "/workflows/" parent2)))]
-      (is (re-find #"<b>reuse-child</b>" body))
-      (is (re-find #"class=\"tree-leaf state-REUSED\"" body))
-      (is (re-find #">Reused<" body)))))
+    (-> (visit (href parent2))
+        (within [:ul.tree :li.tree-leaf.state-REUSED]
+          (has (texts? [:b] ["reuse-child"]))
+          (has (texts? [:span.tree-state-chip] ["Reused"]))))))
 
 (deftest dashboard-lists-reused-top-level-call-again-test
   ;; The second (add-numbers 3 4) reuses the first one's stored result -
@@ -576,22 +671,24 @@
   (let [id (test-util/insert! "test.ns/reused-top" :params (pr-str [3 4]))]
     (test-util/finish! id "DONE" (pr-str 7))
     (test-util/record-reuse! id nil)
-    (let [body (:body (request :get "/"))]
-      (is (= 1 (count (re-seq #"<tr class=\"state-DONE\"" body))))
-      (is (= 1 (count (re-seq #"<tr class=\"state-REUSED\"" body))) "the reusing call is marked as such")
-      (is (= 2 (count (re-seq #"<b>reused-top</b></code>" body))))
-      (is (not (str/includes? (re-find #"<tr class=\"state-REUSED\">.*?</tr>" body) "Done"))
-          "a reuse shows just Reused, not the producer's Done too"))))
+    (-> (visit "/")
+        (has (count? [:table.workflows :tbody :tr.state-DONE] 1))
+        (has (count? [:table.workflows :tbody :tr.state-REUSED] 1) "the reusing call is marked as such")
+        (has (texts? [:table.workflows :tbody :td :b] ["reused-top" "reused-top"]))
+        (has (attrs? [:table.workflows :tbody :tr.state-REUSED :a.wf-link] :href [(href id)])
+             "it links to the workflow whose result it got")
+        (has (texts? [:table.workflows :tbody :tr.state-REUSED [:td enlive/last-child]] ["Reused"])
+             "a reuse shows just Reused, not the producer's Done too"))))
 
 (deftest dashboard-lists-nested-reuse-only-with-all-checkbox-test
   (let [parent-id (test-util/insert! "test.ns/reuse-parent")
         child-id (test-util/insert! "test.ns/reuse-child" :parent parent-id)]
     (test-util/finish! child-id "DONE" (pr-str 1))
     (test-util/record-reuse! child-id parent-id)
-    (let [top (request :get "/")
-          all (request :get "/" {:all "1"})]
-      (is (not (re-find #"<b>reuse-child</b>" (:body top))))
-      (is (= 2 (count (re-seq #"<b>reuse-child</b>" (:body all))))))))
+    (-> (visit "/")
+        (has (texts? [:table.workflows :tbody :td :b] ["reuse-parent"])))
+    (-> (visit "/?all=1")
+        (has (count? [:table.workflows :tbody [:b (with-text "reuse-child")]] 2)))))
 
 (deftest dashboard-row-columns-test
   ;; Id, the name with its namespace muted, how long it ran, and in
@@ -599,31 +696,43 @@
   (let [parent (test-util/insert! "test.ns/cols-parent")
         child (test-util/insert! "test.ns/cols-child" :parent parent)]
     (test-util/finish! child "DONE" (pr-str 1))
-    (let [top (:body (request :get "/"))
-          all (:body (request :get "/" {:all "1"}))]
-      (is (re-find (re-pattern (str "<td><a class=\"wf-link\" href=\"/workflows/" parent "\"[^>]*>⧉ <code>" parent "</code></a></td>")) top))
-      (is (str/includes? top "<code><span class=\"wf-ns\">test.ns/</span><b>cols-parent</b></code>"))
-      (is (re-find #"<td class=\"duration\"><a [^>]*><span title=\"running for [^\"]+\">running " top))
-      (is (not (str/includes? top "<th>Parent</th>")) "no parent column for top-level workflows only")
-      (is (str/includes? all "<th>Parent</th>"))
-      (is (re-find (re-pattern (str "(?s)<b>cols-child</b>.*?⧉ <code>" parent "</code>.*?</tr>")) all)
-          "a sub-workflow links to its parent")
-      (is (re-find #"<td class=\"duration\"><a [^>]*>\d+ms</a>" all) "a finished one shows how long it ran"))))
+    (-> (visit "/")
+        (has (texts? [:table.workflows :thead :th] ["Timestamp" "Id" "Workflow" "Duration" "State"])
+             "no parent column for top-level workflows only")
+        (within (row-of parent)
+          (has (attrs? [:a.wf-link] :href [(href parent)]))
+          (has (texts? [:a.wf-link] [(str "\u29C9 " parent)]))
+          (has (texts? [:code :span.wf-ns] ["test.ns/"]))
+          (has (texts? [:code :b] ["cols-parent"]))
+          (has (present? [:td.duration :a [:span (enlive/attr-starts :title "running for ")]]))
+          (within [:td.duration]
+            (has (regex? "running \\S+")))))
+    (-> (visit "/?all=1")
+        (has (texts? [:table.workflows :thead :th] ["Timestamp" "Id" "Workflow" "Parent" "Duration" "State"]))
+        (within (row-of child)
+          (has (texts? [:b] ["cols-child"]))
+          (has (attrs? [:a.wf-link] :href [(href child) (href parent)]) "a sub-workflow links to its parent")
+          (within [:td.duration]
+            (has (regex? "\\d+ms") "a finished one shows how long it ran"))))))
 
 (deftest dashboard-flags-expired-lease-test
   (let [id (test-util/insert! "test.ns/stuck" :timeout-ms 60000)
         ok (test-util/insert! "test.ns/fresh" :timeout-ms 60000)]
     (test-util/expire! (test-util/ds) id)
-    (let [body (:body (request :get "/"))]
-      (is (= 1 (count (re-seq #"lease expired</span>" body))))
-      (is (re-find #"(?s)<b>stuck</b>.*?lease expired</span>" body)))))
+    (-> (visit "/")
+        (has (count? [:span.wf-expired] 1))
+        (has (texts? (conj (row-of id) :span.wf-expired) ["lease expired"]))
+        (has (missing? (conj (row-of ok) :span.wf-expired))))))
 
 (deftest dashboard-auto-refresh-test
-  (let [off (:body (request :get "/" {:state "STARTED"}))
-        on (:body (request :get "/" {:state "STARTED" :refresh "1"}))]
-    (is (not (str/includes? off "http-equiv")))
-    (is (str/includes? off "href=\"/?state=STARTED&amp;refresh=1\""))
-    (is (str/includes? on "<meta content=\"10\" http-equiv=\"refresh\">"))
-    (is (str/includes? on "href=\"/?state=STARTED\"") "the toggle turns it off again, keeping the filters")
-    (is (str/includes? on "<input name=\"refresh\" type=\"hidden\" value=\"1\">")
-        "changing a filter keeps refreshing")))
+  (-> (visit "/?state=STARTED")
+      (has (missing? [[:meta (enlive/attr= :http-equiv "refresh")]]))
+      (has (link? "\u21BB Auto-refresh off" "/?state=STARTED&refresh=1"))
+      (k/follow "\u21BB Auto-refresh off")
+      (has (attr? [[:meta (enlive/attr= :http-equiv "refresh")]] :content "10"))
+      (has (value? [:input (enlive/attr= :name "refresh")] "1") "changing a filter keeps refreshing")
+      (has (attr? [:form.filters [:input (enlive/attr= :name "refresh")]] :type "hidden"))
+      (has (attr? (selected-option "state") :value "STARTED"))
+      (has (link? "\u21BB Auto-refresh on" "/?state=STARTED") "the toggle turns it off again, keeping the filters")
+      (k/follow "\u21BB Auto-refresh on")
+      (has (missing? [[:meta (enlive/attr= :http-equiv "refresh")]]))))
