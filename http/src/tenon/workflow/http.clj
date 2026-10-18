@@ -88,15 +88,18 @@
    tenon.workflow/init - passed through to handler for every
    request tenon serves."
   [engine tenon-uri-prefix original-handler]
-  (let [prefix (if (= "/" tenon-uri-prefix) "" tenon-uri-prefix)]
+  (let [prefix (if (= "/" tenon-uri-prefix) "" tenon-uri-prefix)
+        tenon-handler (-> (fn [request] (handler engine prefix request))
+                          wrap-params
+                          wrap-json-response)]
     (fn
       ([{:keys [uri] :as request}]
        (if-let [relative-uri (strip-prefix prefix uri)]
-         (handler engine prefix (assoc request :uri relative-uri))
+         (tenon-handler (assoc request :uri relative-uri))
          (original-handler request)))
       ([{:keys [uri] :as request} respond raise]
        (if-let [relative-uri (strip-prefix prefix uri)]
-         (try (respond (handler engine prefix (assoc request :uri relative-uri)))
+         (try (respond (tenon-handler (assoc request :uri relative-uri)))
               (catch Throwable t (raise t)))
          (original-handler request respond raise))))))
 
@@ -107,4 +110,4 @@
 (defn app
   "The standalone, unprefixed (mounted at \"/\") ring app."
   [engine]
-  (-> (wrap-handler engine "" not-found-handler) wrap-params wrap-json-response))
+  (wrap-handler engine "" not-found-handler))

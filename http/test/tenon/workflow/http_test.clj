@@ -2,8 +2,6 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.string :as str]
             [ring.mock.request :as mock]
-            [ring.middleware.params :refer [wrap-params]]
-            [ring.middleware.json :refer [wrap-json-response]]
             [cheshire.core :as json]
             [kerodon.core :as k :refer [within]]
             [kerodon.test :refer [has status? some-text? regex?
@@ -582,7 +580,7 @@
             (has (regex? "Show all \\d+ lines \\(\\d+ chars\\)")))))))
 
 (defn- wrapped-app [prefix original-handler]
-  (-> (http/wrap-handler engine/*workflow-engine* prefix original-handler) wrap-params wrap-json-response))
+  (http/wrap-handler engine/*workflow-engine* prefix original-handler))
 
 (deftest wrap-handler-delegates-non-prefixed-uris-test
   (let [original (constantly {:status 200 :body "from the original app"})
@@ -600,9 +598,10 @@
 (deftest wrap-handler-routes-prefixed-uris-to-tenon-test
   (let [original (constantly {:status 200 :body "from the original app"})
         app (wrapped-app "/tenon" original)]
-    (-> (visit app "/tenon")
+    (-> (visit app "/tenon?state=STARTED")
         (has (status? 200))
-        (has (texts? [:h1] ["Workflows"])))
+        (has (texts? [:h1] ["Workflows"]))
+        (has (attr? (selected-option "state") :value "STARTED")))
     (let [id (test-util/insert! "test.ns/prefixed")
           body (:body (app (mock/request :get "/tenon/workflows/pending")))]
       (is (some #(= id (:invocation_id %)) (json/parse-string body true))))))
