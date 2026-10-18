@@ -415,3 +415,17 @@
         (is (= 1 @calls) "raw-fn ran once; second engine polled DB and reused result"))
       (finally
         (.close ^java.io.Closeable (:tenon/db engine2))))))
+
+(deftest cycle-detection-test
+  ;; Direct or mutual recursion with the exact same (wf_def, params)
+  ;; already on *invocation-stack* must fail immediately with
+  ;; ::engine/cycle-detected instead of deadlocking until timeout.
+  (let [direct (fn direct [x] (engine/run-invocation #'echo-fn direct [x]))
+        e (is (thrown? clojure.lang.ExceptionInfo
+                (engine/run-invocation #'echo-fn direct [1])))]
+    (is (= ::engine/cycle-detected (:type (ex-data e))))
+    (is (= "ERROR" (:state (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn"))))))
+  (let [step-b (fn [step-a x] (engine/run-invocation #'nested-outer-fn (fn [y] (step-a y)) [x]))
+        step-a (fn step-a [x] (engine/run-invocation #'nested-inner-fn (fn [y] (step-b step-a y)) [x]))
+        e (is (thrown? clojure.lang.ExceptionInfo (step-a 2)))]
+    (is (= ::engine/cycle-detected (:type (ex-data e))))))

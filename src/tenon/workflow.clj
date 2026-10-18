@@ -154,6 +154,11 @@
    current caller - under parent-id with meta-str - reused it, then returns
    its result, or throws describing its failure."
   [{ds :tenon/db :as engine} invocation-id parent-id meta-str]
+  (when (some #{invocation-id} *invocation-stack*)
+    (throw (ex-info "Cycle detected: workflow is already running on the current call stack"
+                    {:type ::cycle-detected
+                     :invocation-id invocation-id
+                     :invocation-stack *invocation-stack*})))
   (let [wf (await-finished engine invocation-id)]
     (db/record-reuse! ds (:invocation_id wf) parent-id meta-str)
     (case (:state wf)
