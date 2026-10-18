@@ -159,3 +159,9 @@
     (is (= [[id "DONE" true] [id "DONE" false]]
            (mapv (juxt :invocation_id :state :reused)
                  (engine/list-invocations {:wf-def "tenon.workflow.fixtures/add-numbers"}))))))
+
+(deftest tagged-defn-unbound-workflow-engine-throws-test
+  (binding [engine/*workflow-engine* nil]
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (fixtures/add-numbers 1 2)))]
+      (is (= "Dynamic var *workflow-engine* is not bound." (ex-message e)))
+      (is (= ::engine/precondition-failed (:type (ex-data e)))))))

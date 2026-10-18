@@ -148,6 +148,9 @@
   ([v raw-fn args]
    (run-invocation *workflow-engine* v raw-fn args))
   ([engine v raw-fn args]
+   (when-not engine
+     (throw (ex-info "Dynamic var *workflow-engine* is not bound."
+                     {:type ::precondition-failed})))
    (let [ds (:tenon/db engine)
          timeout-ms (:tenon/timeout-ms engine default-timeout-ms)
          wf-def-str (str (symbol v))
