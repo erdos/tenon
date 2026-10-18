@@ -1,5 +1,6 @@
 (ns tenon.workflow
   (:require [clojure.edn :as edn]
+            [clojure.walk :as walk]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]))
 
@@ -52,13 +53,21 @@
    what makes them work at all. nil until then."
   nil)
 
+(defn- canonical-compare [a b]
+  (if (= a b) 0 (compare (pr-str a) (pr-str b))))
+
 (defn- safe-pr-str
   "Like pr-str, but ignores any caller-bound *print-length*/*print-level*
-   so serialized values are always complete and readable back via edn/read-string,
-   regardless of dynamic bindings in effect at the call site (e.g. from a REPL)."
+   and canonicalizes maps and sets into a deterministic order."
   [x]
   (binding [*print-length* nil *print-level* nil]
-    (pr-str x)))
+    (pr-str (walk/postwalk
+             (fn [v]
+               (cond
+                 (and (map? v) (not (record? v))) (into (sorted-map-by canonical-compare) v)
+                 (set? v) (into (sorted-set-by canonical-compare) v)
+                 :else v))
+             x))))
 
 (defn- serialize-exception [e]
   (safe-pr-str {:message (ex-message e) :class (.getName (class e)) :data (ex-data e)}))

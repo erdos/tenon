@@ -353,3 +353,20 @@
       (is (= 8 @caller))
       (is (= ["STARTED" "ERROR" "REUSED"] (mapv :state (test-util/timeline id)))
           "only the waiter's reuse of the timeout is logged - no late DONE"))))
+
+(deftest run-invocation-canonicalizes-map-and-set-args-for-dedup-test
+  ;; Maps and sets that are = but have different iteration order (e.g.
+  ;; array-map vs hash-map, or different insertion histories) must
+  ;; serialize to the same canonical EDN string and hit the dedup cache.
+  (let [calls (atom 0)
+        f (fn [m s] (swap! calls inc) [(:a m) (count s)])
+        m1 (array-map :b 2 :a 1 "z" #{:y :x 1} :nested (array-map :d 4 :c 3))
+        m2 (array-map :nested (hash-map :c 3 :d 4) "z" (conj #{1} :x :y) :a 1 :b 2)
+        s1 (conj #{} {:b 2 :a 1} :z "a" 10)
+        s2 (conj #{} 10 "a" :z (array-map :a 1 :b 2))]
+    (is (not= (pr-str [m1 s1]) (pr-str [m2 s2]))
+        "raw pr-str differs due to map/set ordering")
+    (is (= [1 4] (engine/run-invocation #'dedup-fn f [m1 s1])))
+    (is (= [1 4] (engine/run-invocation #'dedup-fn f [m2 s2])))
+    (is (= 1 @calls) "second call with equal map/set args must reuse stored result")
+    (is (= 1 (count (test-util/find-by-wf-def "tenon.workflow-test/dedup-fn"))))))
