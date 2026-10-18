@@ -502,6 +502,7 @@
   (let [id (test-util/insert! "tenon.workflow.http-test/http-flaky-fn" :timeout-ms 60000)]
     (-> (visit (href id))
         (has (missing? [:span.chip.wf-expired]))
+        (has (missing? [:span.chip.wf-unregistered]))
         (has (missing? [:form.restart]))
         (has (missing? [:details.panel-toggle])))))
 
@@ -511,6 +512,7 @@
     (test-util/expire! (test-util/ds) id)
     (let [state (-> (visit (href id))
                     (has (texts? [:div.wf-summary-head :span.chip] ["Started" "Expired"]))
+                    (has (missing? [:span.chip.wf-unregistered]))
                     (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
                     (k/press "Yes, restart")
                     (has (status? 303)))
@@ -522,11 +524,13 @@
           (has (attr? [:section.wf-summary] :class "wf-summary state-DONE"))
           (has (missing? [:span.chip.wf-expired]))))))
 
-(deftest workflow-detail-page-hides-restart-button-when-wf-def-unregistered-test
+(deftest workflow-detail-page-shows-warning-badge-when-wf-def-unregistered-test
   (let [id (test-util/insert! "test.ns/never-registered-anywhere")]
     (test-util/finish! id "DONE" (pr-str :ok))
     (-> (visit (href id))
-        (has (missing? [:form.restart])))))
+        (has (missing? [:form.restart]))
+        (has (texts? [:span.chip.wf-unregistered]
+                     ["Unregistered var \u2014 cannot restart in this process"])))))
 
 (deftest workflow-detail-page-shows-ancestry-breadcrumb-test
   (let [root (test-util/insert! "test.ns/crumb-root")

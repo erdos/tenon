@@ -210,6 +210,9 @@
            (:expired wf))
        (some? (engine/lookup (symbol (:wf_def wf))))))
 
+(defn- unregistered? [wf]
+  (nil? (engine/lookup (symbol (:wf_def wf)))))
+
 (defn- workflow-summary
   "The card at the top of the detail page: the workflow's state, how it ran
    and how it relates to other workflows. requested-id is the id in the
@@ -228,12 +231,16 @@
      {:state (:state wf)
       :head [(when (:expired wf) [:span.chip.wf-expired "Expired"])
              (when duration [:span.wf-summary-duration duration])
-             (when (can-restart? wf)
+             (if (can-restart? wf)
                (ui/panel-toggle-btn
                 [:button "\u21BB Restart"]
                 [:form.restart {:method "post" :action (ui/uri :workflows id :restart)}
                  [:span "Run it again with the same params, under a new invocation id?"]
-                 [:button.btn.danger {:type "submit"} "Yes, restart"]]))]
+                 [:button.btn.danger {:type "submit"} "Yes, restart"]])
+               ;; When wf_def is not registered in this process, show a warning
+               ;; badge so operators know why the Restart button is missing.
+               (when (unregistered? wf)
+                 [:span.chip.wf-unregistered "Unregistered var \u2014 cannot restart in this process"]))]
       :error (when restart-error ["Restart failed: " restart-error])
       :note (when (not= requested-id id)
               ["Invocation " (ui/workflow-id requested-id)
