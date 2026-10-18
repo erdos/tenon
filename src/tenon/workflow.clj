@@ -31,7 +31,7 @@
 (defn init
   "Builds the application-state map threaded through run-invocation,
    restart-invocation, list-pending, and tenon.workflow.http's
-   wrap-handler/app: {:tenon/db ... :tenon/timeout-ms ...}.
+   wrap-handler/app: {:tenon/db ... :tenon/timeout-ms ... :tenon/in-flight ...}.
 
    db-path names a SQLite file (creating it if needed); tenon.workflow.sqlite
    opens it (sqlite/datasource) and tenon.workflow.db/init-db! - a
@@ -41,7 +41,8 @@
    nil never times out)."
   [db-path & {:as opts}]
   (merge {:tenon/db (db/init-db! (sqlite/datasource db-path))
-          :tenon/timeout-ms default-timeout-ms}
+          :tenon/timeout-ms default-timeout-ms
+          :tenon/in-flight (atom {})}
          opts))
 
 (def ^:dynamic *workflow-engine*
@@ -101,15 +102,22 @@
    recorded as STARTED, and records how it ended - unless it was timed out
    or restarted meanwhile, in which case that stays its recorded outcome,
    and only this caller gets the result (or exception)."
-  [ds invocation-id raw-fn args]
-  (let [result (try
-                 (binding [*invocation-stack* (conj *invocation-stack* invocation-id)]
-                   (apply raw-fn args))
-                 (catch Throwable e
-                   (db/finish! ds invocation-id "ERROR" (serialize-exception e))
-                   (throw e)))]
-    (db/finish! ds invocation-id "DONE" (safe-pr-str result))
-    result))
+  [{ds :tenon/db in-flight :tenon/in-flight} invocation-id raw-fn args]
+  (let [done (promise)]
+    (when in-flight (swap! in-flight assoc invocation-id done))
+    (try
+      (let [result (try
+                     (binding [*invocation-stack* (conj *invocation-stack* invocation-id)]
+                       (apply raw-fn args))
+                     (catch Throwable e
+                       (db/finish! ds invocation-id "ERROR" (serialize-exception e))
+                       (throw e)))]
+        (db/finish! ds invocation-id "DONE" (safe-pr-str result))
+        result)
+      (finally
+        (when in-flight
+          (swap! in-flight dissoc invocation-id)
+          (deliver done true))))))
 
 (defn- time-out-if-expired!
   "Marks wf ERROR as timed out if it is STARTED past its lease. Returns true
@@ -125,23 +133,28 @@
 
 (defn- await-finished
   "Polls the workflow invocation-id belongs to until it is DONE or ERROR
-   (timing it out if its lease runs out meanwhile), and returns its row."
-  [ds invocation-id]
+   (timing it out if its lease runs out meanwhile), and returns its row.
+   When the invocation is running in this JVM (:tenon/in-flight), waits on
+   its completion promise instead of sleeping so same-JVM callers wake as
+   soon as it finishes."
+  [{ds :tenon/db in-flight :tenon/in-flight} invocation-id]
   (loop [wait-ms 5]
     (let [wf (db/get-workflow ds invocation-id)]
       (case (:state wf)
         ("DONE" "ERROR") wf
         "STARTED" (if (time-out-if-expired! ds wf)
                     (recur wait-ms)
-                    (do (Thread/sleep (long wait-ms))
+                    (do (if-let [p (some-> in-flight deref (get (:invocation_id wf)))]
+                          (deref p (long wait-ms) nil)
+                          (Thread/sleep (long wait-ms)))
                         (recur (min 200 (* 2 wait-ms)))))))))
 
 (defn- reuse-existing-result!
   "Awaits the invocation-id run started by someone else, logs that the
    current caller - under parent-id with meta-str - reused it, then returns
    its result, or throws describing its failure."
-  [ds invocation-id parent-id meta-str]
-  (let [wf (await-finished ds invocation-id)]
+  [{ds :tenon/db :as engine} invocation-id parent-id meta-str]
+  (let [wf (await-finished engine invocation-id)]
     (db/record-reuse! ds (:invocation_id wf) parent-id meta-str)
     (case (:state wf)
       "DONE" (edn/read-string (:result wf))
@@ -167,11 +180,11 @@
          parent-id (first *invocation-stack*)
          meta-str (when (some? *workflow-meta*) (safe-pr-str *workflow-meta*))]
      (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-       (reuse-existing-result! ds (:invocation_id existing) parent-id meta-str)
+       (reuse-existing-result! engine (:invocation_id existing) parent-id meta-str)
        (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
-         (execute-and-record! ds invocation-id raw-fn args)
+         (execute-and-record! engine invocation-id raw-fn args)
          (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-           (reuse-existing-result! ds (:invocation_id existing) parent-id meta-str)
+           (reuse-existing-result! engine (:invocation_id existing) parent-id meta-str)
            (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
                             {:type ::race-condition :wf-def wf-def-str}))))))))
 
@@ -284,7 +297,7 @@
        ;; invocation id lets only one of them through.
        (if-let [new-invocation-id (db/restart! ds (:invocation_id wf) meta-str
                                               (:tenon/timeout-ms engine default-timeout-ms))]
-         (execute-and-record! ds new-invocation-id impl args)
+         (execute-and-record! engine new-invocation-id impl args)
          (throw (not-restartable (:state (db/get-workflow ds (:invocation_id wf))))))))))
 
 

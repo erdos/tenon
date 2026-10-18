@@ -370,3 +370,48 @@
     (is (= [1 4] (engine/run-invocation #'dedup-fn f [m2 s2])))
     (is (= 1 @calls) "second call with equal map/set args must reuse stored result")
     (is (= 1 (count (test-util/find-by-wf-def "tenon.workflow-test/dedup-fn"))))))
+
+(deftest same-jvm-concurrent-dedup-wakes-without-sleep-polling-test
+  ;; A concurrent caller in the same JVM waits on the in-flight promise
+  ;; rather than sleeping through the 200ms poll backoff: once the leader
+  ;; reaches the 200ms backoff window and then finishes, the waiter wakes
+  ;; immediately and the in-flight entry is cleaned up.
+  (let [started (promise)
+        release (promise)
+        f (fn [x] (deliver started true) @release (* x 10))
+        leader (future (engine/run-invocation #'dedup-started-fn f [77]))]
+    @started
+    (let [waiter (future (engine/run-invocation #'dedup-started-fn f [77]))]
+      ;; Let the waiter reach the 200ms backoff cap, then release the leader
+      ;; and verify the waiter wakes right away instead of sleeping ~200ms.
+      (Thread/sleep 400)
+      (let [t0 (System/nanoTime)]
+        (deliver release true)
+        (is (= 770 @leader))
+        (is (= 770 @waiter))
+        (is (< (/ (- (System/nanoTime) t0) 1e6) 50)
+            "waiter woke via in-process promise without waiting out 200ms sleep")))
+    (is (empty? @(:tenon/in-flight engine/*workflow-engine*))
+        "in-flight promise map is cleaned up after completion")))
+
+(deftest cross-engine-concurrent-dedup-polling-test
+  ;; Two separate engine instances sharing the same SQLite file do not share
+  ;; :tenon/in-flight, so the second engine falls back to DB polling until
+  ;; the first engine's run finishes.
+  (let [engine1 engine/*workflow-engine*
+        engine2 (engine/init test-util/*db-path*)]
+    (try
+      (let [calls (atom 0)
+            started (promise)
+            release (promise)
+            f (fn [x] (swap! calls inc) (deliver started true) @release (* x 10))
+            task1 (future (engine/run-invocation engine1 #'dedup-started-fn f [88]))
+            _ @started
+            task2 (future (engine/run-invocation engine2 #'dedup-started-fn f [88]))]
+        (Thread/sleep 50)
+        (deliver release true)
+        (is (= 880 @task1))
+        (is (= 880 @task2))
+        (is (= 1 @calls) "raw-fn ran once; second engine polled DB and reused result"))
+      (finally
+        (.close ^java.io.Closeable (:tenon/db engine2))))))
