@@ -63,9 +63,12 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
         (engine/run-invocation #'boom-fn boom-fn ["boom"])))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/boom-fn"))
-        events (test-util/timeline (:invocation_id wf))]
+        events (test-util/timeline (:invocation_id wf))
+        err (edn/read-string (:data (last events)))]
     (is (= ["STARTED" "ERROR"] (mapv :state events)))
-    (is (= "boom" (:message (edn/read-string (:data (last events))))))))
+    (is (= "boom" (:cause err)))
+    (is (vector? (:via err)))
+    (is (vector? (:trace err)))))
 
 (deftest list-pending-test
   (let [id (test-util/insert! "test.ns/crashed" :params (pr-str [1]))]

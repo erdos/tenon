@@ -71,7 +71,7 @@
              x))))
 
 (defn- serialize-exception [e]
-  (safe-pr-str {:message (ex-message e) :class (.getName (class e)) :data (ex-data e)}))
+  (safe-pr-str (Throwable->map e)))
 
 (def ^:dynamic *invocation-stack*
   "Invocation ids of the #workflow invocations currently running on this
@@ -164,7 +164,7 @@
     (case (:state wf)
       "DONE" (edn/read-string (:result wf))
       "ERROR" (let [failure (edn/read-string (:result wf))]
-                (throw (ex-info (str "Workflow previously failed: " (:message failure))
+                (throw (ex-info (str "Workflow previously failed: " (or (:cause failure) (:message failure)))
                                 {:type ::previous-failure
                                  :invocation-id (:invocation_id wf)
                                  :failure failure}))))))
@@ -216,7 +216,7 @@
                            not STARTED or never expiring
      :metadata             string - EDN of *workflow-meta* when started, or nil
      :result               string - EDN of the return value (DONE) or of
-                           {:message :class :data} of the failure (ERROR),
+                           the failure's Throwable->map (ERROR),
                            nil while STARTED
      :expired              boolean - whether the STARTED lease has run out"
   ([invocation-id] (get-invocation *workflow-engine* invocation-id))

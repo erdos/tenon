@@ -25,11 +25,15 @@
 (defn- result-html [wf]
   (case (:state wf)
     "DONE" (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:result wf)))
-    "ERROR" (let [{:keys [message class data] :as error} (ui/read-edn (:result wf))]
+    "ERROR" (let [error (ui/read-edn (:result wf))]
               (ui/panel {:title "Error"}
                         (if (map? error)
-                          (ui/error-details class message
-                                            (when data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty data))]))
+                          (let [{:keys [type message data]} (first (:via error))
+                                class (or (:class error) type)
+                                msg (or (:message error) (:cause error) message)
+                                ex-data (or (:data error) data)]
+                            (ui/error-details class msg
+                                              (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])))
                           (ui/edn-block (:result wf)))))
     (ui/panel {:title "Result"}
               (ui/muted "Pending \u2014 no result yet."))))
@@ -84,8 +88,9 @@
 (defn- error-title
   "\"class: message\" of an ERROR event, for a chip's tooltip."
   [ev]
-  (let [{:keys [message class]} (ui/read-edn (:data ev))]
-    (str class ": " message)))
+  (let [error (ui/read-edn (:data ev))
+        {:keys [type message]} (first (:via error))]
+    (str (or (:class error) type) ": " (or (:message error) (:cause error) message))))
 
 (defn- problem?
   "Whether node k's subtree has a workflow that failed or is still running."

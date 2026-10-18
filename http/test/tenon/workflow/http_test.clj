@@ -190,7 +190,7 @@
 
 (deftest workflow-detail-page-shows-error-panel-test
   (let [id (test-util/insert! "test.ns/error-panel")]
-    (test-util/finish! id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data {:k 1}}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (ex-info "boom" {:k 1}))))
     (-> (visit (href id))
         (within (panel "Error")
           (has (texts? [:div.error-class :code] ["clojure.lang.ExceptionInfo"]))

@@ -21,7 +21,7 @@
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow.fixtures/boom"))
         events (test-util/timeline (:invocation_id wf))]
     (is (= ["STARTED" "ERROR"] (mapv :state events)))
-    (is (= "kaboom" (:message (edn/read-string (:data (last events))))))))
+    (is (= "kaboom" (:cause (edn/read-string (:data (last events))))))))
 
 (deftest tagged-defn-with-docstring-test
   (let [m (meta #'fixtures/with-docstring)]
