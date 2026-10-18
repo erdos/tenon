@@ -24,6 +24,11 @@
     (is (= "kaboom" (:message (edn/read-string (:data (last events))))))))
 
 (deftest tagged-defn-with-docstring-test
+  (let [m (meta #'fixtures/with-docstring)]
+    (is (= "Multiplies two numbers." (:doc m)))
+    (is (= '([a b]) (:arglists m)))
+    (is (true? (:custom-flag m)))
+    (is (= :custom-val (:custom-key m))))
   (is (= 12 (fixtures/with-docstring 3 4)))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow.fixtures/with-docstring"))
         events (test-util/timeline (:invocation_id wf))]

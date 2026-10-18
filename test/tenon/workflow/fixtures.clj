@@ -25,9 +25,9 @@
     :recovered))
 
 #workflow
-(defn with-docstring
-  "Multiplies two numbers. Exists to prove #workflow strips a leading
-   docstring from the defn tail instead of splicing it into fn."
+(defn ^:custom-flag with-docstring
+  "Multiplies two numbers."
+  {:custom-key :custom-val}
   [a b]
   (* a b))
 

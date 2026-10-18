@@ -282,12 +282,11 @@
   [form]
   (when-not (and (list? form) (= 'defn (first form)))
     (throw (ex-info "#workflow only supports defn forms" {:form form})))
-  (let [[_ fname & fdecl] form
-        fdecl (if (string? (first fdecl)) (next fdecl) fdecl)
-        fdecl (if (map? (first fdecl)) (next fdecl) fdecl)]
+  (let [[_ fname fn-form] (macroexpand-1 form)]
     `(do
        (declare ~fname)
-       (let [raw-fn# (fn ~@fdecl)]
-         (defn ~fname [& args#]
-           (run-invocation (var ~fname) raw-fn# args#))
+       (let [raw-fn# ~fn-form]
+         (def ~fname
+           (fn [& args#]
+             (run-invocation (var ~fname) raw-fn# args#)))
          (register! (var ~fname) raw-fn#)))))
