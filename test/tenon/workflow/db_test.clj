@@ -1,6 +1,8 @@
 (ns tenon.workflow.db-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.edn :as edn]
+            [matcher-combinators.test :refer [match? thrown-match?]]
+            [matcher-combinators.matchers :as m]
             [next.jdbc :as jdbc]
             [tenon.workflow.db :as db]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
@@ -11,13 +13,15 @@
   (let [id (db/insert-workflow! (test-util/ds) "test.ns/foo" (pr-str [1 2]) nil nil nil)
         wf (db/get-workflow (test-util/ds) id)]
     (is (integer? id))
-    (is (= "test.ns/foo" (:wf_def wf)))
-    (is (= [1 2] (edn/read-string (:params wf))))
-    (is (= "STARTED" (:state wf)) "a workflow is inserted already STARTED")
-    (is (integer? (:state_changed_at wf)) "state_changed_at is supplied by the db")
-    (is (nil? (:expires_at wf)) "nil timeout-ms never expires")
-    (is (nil? (:parent_invocation_id wf)))
-    (is (nil? (:metadata wf)))))
+    (is (match? {:wf_def "test.ns/foo"
+                 :params (pr-str [1 2])
+                 :state "STARTED"
+                 :state_changed_at integer?
+                 :expires_at nil?
+                 :parent_invocation_id nil?
+                 :metadata nil?}
+                wf)
+        "a workflow is inserted already STARTED with db-supplied state_changed_at and nil lease")))
 
 (deftest insert-workflow-dedups-on-wf-def-and-params-test
   (let [id (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil)]
@@ -31,8 +35,9 @@
   (let [parent (test-util/insert! "test.ns/parent")
         child (db/insert-workflow! (test-util/ds) "test.ns/child" (pr-str []) parent (pr-str {:actor-id 42}) 1000)
         wf (db/get-workflow (test-util/ds) child)]
-    (is (= parent (:parent_invocation_id wf)))
-    (is (= {:actor-id 42} (edn/read-string (:metadata wf))))
+    (is (match? {:parent_invocation_id parent
+                 :metadata (pr-str {:actor-id 42})}
+                wf))
     (is (= 1000 (- (:expires_at wf) (:state_changed_at wf))))))
 
 (deftest finish-is-compare-and-set-test
@@ -40,12 +45,14 @@
     (is (true? (db/finish! (test-util/ds) id "DONE" (pr-str 42))))
     (is (false? (db/finish! (test-util/ds) id "ERROR" (pr-str {:message "x"})))
         "no longer STARTED")
-    (let [wf (db/get-workflow (test-util/ds) id)]
-      (is (= "DONE" (:state wf)))
-      (is (= 42 (edn/read-string (:result wf))))
-      (is (nil? (:expires_at wf)) "the lease is cleared when leaving STARTED"))
-    (is (= [["STARTED" nil] ["DONE" (pr-str 42)]]
-           (mapv (juxt :state :data) (test-util/history (test-util/ds) id))))))
+    (is (match? {:state "DONE"
+                 :result (pr-str 42)
+                 :expires_at nil?}
+                (db/get-workflow (test-util/ds) id))
+        "the lease is cleared when leaving STARTED")
+    (is (match? [{:state "STARTED" :data nil}
+                 {:state "DONE" :data (pr-str 42)}]
+                (test-util/history (test-util/ds) id)))))
 
 (deftest time-out-only-past-the-lease-test
   (let [id (test-util/insert! "test.ns/lease" :timeout-ms 60000)]
@@ -66,19 +73,19 @@
       (is (> id2 id))
       (is (nil? (db/restart! (test-util/ds) id nil nil))
           "the old invocation id no longer matches - a concurrent restart loses")
-      (let [wf (db/get-workflow (test-util/ds) id2)]
-        (is (= "STARTED" (:state wf)))
-        (is (nil? (:result wf)))
-        (is (= {:run 2} (edn/read-string (:metadata wf))))
-        (is (some? (:expires_at wf))))
+      (is (match? {:state "STARTED"
+                   :result nil?
+                   :metadata (pr-str {:run 2})
+                   :expires_at some?}
+                  (db/get-workflow (test-util/ds) id2)))
       (is (= id2 (:invocation_id (db/get-workflow (test-util/ds) id)))
           "an old invocation id resolves to the current row")
       (db/finish! (test-util/ds) id2 "DONE" (pr-str :ok))
-      (is (= [[id "STARTED" (pr-str {:run 1})]
-              [id "ERROR" (pr-str {:message "first"})]
-              [id2 "STARTED" (pr-str {:run 2})]
-              [id2 "DONE" (pr-str :ok)]]
-             (mapv (juxt :invocation_id :state :data) (test-util/history (test-util/ds) id2)))))))
+      (is (match? [{:invocation_id id :state "STARTED" :data (pr-str {:run 1})}
+                   {:invocation_id id :state "ERROR" :data (pr-str {:message "first"})}
+                   {:invocation_id id2 :state "STARTED" :data (pr-str {:run 2})}
+                   {:invocation_id id2 :state "DONE" :data (pr-str :ok)}]
+                  (test-util/history (test-util/ds) id2))))))
 
 (deftest restart-never-reuses-invocation-ids-test
   (let [a (test-util/insert! "test.ns/a")
@@ -93,7 +100,7 @@
 (deftest lease-only-update-is-not-logged-test
   (let [id (test-util/insert! "test.ns/renew" :timeout-ms 1000)]
     (jdbc/execute! (test-util/ds) ["UPDATE workflow SET expires_at = expires_at + 1000 WHERE invocation_id = ?" id])
-    (is (= ["STARTED"] (mapv :state (test-util/history (test-util/ds) id))))))
+    (is (match? [{:state "STARTED"}] (test-util/history (test-util/ds) id)))))
 
 (deftest expires-at-must-be-cleared-outside-started-test
   (let [id (test-util/insert! "test.ns/check")]
@@ -149,7 +156,10 @@
       (is (= 5 (count timeline)) "parent: STARTED DONE STARTED, child: STARTED DONE")
       (is (= #{[0 "test.ns/tl-parent"] [1 "test.ns/tl-child"]}
              (set (map (juxt :depth :wf_def) timeline))))
-      (is (= #{parent2} (set (map :current_invocation_id (filter #(zero? (:depth %)) timeline)))))
+      (is (match? [{:current_invocation_id parent2}
+                   {:current_invocation_id parent2}
+                   {:current_invocation_id parent2}]
+                  (filter #(zero? (:depth %)) timeline)))
       (is (= timeline (db/full-timeline (test-util/ds) parent))
           "an old invocation id gives the same timeline"))))
 
@@ -170,8 +180,11 @@
         child (test-util/insert! "test.ns/hp-child" :parent parent)]
     (db/finish! (test-util/ds) child "ERROR" (pr-str {:message "x"}))
     (db/finish! (test-util/ds) (db/restart! (test-util/ds) child nil nil) "DONE" "1")
-    (is (= [parent parent parent parent]
-           (mapv :parent_invocation_id (test-util/history (test-util/ds) child)))
+    (is (match? [{:parent_invocation_id parent}
+                 {:parent_invocation_id parent}
+                 {:parent_invocation_id parent}
+                 {:parent_invocation_id parent}]
+                (test-util/history (test-util/ds) child))
         "every history state, not only the current row, names the parent")))
 
 (deftest record-reuse-logs-reused-state-test
@@ -179,11 +192,10 @@
         parent (test-util/insert! "test.ns/reuser")]
     (db/finish! (test-util/ds) child "DONE" (pr-str 1))
     (db/record-reuse! (test-util/ds) child parent (pr-str {:actor-id 7}))
-    (is (= [[child "STARTED" nil nil]
-            [child "DONE" (pr-str 1) nil]
-            [child "REUSED" (pr-str {:actor-id 7}) parent]]
-           (mapv (juxt :invocation_id :state :data :parent_invocation_id)
-                 (test-util/history (test-util/ds) child))))
+    (is (match? [{:invocation_id child :state "STARTED" :data nil :parent_invocation_id nil?}
+                 {:invocation_id child :state "DONE" :data (pr-str 1) :parent_invocation_id nil?}
+                 {:invocation_id child :state "REUSED" :data (pr-str {:actor-id 7}) :parent_invocation_id parent}]
+                (test-util/history (test-util/ds) child)))
     (is (= "DONE" (:state (db/get-workflow (test-util/ds) child)))
         "the workflow row itself is untouched - still the current state")))
 
@@ -194,8 +206,8 @@
     (db/finish! (test-util/ds) child "DONE" "1")
     (db/restart! (test-util/ds) child nil nil)
     (db/record-reuse! (test-util/ds) child nil nil)
-    (is (= [child "REUSED"]
-           ((juxt :invocation_id :state) (last (test-util/history (test-util/ds) child)))))))
+    (is (match? {:invocation_id child :state "REUSED"}
+                (last (test-util/history (test-util/ds) child))))))
 
 (deftest full-timeline-includes-reused-children-test
   (let [parent1 (test-util/insert! "test.ns/rt-parent1")
@@ -204,16 +216,14 @@
     (db/finish! (test-util/ds) child "DONE" "1")
     (db/record-reuse! (test-util/ds) child parent2 nil)
     (let [timeline (db/full-timeline (test-util/ds) parent2)]
-      (is (= [[0 parent2 nil "test.ns/rt-parent2" "STARTED"]
-              [1 child parent2 "test.ns/rt-child" "REUSED"]]
-             (map (juxt :depth :invocation_id :parent_invocation_id :wf_def :state) timeline))
+      (is (match? [{:depth 0 :invocation_id parent2 :parent_invocation_id nil? :wf_def "test.ns/rt-parent2" :state "STARTED"}
+                   {:depth 1 :invocation_id child :parent_invocation_id parent2 :wf_def "test.ns/rt-child" :state "REUSED"}]
+                  timeline)
           "only the REUSED row - the child ran under parent1, so its own states aren't in parent2's timeline"))
-    (is (= [[0 child parent1 "STARTED"]
-            [0 child parent1 "DONE"]
-            [0 child parent2 "REUSED"]]
-           (->> (db/full-timeline (test-util/ds) child)
-                (map (juxt :depth :invocation_id :parent_invocation_id :state))
-                (sort-by #({"STARTED" 0 "DONE" 1 "REUSED" 2} (peek %)))))
+    (is (match? (m/in-any-order [{:depth 0 :invocation_id child :parent_invocation_id parent1 :state "STARTED"}
+                                 {:depth 0 :invocation_id child :parent_invocation_id parent1 :state "DONE"}
+                                 {:depth 0 :invocation_id child :parent_invocation_id parent2 :state "REUSED"}])
+                (db/full-timeline (test-util/ds) child))
         "the child's own timeline still has its reuse")
     (is (= #{"test.ns/rt-parent1" "test.ns/rt-child"}
            (set (map :wf_def (db/full-timeline (test-util/ds) parent1))))
@@ -232,20 +242,21 @@
     (test-util/finish! b "DONE" "2")
     (test-util/record-reuse! a nil)
     (test-util/record-reuse! b a)
-    (let [a' (test-util/restart! a)
-          summary (juxt :invocation_id :wf_def :parent_invocation_id :state :reused)]
-      (is (= [[b "test.ns/calls-b" a "DONE" true]
-              [a' "test.ns/calls-a" nil "STARTED" true]
-              [b "test.ns/calls-b" a "DONE" false]
-              [a' "test.ns/calls-a" nil "STARTED" false]]
-             (mapv summary (db/top-level-workflows (test-util/ds) {:top-level-only? false}))))
-      (is (= [[a' "test.ns/calls-a" nil "STARTED" true]
-              [a' "test.ns/calls-a" nil "STARTED" false]]
-             (mapv summary (db/top-level-workflows (test-util/ds) {}))))
-      (is (= [[b "test.ns/calls-b" a "DONE" true]
-              [b "test.ns/calls-b" a "DONE" false]]
-             (mapv summary (db/top-level-workflows (test-util/ds) {:top-level-only? false :state "DONE"}))
-             (mapv summary (db/top-level-workflows (test-util/ds) {:top-level-only? false :wf-def "test.ns/calls-b"}))))
+    (let [a' (test-util/restart! a)]
+      (is (match? [{:invocation_id b :wf_def "test.ns/calls-b" :parent_invocation_id a :state "DONE" :reused true}
+                   {:invocation_id a' :wf_def "test.ns/calls-a" :parent_invocation_id nil? :state "STARTED" :reused true}
+                   {:invocation_id b :wf_def "test.ns/calls-b" :parent_invocation_id a :state "DONE" :reused false}
+                   {:invocation_id a' :wf_def "test.ns/calls-a" :parent_invocation_id nil? :state "STARTED" :reused false}]
+                  (db/top-level-workflows (test-util/ds) {:top-level-only? false})))
+      (is (match? [{:invocation_id a' :wf_def "test.ns/calls-a" :parent_invocation_id nil? :state "STARTED" :reused true}
+                   {:invocation_id a' :wf_def "test.ns/calls-a" :parent_invocation_id nil? :state "STARTED" :reused false}]
+                  (db/top-level-workflows (test-util/ds) {})))
+      (let [expected-done [{:invocation_id b :wf_def "test.ns/calls-b" :parent_invocation_id a :state "DONE" :reused true}
+                           {:invocation_id b :wf_def "test.ns/calls-b" :parent_invocation_id a :state "DONE" :reused false}]]
+        (is (match? expected-done
+                    (db/top-level-workflows (test-util/ds) {:top-level-only? false :state "DONE"})))
+        (is (match? expected-done
+                    (db/top-level-workflows (test-util/ds) {:top-level-only? false :wf-def "test.ns/calls-b"}))))
       (let [[c1 c2 c3 c4] (db/top-level-workflows (test-util/ds) {:top-level-only? false})]
         (is (= [c3 c4] (db/top-level-workflows (test-util/ds) {:top-level-only? false :before (:call_id c2)})))
         (is (= [c1 c2 c3] (db/top-level-workflows (test-util/ds) {:top-level-only? false :limit 2}))

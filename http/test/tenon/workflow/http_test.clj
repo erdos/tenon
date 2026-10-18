@@ -3,6 +3,8 @@
             [clojure.string :as str]
             [ring.mock.request :as mock]
             [cheshire.core :as json]
+            [matcher-combinators.test :refer [match? thrown-match?]]
+            [matcher-combinators.matchers :as m]
             [kerodon.core :as k :refer [within]]
             [kerodon.test :refer [has status? some-text? regex?
                                   attr? value? missing? heading? link?]]
@@ -55,8 +57,8 @@
   (let [id (test-util/insert! "test.ns/crashed" :params (pr-str [1 2]))
         response (request :get "/workflows/pending")
         body (json/parse-string (:body response) true)]
-    (is (= 200 (:status response)))
-    (is (some #(= id (:invocation_id %)) body))))
+    (is (match? {:status 200} response))
+    (is (match? [{:invocation_id id :params [1 2]}] body))))
 
 (deftest pending-endpoint-handles-invalid-params-edn-test
   ;; A single row with unreadable :params must not fail the whole
@@ -66,16 +68,15 @@
         bad-id (test-util/insert! "test.ns/bad" :params "(1 2")
         response (request :get "/workflows/pending")
         body (json/parse-string (:body response) true)]
-    (is (= 200 (:status response)))
-    (is (some #(= good-id (:invocation_id %)) body))
-    (let [bad-row (first (filter #(= bad-id (:invocation_id %)) body))]
-      (is (some? bad-row))
-      (is (contains? bad-row :params_raw)))))
+    (is (match? {:status 200} response))
+    (is (match? (m/in-any-order [{:invocation_id good-id :params [1 2]}
+                                 {:invocation_id bad-id :params_raw "(1 2"}])
+                body))))
 
 (deftest pending-endpoint-returns-500-on-unexpected-error-test
   (with-redefs [engine/list-pending (fn [] (throw (ex-info "kaboom" {})))]
     (let [response (request :get "/workflows/pending")]
-      (is (= 500 (:status response))))))
+      (is (match? {:status 500} response)))))
 
 (deftest dashboard-lists-top-level-workflows-test
   (let [id (test-util/insert! "test.ns/top" :params (pr-str [1]))]
@@ -604,7 +605,7 @@
         (has (attr? (selected-option "state") :value "STARTED")))
     (let [id (test-util/insert! "test.ns/prefixed")
           body (:body (app (mock/request :get "/tenon/workflows/pending")))]
-      (is (some #(= id (:invocation_id %)) (json/parse-string body true))))))
+      (is (match? [{:invocation_id id}] (json/parse-string body true))))))
 
 (deftest wrap-handler-generates-prefixed-links-test
   (let [original (constantly {:status 200 :body "unreachable"})
@@ -650,7 +651,8 @@
 (deftest wrap-handler-async-delegates-non-prefixed-uris-test
   (let [original (fn [_request respond _raise] (respond {:status 200 :body "from the original app"}))
         app (wrapped-app "/tenon" original)]
-    (is (= "from the original app" (:body (async-call app (mock/request :get "/other")))))))
+    (is (match? {:status 200 :body "from the original app"}
+                (async-call app (mock/request :get "/other"))))))
 
 (deftest wrap-handler-async-routes-prefixed-uris-to-tenon-test
   (let [original (fn [_request _respond raise] (raise (ex-info "unreachable" {})))
@@ -661,13 +663,13 @@
 
 (deftest app-async-not-found-test
   (let [response (async-call (http/app engine/*workflow-engine*) (mock/request :get "/no/such/route"))]
-    (is (= 404 (:status response)))
-    (is (= {:error "not found"} (json/parse-string (:body response) true)))))
+    (is (match? {:status 404} response))
+    (is (match? {:error "not found"} (json/parse-string (:body response) true)))))
 
 (deftest app-not-found-test
   (let [response (request :get "/no/such/route")]
-    (is (= 404 (:status response)))
-    (is (= {:error "not found"} (json/parse-string (:body response) true)))))
+    (is (match? {:status 404} response))
+    (is (match? {:error "not found"} (json/parse-string (:body response) true)))))
 
 (deftest workflow-detail-page-shows-reused-sub-workflow-test
   ;; A child whose result another parent reused shows under that parent's

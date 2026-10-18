@@ -13,5 +13,6 @@
                       kerodon/kerodon {:mvn/version "0.9.1"
                                        :exclusions [ring-mock/ring-mock]}
                       ring/ring-jetty-adapter {:mvn/version "1.13.0"}
-                      ring/ring-devel {:mvn/version "1.13.0"}}
+                      ring/ring-devel {:mvn/version "1.13.0"}
+                      nubank/matcher-combinators {:mvn/version "3.11.0"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "test"]}}}

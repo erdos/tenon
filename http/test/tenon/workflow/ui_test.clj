@@ -1,5 +1,6 @@
 (ns tenon.workflow.ui-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
+            [matcher-combinators.test :refer [match?]]
             [kerodon.core :refer [within]]
             [kerodon.test :refer [has text? attr? missing? heading?]]
             [tenon.workflow.kerodon-util :as ku :refer [render count? present? texts? attrs?]]
@@ -17,28 +18,28 @@
     (is (= "/tenon/workflows/1?a=1" (ui/uri :workflows 1 {:a 1})))))
 
 (deftest parse-pagination-defaults-page-size-when-absent-test
-  (is (= {:page-size 100 :page_cursor nil}
-         (ui/parse-pagination {} [:before_ts :before_id]))))
+  (is (match? {:page-size 100 :page_cursor nil?}
+              (ui/parse-pagination {} [:before_ts :before_id]))))
 
 (deftest parse-pagination-defaults-page-size-when-not-a-listed-size-test
-  (is (= 100 (:page-size (ui/parse-pagination {"page_size" "3"} [:before_ts :before_id]))))
-  (is (= 100 (:page-size (ui/parse-pagination {"page_size" "not-a-number"} [:before_ts :before_id])))))
+  (is (match? {:page-size 100} (ui/parse-pagination {"page_size" "3"} [:before_ts :before_id])))
+  (is (match? {:page-size 100} (ui/parse-pagination {"page_size" "not-a-number"} [:before_ts :before_id]))))
 
 (deftest parse-pagination-accepts-a-listed-page-size-test
-  (is (= 500 (:page-size (ui/parse-pagination {"page_size" "500"} [:before_ts :before_id])))))
+  (is (match? {:page-size 500} (ui/parse-pagination {"page_size" "500"} [:before_ts :before_id]))))
 
 (deftest parse-pagination-builds-cursor-from-named-keys-in-order-test
-  (is (= ["2026-01-01" "abc"]
-         (:page_cursor (ui/parse-pagination {"before_ts" "2026-01-01" "before_id" "abc"}
-                                             [:before_ts :before_id])))))
+  (is (match? {:page_cursor ["2026-01-01" "abc"]}
+              (ui/parse-pagination {"before_ts" "2026-01-01" "before_id" "abc"}
+                                   [:before_ts :before_id]))))
 
 (deftest parse-pagination-treats-a-partial-cursor-as-no-cursor-test
-  (is (nil? (:page_cursor (ui/parse-pagination {"before_ts" "2026-01-01"} [:before_ts :before_id]))))
-  (is (nil? (:page_cursor (ui/parse-pagination {"before_id" "abc"} [:before_ts :before_id])))))
+  (is (match? {:page_cursor nil?} (ui/parse-pagination {"before_ts" "2026-01-01"} [:before_ts :before_id])))
+  (is (match? {:page_cursor nil?} (ui/parse-pagination {"before_id" "abc"} [:before_ts :before_id]))))
 
 (deftest parse-pagination-works-with-different-cursor-key-names-test
-  (is (= ["x" "y"]
-         (:page_cursor (ui/parse-pagination {"after_a" "x" "after_b" "y"} [:after_a :after_b])))))
+  (is (match? {:page_cursor ["x" "y"]}
+              (ui/parse-pagination {"after_a" "x" "after_b" "y"} [:after_a :after_b]))))
 
 (deftest workflow-link-test
   (-> (render (ui/workflow-link 12))
