@@ -499,10 +499,29 @@
                      ["Restart failed: Cannot restart: workflow is not DONE or ERROR"])))))
 
 (deftest workflow-detail-page-hides-restart-button-when-pending-test
-  (let [id (test-util/insert! "test.ns/still-running")]
+  (engine/register! #'http-flaky-fn (fn [] :ok))
+  (let [id (test-util/insert! "tenon.workflow.http-test/http-flaky-fn" :timeout-ms 60000)]
     (-> (visit (href id))
+        (has (missing? [:span.chip.wf-expired]))
         (has (missing? [:form.restart]))
         (has (missing? [:details.panel-toggle])))))
+
+(deftest workflow-detail-page-allows-restarting-expired-started-workflow-test
+  (engine/register! #'http-flaky-fn (fn [] :ok))
+  (let [id (test-util/insert! "tenon.workflow.http-test/http-flaky-fn" :timeout-ms 60000)]
+    (test-util/expire! (test-util/ds) id)
+    (let [state (-> (visit (href id))
+                    (has (texts? [:div.wf-summary-head :span.chip] ["Started" "Expired"]))
+                    (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
+                    (k/press "Yes, restart")
+                    (has (status? 303)))
+          current (:invocation_id (engine/get-invocation id))]
+      (is (not= id current))
+      (-> state
+          k/follow-redirect
+          (has (status? 200))
+          (has (attr? [:section.wf-summary] :class "wf-summary state-DONE"))
+          (has (missing? [:span.chip.wf-expired]))))))
 
 (deftest workflow-detail-page-hides-restart-button-when-wf-def-unregistered-test
   (let [id (test-util/insert! "test.ns/never-registered-anywhere")]

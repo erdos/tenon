@@ -201,7 +201,8 @@
       [:ul.tree (timeline-tree-node nodes children start [:root])])))
 
 (defn- can-restart? [wf]
-  (and (#{"DONE" "ERROR"} (:state wf))
+  (and (or (#{"DONE" "ERROR"} (:state wf))
+           (:expired wf))
        (some? (engine/lookup (symbol (:wf_def wf))))))
 
 (defn- workflow-summary
@@ -220,7 +221,8 @@
         now (System/currentTimeMillis)]
     (ui/summary-card
      {:state (:state wf)
-      :head [(when duration [:span.wf-summary-duration duration])
+      :head [(when (:expired wf) [:span.chip.wf-expired "Expired"])
+             (when duration [:span.wf-summary-duration duration])
              (when (can-restart? wf)
                (ui/panel-toggle-btn
                 [:button "\u21BB Restart"]
