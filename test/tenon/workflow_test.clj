@@ -6,7 +6,16 @@
             [tenon.workflow.db :as db]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
-(use-fixtures :each temp-db-fixture)
+(def ^:private ^:dynamic *emitted-events* nil)
+
+(use-fixtures :each
+  temp-db-fixture
+  (fn [f]
+    (let [events (atom [])]
+      (binding [*emitted-events* events
+                engine/*workflow-engine* (assoc engine/*workflow-engine*
+                                                :tenon/on-event #(swap! events conj [%1 %2]))]
+        (f)))))
 
 (def ^:private add-fn (fn [a b] (+ a b)))
 (def ^:private boom-fn (fn [msg] (throw (ex-info msg {}))))
@@ -33,13 +42,25 @@
     (is (= [2 3] (edn/read-string (:params wf))))
     (is (nil? (:parent_invocation_id wf)) "a top-level invocation has no parent")
     (is (= ["STARTED" "DONE"] (mapv :state events)))
-    (is (= 5 (edn/read-string (:data (last events)))))))
+    (is (= 5 (edn/read-string (:data (last events)))))
+    (is (= [[:started {:invocation-id (:invocation_id wf)
+                       :parent-invocation-id nil
+                       :wf-def "tenon.workflow-test/add-fn"
+                       :args [2 3]
+                       :metadata nil}]
+            [:done {:invocation-id (:invocation_id wf)
+                    :parent-invocation-id nil
+                    :wf-def "tenon.workflow-test/add-fn"
+                    :args [2 3]
+                    :result 5}]]
+           @*emitted-events*))))
 
 (deftest run-invocation-stores-bound-workflow-meta-test
   (binding [engine/*workflow-meta* {:actor-id 42 :trace-id "abc"}]
     (engine/run-invocation #'meta-fn meta-fn [1]))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))]
-    (is (= {:actor-id 42 :trace-id "abc"} (edn/read-string (:metadata wf))))))
+    (is (= {:actor-id 42 :trace-id "abc"} (edn/read-string (:metadata wf))))
+    (is (= {:actor-id 42 :trace-id "abc"} (:metadata (second (first @*emitted-events*)))))))
 
 (deftest run-invocation-without-bound-workflow-meta-stores-nil-test
   (engine/run-invocation #'no-meta-fn no-meta-fn [1])
@@ -56,6 +77,11 @@
     (is (= 11 result))
     (is (nil? (:parent_invocation_id outer-wf)))
     (is (= (:invocation_id outer-wf) (:parent_invocation_id inner-wf)))
+    (is (= [[:started nil]
+            [:started (:invocation_id outer-wf)]
+            [:done (:invocation_id outer-wf)]
+            [:done nil]]
+           (mapv (fn [[ev data]] [ev (:parent-invocation-id data)]) @*emitted-events*)))
     (is (nil? (seq engine/*invocation-stack*))
         "the stack unwinds back to empty once both invocations return")))
 
@@ -68,7 +94,9 @@
     (is (= ["STARTED" "ERROR"] (mapv :state events)))
     (is (= "boom" (:cause err)))
     (is (vector? (:via err)))
-    (is (vector? (:trace err)))))
+    (is (vector? (:trace err)))
+    (is (= [:started :error] (mapv first @*emitted-events*)))
+    (is (instance? clojure.lang.ExceptionInfo (:error (second (second @*emitted-events*)))))))
 
 (deftest list-pending-test
   (let [id (test-util/insert! "test.ns/crashed" :params (pr-str [1]))]
@@ -89,7 +117,9 @@
     (engine/register! #'flaky-fn (fn [_n] :recovered))
     (let [result (engine/restart-invocation id)]
       (is (= :recovered result))
-      (is (= ["STARTED" "ERROR" "STARTED" "DONE"] (mapv :state (test-util/timeline id)))))))
+      (is (= ["STARTED" "ERROR" "STARTED" "DONE"] (mapv :state (test-util/timeline id))))
+      (is (= [:started :error :restarted :done] (mapv first @*emitted-events*)))
+      (is (= id (:previous-invocation-id (second (nth @*emitted-events* 2))))))))
 
 (deftest run-invocation-preserves-full-args-and-result-despite-print-length-test
   ;; A caller-bound *print-length*/*print-level* (common in REPLs/editors) must
@@ -155,7 +185,9 @@
     (is (= 70 result1 result2))
     (is (zero? @calls) "must not have re-executed - the DONE row was replayed")
     (is (= 1 (count (test-util/find-by-wf-def "tenon.workflow-test/dedup-fn")))
-        "only one workflow row exists for this wf-def+args pair")))
+        "only one workflow row exists for this wf-def+args pair")
+    (is (= [:started :done :reused] (mapv first @*emitted-events*)))
+    (is (= "DONE" (:state (second (last @*emitted-events*)))))))
 
 (deftest run-invocation-dedups-failed-invocation-test
   ;; Same wf-def + same args as an already-ERROR invocation must not
@@ -285,7 +317,8 @@
       (is (= ::engine/timed-out (-> e ex-data :failure :data :type))))
     (is (zero? @calls))
     (is (= ["STARTED" "ERROR" "REUSED"] (mapv :state (test-util/timeline id)))
-        "the caller that timed it out reused the timeout failure")))
+        "the caller that timed it out reused the timeout failure")
+    (is (= [:timed-out :reused] (mapv first @*emitted-events*)))))
 
 (deftest run-invocation-timeout-counts-from-start-time-test
   ;; The deadline is the invocation's start time + :tenon/timeout-ms, not
