@@ -347,5 +347,6 @@
                [:div.page-head
                 [:h2 "Timeline"]
                 (when (seq events)
-                  [:button.btn.back {:type "button" :onclick expand-all-js} "Expand all"])]
+                  [:div.head-actions
+                   [:button.btn {:type "button" :onclick expand-all-js} "Expand all"]])]
                (full-timeline-tree events)]))))

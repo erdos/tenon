@@ -281,6 +281,12 @@
     {:page-size   page-size
      :page_cursor (when (every? not-empty cursor-vals) cursor-vals)}))
 
+(def ^:private saved-theme-js
+  "try{document.documentElement.dataset.theme=localStorage.theme||''}catch(e){}")
+
+(def ^:private theme-toggle-js
+  "const r=document.documentElement,t={'':'light',light:'dark',dark:''}[r.dataset.theme||''];r.dataset.theme=t;try{localStorage.theme=t}catch(e){}")
+
 (defn layout
   "A whole HTML page, as a string, titled title. Options: back, an
    [href label] link shown at the top right to the page this one belongs
@@ -291,12 +297,15 @@
    (->> [:html
          [:head [:title (or tab-title title)]
           (when refresh [:meta {:http-equiv "refresh" :content (str refresh)}])
+          [:script (hiccup/raw saved-theme-js)]
           [:style (hiccup/raw page-style)]]
          [:body
           [:header.page-head
            [:h1 title]
-           (when-let [[href label] back]
-             [:a.btn.back {:href href} "\u2190 " label])]
+           [:div.head-actions
+            (when-let [[href label] back]
+              [:a.btn.back {:href href} "\u2190 " label])
+            [:button.btn.theme-toggle {:type "button" :title "Theme: auto, light or dark" :onclick theme-toggle-js}]]]
           body]]
         (hiccup/html {:mode :html})
         (str))))

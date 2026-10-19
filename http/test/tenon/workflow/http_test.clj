@@ -432,6 +432,13 @@
         (has (texts? [:div.page-head :h2] ["Timeline"]))
         (has (texts? [:div.page-head :button] ["Expand all"])))))
 
+(deftest page-has-a-theme-toggle-test
+  (let [id (test-util/insert! "test.ns/tree-themed")]
+    (test-util/finish! id "DONE" (pr-str :ok))
+    (-> (visit (href id))
+        (has (present? [:header.page-head :button.theme-toggle]))
+        (has (present? [:head :script]) "the saved theme is applied before first paint"))))
+
 (deftest timeline-tree-shows-offsets-and-durations-test
   (let [id (test-util/insert! "test.ns/tree-timed")]
     (test-util/finish! id "DONE" (pr-str :ok))
@@ -476,7 +483,7 @@
         (has (attr? [:details.panel-toggle :form.restart] :action (str (href id) "/restart")))
         (has (attr? [:form.restart] :method "post"))
         (has (texts? [:form.restart [:button (enlive/attr= :type "submit")]] ["Yes, restart"]))
-        (has (missing? [:script]) "no script needed"))))
+        (has (missing? [:details.panel-toggle :script]) "the restart popover needs no script"))))
 
 (deftest restart-form-redirects-back-to-the-detail-page-test
   (let [id (flaky-invocation!)
