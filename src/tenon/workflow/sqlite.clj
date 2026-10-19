@@ -81,12 +81,13 @@
    "CREATE TABLE IF NOT EXISTS workflow (
       id            INTEGER PRIMARY KEY,  -- its first invocation id
       invocation_id INTEGER NOT NULL,     -- the current invocation (its STARTED event)
+      state         TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR')), -- a copy of the current state event's, for filters
       state_id      INTEGER NOT NULL,     -- the current state's event: invocation_id while STARTED
       last_id       INTEGER NOT NULL,     -- its latest event, head of the prev_id list
       last_call_id  INTEGER               -- the latest call it made, head of the prev_call_id list
     ) STRICT"
    ;; The few running workflows.
-   "CREATE INDEX IF NOT EXISTS workflow_started ON workflow(id) WHERE state_id = invocation_id"
+   "CREATE INDEX IF NOT EXISTS workflow_started ON workflow(id) WHERE state = 'STARTED'"
    "CREATE TABLE IF NOT EXISTS idempotence (
       key         BLOB    PRIMARY KEY,
       workflow_id INTEGER NOT NULL
@@ -95,7 +96,8 @@
    "CREATE TRIGGER IF NOT EXISTS event_first AFTER INSERT ON event
     WHEN NEW.id = NEW.workflow_id
     BEGIN
-      INSERT INTO workflow (id, invocation_id, state_id, last_id) VALUES (NEW.id, NEW.id, NEW.id, NEW.id);
+      INSERT INTO workflow (id, invocation_id, state, state_id, last_id)
+      VALUES (NEW.id, NEW.id, 'STARTED', NEW.id, NEW.id);
     END"
    ;; ... and every later one moves its pointers.
    "CREATE TRIGGER IF NOT EXISTS event_next AFTER INSERT ON event
@@ -103,6 +105,7 @@
     BEGIN
       UPDATE workflow
          SET invocation_id = iif(NEW.state = 'STARTED', NEW.id, invocation_id),
+             state = iif(NEW.state = 'REUSED', state, NEW.state),
              state_id = iif(NEW.state = 'REUSED', state_id, NEW.id),
              last_id = NEW.id
        WHERE id = NEW.workflow_id;
@@ -118,10 +121,10 @@
    ;; A workflow's current state, all fields: the pointers resolved.
    "CREATE VIEW IF NOT EXISTS workflow_state AS
     SELECT w.id AS workflow_id, w.invocation_id, d.name AS wf_def, f.params, f.parent_invocation_id,
-           s.state, s.at AS state_changed_at, s.expires_at, i.data AS metadata,
-           iif(s.state = 'STARTED', NULL, s.data) AS result
+           w.state, s.at AS state_changed_at, s.expires_at, i.data AS metadata,
+           iif(w.state = 'STARTED', NULL, s.data) AS result
       FROM workflow w
-      CROSS JOIN event s ON s.id = w.state_id  -- first, so filters on the state skip the rest
+      CROSS JOIN event s ON s.id = w.state_id
       CROSS JOIN event i ON i.id = w.invocation_id
       CROSS JOIN event f ON f.id = w.id
       CROSS JOIN wf_def d ON d.id = f.wf_def_id"
@@ -184,25 +187,39 @@
    - else: walking the log newest first."
   [{:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
   (let [limit (when limit (inc limit))
-        where (fn [& conditions] (str/join " AND " (remove nil? conditions)))
+        where (fn [& conditions] (str/join " AND " (remove str/blank? conditions)))
         order (str " ORDER BY c.id DESC" (when limit " LIMIT ?"))
         def-id "(SELECT id FROM wf_def WHERE name = ?)"]
     (cond
       (= "STARTED" state)
-      [(str "WITH RECURSIVE running(id) AS (
-               SELECT last_id FROM workflow WHERE state_id = invocation_id
-               UNION ALL
-               SELECT e.prev_id FROM running r JOIN event e ON e.id = r.id WHERE e.prev_id IS NOT NULL)
-             SELECT " call-columns "
-               FROM running r
-               CROSS JOIN event c ON c.id = r.id
-               CROSS JOIN workflow_state s ON s.workflow_id = c.workflow_id
-              WHERE " (where "c.wf_def_id IS NOT NULL"
-                             (when top-level-only? "c.parent_invocation_id IS NULL")
-                             (when wf-def (str "c.wf_def_id = " def-id))
-                             (when before "c.id < ?"))
-            order)
-       (cond-> [] wf-def (conj wf-def) before (conj before) limit (conj limit))]
+      ;; A running workflow's first call is in workflow_started's order,
+      ;; its reuses (if any) are found in its event list.
+      (let [filters (fn [id] (where (when top-level-only? "c.parent_invocation_id IS NULL")
+                                    (when wf-def (str "c.wf_def_id = " def-id))
+                                    (when before (str id " < ?"))))
+            params (cond-> [] wf-def (conj wf-def) before (conj before) limit (conj limit))]
+        [(str "WITH RECURSIVE reuse(id) AS (
+                 SELECT last_id FROM workflow WHERE state = 'STARTED'
+                 UNION ALL
+                 SELECT e.prev_id FROM reuse r JOIN event e ON e.id = r.id WHERE e.prev_id IS NOT NULL)
+               SELECT * FROM (
+                 SELECT * FROM (
+                   SELECT " call-columns "
+                     FROM workflow r INDEXED BY workflow_started
+                     CROSS JOIN event c ON c.id = r.id
+                     CROSS JOIN workflow_state s ON s.workflow_id = r.id
+                    WHERE " (where "r.state = 'STARTED'" (filters "r.id")) "
+                    ORDER BY r.id DESC" (when limit " LIMIT ?") ")
+                 UNION ALL
+                 SELECT * FROM (
+                   SELECT " call-columns "
+                     FROM reuse x
+                     CROSS JOIN event c ON c.id = x.id
+                     CROSS JOIN workflow_state s ON s.workflow_id = c.workflow_id
+                    WHERE " (where "c.state = 'REUSED'" (filters "c.id")) "
+                    ORDER BY c.id DESC" (when limit " LIMIT ?") "))
+               ORDER BY call_id DESC" (when limit " LIMIT ?"))
+         (cond-> (into params params) limit (conj limit))])
 
       wf-def
       (let [branch (fn [top-level]
