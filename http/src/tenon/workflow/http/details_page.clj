@@ -318,6 +318,9 @@
       (recur (:parent_invocation_id parent) (cons parent acc))
       acc)))
 
+(def ^:private expand-all-js
+  "let d=[...document.querySelectorAll('ul.tree details')],o=d.every(x=>x.open);d.forEach(x=>x.open=!o);this.textContent=o?'Expand all':'Collapse all'")
+
 (defn html
   "The page of the workflow requested-id belongs to as an HTML string, or
    nil if there is no such workflow. restart-error, if not nil, is a
@@ -341,5 +344,8 @@
                 (params-html (:params wf))
                 (result-html wf)
                 (when (:metadata wf) (metadata-html (:metadata wf)))]
-               [:h2 "Timeline"]
+               [:div.page-head
+                [:h2 "Timeline"]
+                (when (seq events)
+                  [:button.btn.back {:type "button" :onclick expand-all-js} "Expand all"])]
                (full-timeline-tree events)]))))

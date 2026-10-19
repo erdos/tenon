@@ -425,6 +425,13 @@
           (has (present? [(tree-node "tree-p") :span.tree-time [:span (enlive/attr-starts :title "running for ")]])
                "a running node shows how long it has been running")))))
 
+(deftest timeline-has-an-expand-all-button-test
+  (let [id (test-util/insert! "test.ns/tree-expandable")]
+    (test-util/finish! id "DONE" (pr-str :ok))
+    (-> (visit (href id))
+        (has (texts? [:div.page-head :h2] ["Timeline"]))
+        (has (texts? [:div.page-head :button] ["Expand all"])))))
+
 (deftest timeline-tree-shows-offsets-and-durations-test
   (let [id (test-util/insert! "test.ns/tree-timed")]
     (test-util/finish! id "DONE" (pr-str :ok))

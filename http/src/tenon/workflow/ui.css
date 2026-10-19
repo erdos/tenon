@@ -31,9 +31,9 @@ span.chip{font-size:.8em;font-weight:600;font-variant-caps:all-small-caps;letter
 .btn.danger:hover{background:#ffc9c9}
 
 /* Page header */
-header.page-head{display:flex;align-items:center;gap:1em;flex-wrap:wrap}
-header.page-head h1{min-width:0;overflow-wrap:anywhere}
-a.back{margin-left:auto;white-space:nowrap}
+.page-head{display:flex;align-items:center;gap:1em;flex-wrap:wrap}
+.page-head :is(h1,h2){min-width:0;overflow-wrap:anywhere}
+.back{margin-left:auto;white-space:nowrap}
 
 /* Listing: filter bar, table, pager */
 form.filters{display:flex;flex-wrap:wrap;align-items:center;gap:.5em 1.2em;margin:0;padding:8px 12px;
