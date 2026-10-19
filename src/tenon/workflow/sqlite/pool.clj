@@ -7,6 +7,7 @@
            [java.sql Connection DriverManager PreparedStatement ResultSet]
            [java.util HashMap Map]
            [java.util.concurrent LinkedBlockingQueue Semaphore]
+           [java.util.concurrent.locks ReentrantLock]
            [java.util.concurrent.atomic AtomicBoolean]))
 
 (defn- close-quietly [^java.lang.AutoCloseable c]
@@ -62,7 +63,8 @@
          ~sym (borrow pool#)]
      (try ~@body (finally (give-back pool# ~sym)))))
 
-(deftype Pool [^String url ^LinkedBlockingQueue idle ^Semaphore permits ^AtomicBoolean closed]
+(deftype Pool [^String url ^LinkedBlockingQueue idle ^Semaphore permits ^AtomicBoolean closed
+               ^ReentrantLock write-lock]
   p/Executable
   (-execute [_ _ _]
     (throw (UnsupportedOperationException. "plan needs a connection: borrow one with with-connection")))
@@ -82,7 +84,18 @@
         (recur)))))
 
 (defn open ^Pool [url size]
-  (Pool. url (LinkedBlockingQueue.) (Semaphore. size) (AtomicBoolean. false)))
+  (Pool. url (LinkedBlockingQueue.) (Semaphore. size) (AtomicBoolean. false) (ReentrantLock. true)))
+
+(defn write!
+  "Calls (f) holding the pool's write lock. SQLite runs one writer at a
+   time anyway, and a writer finding the database locked backs off by
+   sleeping (busy_timeout) - so writers of this process queue up here
+   instead, in arrival order, and each starts the moment the last one is
+   done. Writers of other processes still meet at SQLite's lock."
+  [^Pool pool f]
+  (let [^ReentrantLock lock (.-write-lock pool)]
+    (.lock lock)
+    (try (f) (finally (.unlock lock)))))
 
 (defn- check-open [^Pool pool]
   (when (.get ^AtomicBoolean (.-closed pool))

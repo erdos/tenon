@@ -152,20 +152,24 @@
 
 (def ^:private opts {:builder-fn rs/as-unqualified-lower-maps})
 
+(defn- write!
+  "Runs a write statement, returning its first row (RETURNING) if any."
+  [ds sql-params]
+  (pool/write! ds #(jdbc/execute-one! ds sql-params opts)))
+
 (defn- finish!
   "Appends a state-ended event for invocation-id - if it is still the
    current state of its workflow (so STARTED, and neither finished,
    timed out nor restarted) and, when expired-only?, its lease is over."
   [ds invocation-id state result-edn-str expired-only?]
-  (some? (jdbc/execute-one! ds [(str "INSERT INTO event (workflow_id, state, at, data, invocation_id, prev_id)
+  (some? (write! ds [(str "INSERT INTO event (workflow_id, state, at, data, invocation_id, prev_id)
                                       SELECT w.id, ?, " now-ms ", ?, w.invocation_id, w.last_id
                                         FROM event i
                                         JOIN workflow w ON w.id = i.workflow_id
                                        WHERE i.id = ? AND w.state_id = i.id"
                                      (when expired-only? (str " AND i.expires_at <= " now-ms))
                                      " RETURNING id")
-                                state result-edn-str invocation-id]
-                            opts)))
+                     state result-edn-str invocation-id])))
 
 (def ^:private call-columns
   (str "c.id AS call_id, c.at AS created_at, c.parent_invocation_id, c.state = 'REUSED' AS reused, "
@@ -237,14 +241,13 @@
     this)
 
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (:id (jdbc/execute-one! this [(str "INSERT INTO new_workflow (key, id, wf_def, params, parent_invocation_id,
+    (:id (write! this [(str "INSERT INTO new_workflow (key, id, wf_def, params, parent_invocation_id,
                                                                   metadata, at, expires_at)
                                         SELECT ?, coalesce(max(id), 0) + 1, ?, ?, ?, ?, " now-ms ", " now-ms " + ?
                                           FROM event
                                         RETURNING id")
                                    (idempotence-key wf-def params-edn-str) wf-def params-edn-str
-                                   parent-invocation-id metadata-edn-str timeout-ms]
-                            opts)))
+                       parent-invocation-id metadata-edn-str timeout-ms])))
 
   (finish! [this invocation-id state result-edn-str]
     (finish! this invocation-id state result-edn-str false))
@@ -253,17 +256,16 @@
     (finish! this invocation-id "ERROR" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
-    (:id (jdbc/execute-one! this [(str "INSERT INTO event (workflow_id, state, at, data, expires_at, prev_id)
+    (:id (write! this [(str "INSERT INTO event (workflow_id, state, at, data, expires_at, prev_id)
                                         SELECT w.id, 'STARTED', " now-ms ", ?, " now-ms " + ?, w.last_id
                                           FROM event i
                                           JOIN workflow w ON w.id = i.workflow_id
                                          WHERE i.id = ? AND w.invocation_id = i.id AND w.state_id <> i.id
                                         RETURNING id")
-                                   metadata-edn-str timeout-ms invocation-id]
-                            opts)))
+                       metadata-edn-str timeout-ms invocation-id])))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
-    (jdbc/execute-one! this [(str "INSERT INTO event (workflow_id, state, at, data, invocation_id,
+    (write! this [(str "INSERT INTO event (workflow_id, state, at, data, invocation_id,
                                                       parent_invocation_id, wf_def_id, prev_id, prev_call_id)
                                    SELECT w.id, 'REUSED', " now-ms ", ?, i.id, ?, f.wf_def_id, w.last_id,
                                           (SELECT pw.last_call_id FROM event p JOIN workflow pw ON pw.id = p.workflow_id
