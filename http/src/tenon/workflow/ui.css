@@ -117,11 +117,27 @@ ul.tree ul>li::before{top:-4px;width:1em;height:calc(.95em + 4px);border-bottom:
 ul.tree ul>li:not(:last-child)::after{top:calc(.95em + 1px);bottom:-4px}
 ul.tree summary,ul.tree li.tree-event,ul.tree li.tree-leaf{padding:4px 8px;border-radius:4px;display:flex;
                                                           align-items:center;gap:.5em;background:var(--row-bg)}
-ul.tree li.tree-event{padding:2px 8px;min-height:1.6em}
+/* padding-left: the 1em + gap of the marker the foldable rows have */
+ul.tree li.tree-event{padding:2px 8px 2px calc(8px + 1.5em);min-height:1.6em}
+.event-error-body{margin:0;padding:8px 12px;background:#fff;border:1px solid #ddd;border-top:0;border-radius:0 0 4px 4px;overflow:auto}
+ul.tree li.tree-error details[open]>summary{border-bottom-left-radius:0;border-bottom-right-radius:0}
+.event-error-body pre{max-height:30em;overflow:auto;font-size:.85em}
+ol.error-via{margin:4px 0 8px;padding-left:1.4em}
+ol.stack-trace{list-style:none;margin:4px 0 0;padding:0;max-height:30em;overflow:auto;font:.85em monospace;
+               border:1px solid #eee;border-radius:4px}
+ol.stack-trace li{display:flex;justify-content:space-between;gap:1.5em;padding:2px 8px}
+ol.stack-trace li:nth-child(even){background:#fafafa}
+ol.stack-trace .frame-fn{font-weight:600;overflow-wrap:anywhere}
+ol.stack-trace .frame-ns,ol.stack-trace .frame-loc{font-weight:400;color:#777}
+ol.stack-trace .frame-loc{white-space:nowrap}
+ol.stack-trace li.frame-lib{opacity:.55}
+.error-at{color:#555;font-size:.85em}
 ul.tree summary{cursor:pointer;list-style:none}
 ul.tree summary::-webkit-details-marker{display:none}
 ul.tree summary::before{content:'\25B8';display:inline-block;width:1em;text-align:center;transition:transform .15s}
 ul.tree details[open]>summary::before{transform:rotate(90deg)}
+ul.tree li.tree-error>details>summary::before{content:'+';font-weight:700;transition:none}
+ul.tree li.tree-error>details[open]>summary::before{content:'\2212';transform:none}
 ul.tree details:not([open])>summary{box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}
 ul.tree .tree-bullet{width:1em;text-align:center;color:#888}
 ul.tree .tree-cols{margin-left:auto;display:flex;align-items:center;gap:.8em;flex:none}
@@ -133,3 +149,4 @@ ul.tree .tree-count{width:3em;text-align:right;color:#333;font-size:.85em}
 ul.tree .tree-state{width:5.5em;text-align:right}
 ul.tree .tree-reuse{color:#555;font-size:.85em}
 ul.tree [title]{cursor:help}
+.err-class .err-name{font-weight:700}

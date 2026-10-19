@@ -1,7 +1,8 @@
 (ns tenon.workflow.http.details-page
   "The page of a single workflow (/workflows/{id}): its summary, params,
    result and metadata, and the timeline of it and its sub-workflows."
-  (:require [tenon.workflow :as engine]
+  (:require [clojure.string :as str]
+            [tenon.workflow :as engine]
             [tenon.workflow.ui :as ui]))
 
 (defn- params-html [params-str]
@@ -92,6 +93,19 @@
         {:keys [type message]} (first (:via error))]
     (str (or (:class error) type) ": " (or (:message error) (:cause error) message))))
 
+(defn- error-class-html
+  "The exception class of an ERROR event, its package muted so the class
+   name stands out - nil if the saved error has none."
+  [ev]
+  (let [error (ui/read-edn (:data ev))
+        cls (when (map? error) (or (:class error) (:type (first (:via error)))))]
+    (when cls
+      (let [cls (str cls)
+            i (str/last-index-of cls ".")]
+        (if i
+          [:code.err-class [:span.wf-ns (subs cls 0 (inc i))] [:span.err-name (subs cls (inc i))]]
+          [:code.err-class [:span.err-name cls]])))))
+
 (defn- problem?
   "Whether node k's subtree has a workflow that failed or is still running."
   [nodes children k]
@@ -123,23 +137,57 @@
                           "ERROR" "Failed"
                           (str (:state ev))))]))
 
+(defn- error-body
+  "The full error of an ERROR event as saved (a Throwable->map): class,
+   message, ex-data, the chain of causes (via) and the stack trace. Not a
+   map - shown as the raw EDN."
+  [data-str]
+  (let [error (ui/read-edn data-str)]
+    (if-not (map? error)
+      (ui/edn-block data-str)
+      (let [{:keys [via trace phase data]} error
+            {:keys [type message]} (first via)
+            ex-data (or data (:data (last via)))]
+        [:div.event-error-body
+         (ui/error-details (or (:class error) type)
+                           (or (:message error) (:cause error) message)
+                           (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])
+                           (when phase [:div (ui/muted "phase") [:code (pr-str phase)]])
+                           (when (next via)
+                             [:div (ui/muted "caused by")
+                              [:ol.error-via
+                               (for [{:keys [type message at]} via]
+                                 [:li [:code (str type)] (when message (str ": " message))
+                                  (when at [:div.error-at (ui/frame-str at)])])]])
+                           (when (seq trace)
+                             [:div (ui/muted "stack trace")
+                              (ui/stack-trace trace)]))]))))
+
 (defn- timeline-tree-event
   "An event of a node's run. A REUSED one (the workflow's own reuses -
    ones within the tree are leaves of their own) names the invocation
    whose result was reused and the caller that reused it - nothing for a
    top-level call, which had no caller. A STARTED one other than the
-   node's first event (its run always opens with one) is a restart."
+   node's first event (its run always opens with one) is a restart. An
+   ERROR one folds (closed) to its full error."
   [start ev root? restart?]
-  [:li {:class (str "tree-event state-" (:state ev))}
-   (tree-offset start ev (when restart? "Restarted"))
-   (when-let [caller (and (reused? ev) root? (:parent_invocation_id ev))]
-     [:span.tree-reuse
-      "from " (ui/workflow-link (:invocation_id ev))
-      " for " (ui/workflow-link caller)])
-   (tree-columns
-    nil
-    nil
-    (ui/state-with-tooltip (:state ev) (when (= "ERROR" (:state ev)) (error-title ev))))])
+  (let [row (list
+             (tree-offset start ev (when restart? "Restarted"))
+             (when (= "ERROR" (:state ev)) (error-class-html ev))
+             (when-let [caller (and (reused? ev) root? (:parent_invocation_id ev))]
+               [:span.tree-reuse
+                "from " (ui/workflow-link (:invocation_id ev))
+                " for " (ui/workflow-link caller)])
+             (tree-columns
+              nil
+              nil
+              (ui/state-with-tooltip (:state ev) (when (= "ERROR" (:state ev)) (error-title ev)))))]
+    (if (and (= "ERROR" (:state ev)) (:data ev))
+      [:li.tree-error
+       [:details
+        (into [:summary {:class (str "state-" (:state ev))}] row)
+        (error-body (:data ev))]]
+      (into [:li {:class (str "tree-event state-" (:state ev))}] row))))
 
 (defn- timeline-tree-reuse
   "A reuse within the tree: its single REUSED row, as a leaf - there is

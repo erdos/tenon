@@ -274,10 +274,10 @@
     (is (= 4 (count (test-util/timeline id))))
     (-> (visit (href id))
         (has (attrs? [:ul.tree :li.tree-event] :class
-                     ["tree-event state-STARTED" "tree-event state-ERROR"
-                      "tree-event state-STARTED" "tree-event state-DONE"])
-             "one timeline entry per event, in order")
-        (has (attr? [:ul.tree :li.tree-event.state-ERROR :span.tree-state-chip] :title
+                     ["tree-event state-STARTED" "tree-event state-STARTED" "tree-event state-DONE"])
+             "the other events, in order")
+        (has (texts? [:ul.tree :li.tree-error :.tree-verb] ["Failed"]))
+        (has (attr? [:ul.tree :li.tree-error :span.tree-state-chip] :title
                     "clojure.lang.ExceptionInfo: first failure"))
         (has (texts? (conj (panel "Result") :pre) [":recovered"])))))
 
@@ -416,7 +416,8 @@
     (-> (visit (href parent))
         (within [:ul.tree]
           (has (texts? [:summary :b] ["tree-p" "tree-failing" "tree-ok" "tree-sibling"]))
-          (has (attrs? [:summary] :class ["state-STARTED" "state-ERROR" "state-DONE" "state-DONE"]))
+          (has (attrs? [:summary] :class ["state-STARTED" "state-ERROR" "state-DONE" "state-ERROR" "state-DONE"]))
+          (has (texts? [:li.tree-error :.error-message] ["kaboom"]))
           (has (texts? [[:details (enlive/attr? :open)] :> :summary :b] ["tree-p" "tree-failing"]))
           (has (texts? [[:details (enlive/but (enlive/attr? :open))] :> :summary :b] ["tree-ok" "tree-sibling"]))
           (has (attr? [(tree-node "tree-failing") :span.tree-state-chip] :title "clojure.lang.ExceptionInfo: kaboom")
@@ -561,7 +562,7 @@
         (jdbc/execute! (test-util/ds) ["UPDATE event SET at = ? WHERE id = ?" at hid])))
     (-> (visit (href id))
         (has (texts? [:span.wf-summary-duration] ["1.50s"]))
-        (has (texts? [:ul.tree :summary :span.tree-time] ["1m 01s"])))))
+        (has (texts? [:ul.tree :summary :span.tree-time] ["1m 01s" ""])))))
 
 (deftest workflow-detail-page-tab-title-test
   (let [id (test-util/insert! "test.ns/tab")]

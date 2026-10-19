@@ -1,6 +1,7 @@
 (ns tenon.workflow.ui
   "HTML UI components"
   (:require [clojure.edn :as edn]
+            [clojure.main :as main]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
@@ -217,6 +218,30 @@
          [:div.error-class [:code (str class)]]
          [:p.error-message message]]
         extra))
+
+(defn frame-str
+  "A stack frame of a Throwable->map, [class method file line], as a line."
+  [[cls method file line]]
+  (str cls "." method "(" file (when line (str ":" line)) ")"))
+
+(defn- stack-frame
+  "A stack frame of a Throwable->map as a row: the called function (a
+   Clojure one demunged, its namespace dimmed) and its file:line. Frames of
+   the JVM and Clojure itself are dimmed as a whole."
+  [[cls method file line]]
+  (let [cls (str cls)
+        clj? (str/includes? cls "$")
+        fn-name (if clj? (main/demunge cls) (str cls "." method))
+        [_ prefix base] (re-matches #"(.*[/.])([^/.]*)" fn-name)
+        lib? (re-find #"^(java|javax|jdk|sun|clojure|nrepl)\." cls)]
+    [:li {:class (when lib? "frame-lib")}
+     [:span.frame-fn (when prefix [:span.frame-ns prefix]) (or base fn-name)]
+     [:span.frame-loc file (when (and line (pos? line)) (str ":" line))]]))
+
+(defn stack-trace
+  "The stack trace of a Throwable->map (a seq of frames) as a list."
+  [trace]
+  [:ol.stack-trace (map stack-frame trace)])
 
 (defn fact
   "A labelled value in a summary-card's grid."
