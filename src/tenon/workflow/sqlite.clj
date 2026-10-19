@@ -155,7 +155,7 @@
 (defn- write!
   "Runs a write statement, returning its first row (RETURNING) if any."
   [ds sql-params]
-  (pool/write! ds #(jdbc/execute-one! ds sql-params opts)))
+  (pool/write! ds #(jdbc/execute-one! % sql-params opts)))
 
 (defn- finish!
   "Appends a state-ended event for invocation-id - if it is still the
