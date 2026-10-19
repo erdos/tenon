@@ -121,10 +121,10 @@
            s.state, s.at AS state_changed_at, s.expires_at, i.data AS metadata,
            iif(s.state = 'STARTED', NULL, s.data) AS result
       FROM workflow w
-      JOIN event f ON f.id = w.id
-      JOIN wf_def d ON d.id = f.wf_def_id
-      JOIN event i ON i.id = w.invocation_id
-      JOIN event s ON s.id = w.state_id"
+      CROSS JOIN event s ON s.id = w.state_id  -- first, so filters on the state skip the rest
+      CROSS JOIN event i ON i.id = w.invocation_id
+      CROSS JOIN event f ON f.id = w.id
+      CROSS JOIN wf_def d ON d.id = f.wf_def_id"
    ;; insert-workflow!: the only write that touches more than the log -
    ;; an INSERT into this view checks and claims the idempotence key and
    ;; logs the first event (whose id the INSERT computes, RETURNING it).
