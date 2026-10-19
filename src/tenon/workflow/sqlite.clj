@@ -4,10 +4,10 @@
             [next.jdbc :as jdbc]
             [next.jdbc.connection :as connection]
             [next.jdbc.result-set :as rs]
-            [tenon.workflow.db :as db])
-  (:import [com.zaxxer.hikari HikariDataSource]
-           [java.security MessageDigest]
-           [javax.sql DataSource]))
+            [tenon.workflow.db :as db]
+            [tenon.workflow.sqlite.pool :as pool])
+  (:import [java.security MessageDigest]
+           [tenon.workflow.sqlite.pool Pool]))
 
 (def ^:private now-ms
   "SQL expression for the current UTC time in epoch milliseconds. SQLite
@@ -113,7 +113,7 @@
 (def ^:private opts {:builder-fn rs/as-unqualified-lower-maps})
 
 (extend-protocol db/Storage
-  DataSource
+  Pool
   (init-db! [this]
     (jdbc/with-transaction [tx this]
       (doseq [ddl schema]
@@ -279,15 +279,15 @@
       opts)))
 
 (defn datasource
-  "A pooled (HikariCP) javax.sql.DataSource for the SQLite file at db-path
-   (creating it if needed) - just the connections, no schema. Pass it to
-   tenon.workflow.db/init-db! to also ensure the schema exists (a plain
-   Storage method now - dispatches on this being a DataSource, same as
-   every other Storage method). Every connection enforces foreign keys and
-   waits up to 5s for a concurrent writer's lock, and the file is in WAL
-   mode so readers don't block writers. The pool is Closeable: close it
-   (e.g. with-open or .close) once it's no longer needed."
-  ^HikariDataSource [db-path]
-  (connection/->pool HikariDataSource
-                     {:jdbcUrl (str "jdbc:sqlite:" db-path
-                                    "?foreign_keys=true&journal_mode=WAL&busy_timeout=5000")}))
+  "A connection pool (tenon.workflow.sqlite.pool) for the SQLite file at
+   db-path (creating it if needed) - just the connections, no schema. Pass
+   it to tenon.workflow.db/init-db! to also ensure the schema exists (a
+   plain Storage method now - dispatches on this being a pool, same as
+   every other Storage method). Every connection enforces foreign keys,
+   waits up to 5s for a concurrent writer's lock and keeps its prepared
+   statements, and the file is in WAL mode so readers don't block writers.
+   The pool is Closeable: close it (e.g. with-open or .close) once it's no
+   longer needed."
+  ^java.io.Closeable [db-path]
+  (pool/open (str "jdbc:sqlite:" db-path "?foreign_keys=true&journal_mode=WAL&busy_timeout=5000")
+             10))
