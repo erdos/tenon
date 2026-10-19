@@ -99,19 +99,14 @@
 
 (deftest lease-only-update-is-not-logged-test
   (let [id (test-util/insert! "test.ns/renew" :timeout-ms 1000)]
-    (jdbc/execute! (test-util/ds) ["UPDATE workflow SET expires_at = expires_at + 1000 WHERE invocation_id = ?" id])
+    (jdbc/execute! (test-util/ds) ["UPDATE event SET expires_at = expires_at + 1000 WHERE id = ?" id])
     (is (match? [{:state "STARTED"}] (test-util/history (test-util/ds) id)))))
 
 (deftest expires-at-must-be-cleared-outside-started-test
   (let [id (test-util/insert! "test.ns/check")]
+    (test-util/finish! id "DONE" "1")
     (is (thrown? Exception
-          (jdbc/execute! (test-util/ds) ["UPDATE workflow SET state = 'DONE', expires_at = 1 WHERE invocation_id = ?" id])))))
-
-(deftest history-requires-existing-workflow-test
-  (is (thrown? Exception
-        (jdbc/execute! (test-util/ds) ["INSERT INTO workflow_history (idempotence_key, wf_invocation_id, state, state_changed_at)
-                                        VALUES (x'00', 1, 'DONE', 0)"]))
-      "foreign keys are enforced"))
+          (jdbc/execute! (test-util/ds) ["UPDATE event SET expires_at = 1 WHERE state = 'DONE'"])))))
 
 (deftest top-level-workflows-seek-pagination-test
   ;; 10 rows, paged 4 at a time via :limit/:before - every page after the
@@ -269,3 +264,102 @@
     (test-util/finish! child "DONE" "1")
     (test-util/record-reuse! child nil)
     (is (= ["test.ns/defs-child" "test.ns/defs-parent"] (db/top-level-wf-defs (test-util/ds) true)))))
+
+(deftest concurrent-inserts-of-one-workflow-insert-once-test
+  (let [results (->> (range 8)
+                     (mapv (fn [_] (future (db/insert-workflow! (test-util/ds) "test.ns/race" "[1]" nil nil nil))))
+                     (mapv deref))]
+    (is (= 1 (count (remove nil? results))) "exactly one inserter wins")
+    (is (= 7 (count (filter nil? results))))))
+
+(deftest concurrent-restarts-of-one-workflow-restart-once-test
+  (let [id (test-util/insert! "test.ns/restart-race")
+        _ (db/finish! (test-util/ds) id "DONE" "1")
+        results (->> (range 8)
+                     (mapv (fn [_] (future (db/restart! (test-util/ds) id nil nil))))
+                     (mapv deref))]
+    (is (= 1 (count (remove nil? results))) "exactly one restarter wins")
+    (is (match? {:invocation_id (first (remove nil? results)) :state "STARTED"}
+                (db/get-workflow (test-util/ds) id)))
+    (is (match? [{:state "STARTED"} {:state "DONE"} {:state "STARTED"}] (test-util/history (test-util/ds) id)))))
+
+(defn- populate!
+  "A varied set of workflows: three wf_defs, nested and top-level, DONE,
+   ERROR and STARTED, some restarted, many reused from the top level and
+   from within other workflows. Returns nothing."
+  []
+  (let [ds (test-util/ds)
+        defs ["test.ns/a" "test.ns/b" "test.ns/c"]
+        ids (reduce (fn [ids i]
+                      (let [parent (when (and (pos? i) (zero? (mod i 3))) (nth ids (quot i 2)))
+                            id (db/insert-workflow! ds (nth defs (mod i 3)) (pr-str [i]) parent nil nil)]
+                        (conj ids id)))
+                    [] (range 45))]
+    (doseq [[i id] (map-indexed vector ids)]
+      (case (mod i 5)
+        0 nil
+        1 (db/finish! ds id "ERROR" "{}")
+        (db/finish! ds id "DONE" "1")))
+    (doseq [[i id] (map-indexed vector ids)]
+      (when (zero? (mod i 4)) (db/restart! ds id nil nil)))
+    (doseq [[i id] (map-indexed vector ids)]
+      (dotimes [k (mod i 3)]
+        (db/record-reuse! ds id (when (odd? (+ i k)) (nth ids (mod (* 7 i) 45))) nil)))
+    (doseq [[i id] (map-indexed vector ids)]
+      (when (and (zero? (mod i 8)) (zero? (mod i 4)))
+        (let [wf (db/get-workflow ds id)]
+          (when (= "STARTED" (:state wf)) (db/finish! ds (:invocation_id wf) "ERROR" "{}")
+                (db/restart! ds (:invocation_id wf) nil nil)))))))
+
+(deftest top-level-workflows-filters-agree-with-unfiltered-listing-test
+  ;; Every filter combination - whichever index it is answered from - must
+  ;; equal filtering the unfiltered listing, which is the plain history walk.
+  (populate!)
+  (let [ds (test-util/ds)
+        all (db/top-level-workflows ds {:top-level-only? false})
+        matches? (fn [{:keys [state wf-def top-level-only? before]} row]
+                   (and (or (not top-level-only?) (nil? (:parent_invocation_id row)))
+                        (or (nil? state) (= state (:state row)))
+                        (or (nil? wf-def) (= wf-def (:wf_def row)))
+                        (or (nil? before) (< (:call_id row) before))))
+        mid (:call_id (nth all (quot (count all) 2)))]
+    (is (> (count all) 60))
+    (is (= (sort > (map :call_id all)) (map :call_id all)) "newest first")
+    (doseq [state [nil "STARTED" "DONE" "ERROR"]
+            wf-def [nil "test.ns/a" "test.ns/b" "test.ns/c"]
+            top-level-only? [true false]
+            before [nil mid]
+            limit [nil 4]]
+      (let [filters {:state state :wf-def wf-def :top-level-only? top-level-only? :before before :limit limit}
+            expected (cond->> (filter #(matches? filters %) all)
+                       limit (take (inc limit)))
+            actual (db/top-level-workflows ds (into {} (remove (comp nil? val)) filters))]
+        (is (= expected actual) (pr-str filters))))))
+
+(deftest top-level-wf-defs-agree-with-calls-test
+  (populate!)
+  (let [ds (test-util/ds)
+        all (db/top-level-workflows ds {:top-level-only? false})]
+    (is (= (vec (sort (distinct (map :wf_def all)))) (db/top-level-wf-defs ds false)))
+    (is (= (vec (sort (distinct (map :wf_def (filter (comp nil? :parent_invocation_id) all)))))
+           (db/top-level-wf-defs ds true)))))
+
+(deftest full-timeline-covers-the-history-of-the-tree-test
+  (populate!)
+  (let [ds (test-util/ds)
+        roots (->> (db/top-level-workflows ds {:top-level-only? false})
+                   (remove :reused)
+                   (map :invocation_id))
+        shape (juxt :invocation_id :state :state_changed_at :data)]
+    (is (> (count roots) 40))
+    (doseq [root roots]
+      (let [rows (db/full-timeline ds root)
+            own (filter #(= 0 (:depth %)) rows)]
+        (is (= (map :state_changed_at rows) (sort (map :state_changed_at rows))) "chronological")
+        (is (= (map shape (remove #(= "REUSED" (:state %)) (test-util/history ds root)))
+               (map shape (remove #(= "REUSED" (:state %)) own)))
+            "the workflow's own states, in order")
+        (is (= (count (filter #(= "REUSED" (:state %)) (test-util/history ds root)))
+               (count (filter #(= "REUSED" (:state %)) own)))
+            "its own reuses are part of it")))))
+
