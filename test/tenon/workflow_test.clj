@@ -358,7 +358,7 @@
   ;; nil :tenon/timeout-ms opts out - even a long-STARTED invocation is
   ;; waited out until it finishes.
   (let [id (test-util/insert! "tenon.workflow-test/dedup-started-fn" :params (pr-str [6]) :timeout-ms nil)]
-    (jdbc/execute! (test-util/ds) ["UPDATE workflow SET state_changed_at = 0 WHERE invocation_id = ?" id])
+    (jdbc/execute! (test-util/ds) ["UPDATE event SET at = 0 WHERE id = ?" id])
     (future
       (Thread/sleep 300)
       (test-util/finish! id "DONE" (pr-str :late-result)))

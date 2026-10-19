@@ -6,7 +6,9 @@
   (:import [java.io Closeable]
            [java.sql Connection DriverManager PreparedStatement ResultSet]
            [java.util HashMap Map]
-           [java.util.concurrent LinkedBlockingQueue Semaphore]
+           [java.util.concurrent CompletableFuture ConcurrentLinkedQueue ExecutionException
+            LinkedBlockingQueue Semaphore]
+           [java.util.concurrent.locks ReentrantLock]
            [java.util.concurrent.atomic AtomicBoolean]))
 
 (defn- close-quietly [^java.lang.AutoCloseable c]
@@ -62,7 +64,8 @@
          ~sym (borrow pool#)]
      (try ~@body (finally (give-back pool# ~sym)))))
 
-(deftype Pool [^String url ^LinkedBlockingQueue idle ^Semaphore permits ^AtomicBoolean closed]
+(deftype Pool [^String url ^LinkedBlockingQueue idle ^Semaphore permits ^AtomicBoolean closed
+               ^ReentrantLock write-lock ^ConcurrentLinkedQueue writes]
   p/Executable
   (-execute [_ _ _]
     (throw (UnsupportedOperationException. "plan needs a connection: borrow one with with-connection")))
@@ -82,7 +85,64 @@
         (recur)))))
 
 (defn open ^Pool [url size]
-  (Pool. url (LinkedBlockingQueue.) (Semaphore. size) (AtomicBoolean. false)))
+  (Pool. url (LinkedBlockingQueue.) (Semaphore. size) (AtomicBoolean. false) (ReentrantLock.)
+         (ConcurrentLinkedQueue.)))
+
+(defn- run-each
+  "Runs each write of batch on c in a transaction of its own."
+  [c batch]
+  (doseq [[f ^CompletableFuture result] batch]
+    (try (.complete result (f c))
+         (catch Throwable e (.completeExceptionally result e)))))
+
+(defn- run-together
+  "Runs the writes of batch on c in one transaction - one commit, so one
+   fsync, for all of them. A write that throws rolls them all back, and
+   they are retried one by one so each fails or succeeds on its own."
+  [c batch]
+  (let [results (try
+                  (p/-execute-one c ["BEGIN IMMEDIATE"] {})
+                  (mapv (fn [[f]] (f c)) batch)
+                  (catch Throwable _
+                    (try (p/-execute-one c ["ROLLBACK"] {}) (catch Throwable _))
+                    nil))]
+    (if results
+      (let [committed (try (p/-execute-one c ["COMMIT"] {}) nil
+                           (catch Throwable e
+                             (try (p/-execute-one c ["ROLLBACK"] {}) (catch Throwable _))
+                             e))]
+        (doseq [[[_ ^CompletableFuture result] v] (map vector batch results)]
+          (if committed
+            (.completeExceptionally result committed)
+            (.complete result v))))
+      (run-each c batch))))
+
+(defn write!
+  "Calls (f conn) with a connection of the pool, as part of a group commit:
+   SQLite runs one writer at a time, and each commit waits for an fsync. So
+   writes queue up here, and whoever holds the write lock runs every write
+   queued so far in a single transaction - the ones that arrived while the
+   previous batch was committing - and hands each its result once they are
+   durable. A write must be a single statement (atomic on its own), and
+   sees the effects of the writes before it in its batch. Writers of other
+   processes still meet at SQLite's own lock."
+  [^Pool pool f]
+  (let [result (CompletableFuture.)
+        ^ReentrantLock lock (.-write-lock pool)
+        ^ConcurrentLinkedQueue writes (.-writes pool)]
+    (.add writes [f result])
+    (.lock lock)
+    (try
+      (when-not (.isDone result)
+        (let [batch (loop [batch []]
+                      (if-let [w (.poll writes)] (recur (conj batch w)) batch))]
+          (with-borrowed [c pool]
+            (if (next batch)
+              (run-together c batch)
+              (run-each c batch)))))
+      (finally (.unlock lock)))
+    (try (.get result)
+         (catch ExecutionException e (throw (.getCause e))))))
 
 (defn- check-open [^Pool pool]
   (when (.get ^AtomicBoolean (.-closed pool))

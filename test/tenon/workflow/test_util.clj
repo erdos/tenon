@@ -18,16 +18,19 @@
 
 (defn history
   "Every state - the current one included - of the workflow invocation-id
-   belongs to, oldest first, straight from workflow_history. Test-only -
-   the library reads it only as part of db/full-timeline."
+   belongs to, oldest first, straight from the event table (by a plain scan,
+   not the per-workflow event list the library walks). Test-only - the
+   library reads it only as part of db/full-timeline."
   [ds invocation-id]
-  (jdbc/execute! ds ["SELECT h.id, h.wf_invocation_id AS invocation_id,
-                           h.state, h.state_changed_at, h.data, h.parent_invocation_id
-                      FROM workflow_history h
-                      JOIN workflow w ON w.idempotence_key = h.idempotence_key
-                     WHERE w.invocation_id = ?
-                     ORDER BY h.id"
-                     (:invocation_id (db/get-workflow ds invocation-id))]
+  (jdbc/execute! ds ["SELECT e.id, coalesce(e.invocation_id, e.id) AS invocation_id,
+                             e.state, e.at AS state_changed_at, e.data,
+                             iif(e.state = 'REUSED', e.parent_invocation_id, f.parent_invocation_id)
+                               AS parent_invocation_id
+                        FROM event e NOT INDEXED
+                        JOIN event f ON f.id = e.workflow_id
+                       WHERE e.workflow_id = (SELECT workflow_id FROM event WHERE id = ?)
+                       ORDER BY e.id"
+                     invocation-id]
                  {:builder-fn rs/as-unqualified-lower-maps}))
 
 (defn timeline
@@ -78,8 +81,7 @@
   "Moves the lease end of STARTED invocation-id into the past, so it looks
    like it started long ago and timed out."
   [ds invocation-id]
-  (jdbc/execute! ds ["UPDATE workflow SET state_changed_at = 0, expires_at = 1
-                       WHERE invocation_id = ? AND state = 'STARTED'"
+  (jdbc/execute! ds ["UPDATE event SET at = 0, expires_at = 1 WHERE id = ? AND state = 'STARTED'"
                      invocation-id]))
 
 (defn temp-db-fixture [f]
