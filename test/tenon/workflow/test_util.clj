@@ -73,9 +73,10 @@
 
 (defn record-reuse!
   "Logs that a caller under parent-invocation-id reused invocation-id's
-   result."
-  [invocation-id parent-invocation-id]
-  (db/record-reuse! (ds) invocation-id parent-invocation-id nil))
+   result, with metadata (an edn string, nil by default)."
+  ([invocation-id parent-invocation-id] (record-reuse! invocation-id parent-invocation-id nil))
+  ([invocation-id parent-invocation-id metadata]
+   (db/record-reuse! (ds) invocation-id parent-invocation-id metadata)))
 
 (defn expire!
   "Moves the lease end of STARTED invocation-id into the past, so it looks

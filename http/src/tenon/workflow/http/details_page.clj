@@ -15,13 +15,18 @@
                       (ui/key-values (for [[i arg] (map-indexed vector params)]
                                        [[:code (str "%" (inc i))] (ui/folded-pre (ui/pretty arg))]))))))
 
-(defn- metadata-html [metadata-str]
+(defn- metadata-body
+  "Metadata EDN as key-value rows, one per key - or the raw EDN block if it
+   isn't a non-empty map."
+  [metadata-str]
   (let [metadata (ui/read-edn metadata-str)]
-    (ui/panel {:title "Metadata"}
-              (if (and (map? metadata) (seq metadata))
-                (ui/key-values (for [[k v] (sort-by (comp str key) metadata)]
-                                 [[:code (pr-str k)] (ui/folded-pre (ui/pretty v))]))
-                (ui/edn-block metadata-str)))))
+    (if (and (map? metadata) (seq metadata))
+      (ui/key-values (for [[k v] (sort-by (comp str key) metadata)]
+                       [[:code (pr-str k)] (ui/folded-pre (ui/pretty v))]))
+      (ui/edn-block metadata-str))))
+
+(defn- metadata-html [metadata-str]
+  (ui/panel {:title "Metadata"} (metadata-body metadata-str)))
 
 (defn- result-html [wf]
   (case (:state wf)
@@ -169,7 +174,8 @@
    whose result was reused and the caller that reused it - nothing for a
    top-level call, which had no caller. A STARTED one other than the
    node's first event (its run always opens with one) is a restart. An
-   ERROR one folds (closed) to its full error."
+   ERROR one folds (closed) to its full error, a STARTED or REUSED one
+   to the invocation's metadata."
   [start ev root? restart?]
   (let [row (list
              (tree-offset start ev (when restart? "Restarted"))
@@ -182,29 +188,44 @@
               nil
               nil
               (ui/state-with-tooltip (:state ev) (when (= "ERROR" (:state ev)) (error-title ev)))))]
-    (if (and (= "ERROR" (:state ev)) (:data ev))
+    (cond
+      (and (= "ERROR" (:state ev)) (:data ev))
       [:li.tree-error
        [:details
         (into [:summary {:class (str "state-" (:state ev))}] row)
         (error-body (:data ev))]]
+
+      (and (#{"STARTED" "REUSED"} (:state ev)) (:data ev))
+      [:li.tree-error.tree-meta
+       [:details
+        (into [:summary {:class (str "state-" (:state ev))}] row)
+        [:div.event-error-body (ui/muted "Metadata") (metadata-body (:data ev))]]]
+
+      :else
       (into [:li {:class (str "tree-event state-" (:state ev))}] row))))
 
 (defn- timeline-tree-reuse
-  "A reuse within the tree: its single REUSED row, as a leaf - there is
-   nothing in it to fold. It names the producing invocation only when that
-   isn't the reused workflow's current one (it was restarted since)."
-  [start {:keys [current_invocation_id invocation_id wf_def] :as ev}]
-  [:li.tree-leaf.state-REUSED
-   [:span.tree-bullet "\u2022"]
-   (tree-offset start ev "Invoked")
-   (ui/workflow-name wf_def)
-   (ui/workflow-link current_invocation_id)
-   (when (not= invocation_id current_invocation_id)
-     [:span.tree-reuse "from " (ui/workflow-link invocation_id)])
-   (tree-columns
-    nil
-    nil
-    (ui/state-with-tooltip "REUSED" nil))])
+  "A reuse within the tree: its single REUSED row, as a leaf. It names the
+   producing invocation only when that isn't the reused workflow's current
+   one (it was restarted since). With metadata it folds (closed) to it,
+   otherwise there is nothing in it to fold."
+  [start {:keys [current_invocation_id invocation_id wf_def data] :as ev}]
+  (let [row (list
+             (tree-offset start ev "Invoked")
+             (ui/workflow-name wf_def)
+             (ui/workflow-link current_invocation_id)
+             (when (not= invocation_id current_invocation_id)
+               [:span.tree-reuse "from " (ui/workflow-link invocation_id)])
+             (tree-columns
+              nil
+              nil
+              (ui/state-with-tooltip "REUSED" nil)))]
+    (if data
+      [:li.tree-error.tree-meta.state-REUSED
+       [:details
+        (into [:summary {:class "state-REUSED"}] row)
+        [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]]]
+      (into [:li.tree-leaf.state-REUSED [:span.tree-bullet "\u2022"]] row))))
 
 (defn- timeline-tree-node [nodes children start k]
   (let [events (get-in nodes [k :events])

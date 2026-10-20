@@ -775,3 +775,22 @@
       (has (link? "\u21BB Auto-refresh on" "/?state=STARTED") "the toggle turns it off again, keeping the filters")
       (k/follow "\u21BB Auto-refresh on")
       (has (missing? [[:meta (enlive/attr= :http-equiv "refresh")]]))))
+
+(deftest called-event-opens-to-its-metadata-test
+  (let [id (test-util/insert! "test.ns/tree-meta" :metadata (pr-str {:user "bob" :n 1}))]
+    (test-util/finish! id "DONE" (pr-str :ok))
+    (-> (visit (href id))
+        (within [:ul.tree :li.tree-meta]
+          (has (texts? [:summary :span.tree-verb] ["Called"]))
+          (has (texts? [:details :> :div.event-error-body :pre] ["1" "\"bob\""])
+               "closed by default, the pretty printed metadata inside")))))
+
+(deftest reused-leaf-opens-to-its-metadata-test
+  (let [child (test-util/insert! "test.ns/tree-produced-meta")
+        parent (test-util/insert! "test.ns/tree-reusing-meta")]
+    (test-util/finish! child "DONE" (pr-str :ok))
+    (test-util/record-reuse! child parent (pr-str {:trace "abc"}))
+    (-> (visit (href parent))
+        (within [:ul.tree :li.state-REUSED.tree-meta]
+          (has (texts? [:summary :span.tree-verb] ["Invoked"]))
+          (has (texts? [:details :> :div.event-error-body :pre] ["\"abc\""]))))))
