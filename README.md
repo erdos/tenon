@@ -23,6 +23,19 @@ Mark `defn` forms with `#workflow` to have their invocations tracked.
 
 Every call to `charge-card` writes a database logs into the database. Marked functions can call other such functions and the whole call chain is tracked.
 
+If you'd rather not use a reader tag, `defworkflow` takes the same arguments as `defn` and tracks calls the same way:
+
+```clojure
+(require '[tenon.workflow :refer [defworkflow]])
+
+(defworkflow charge-card [customer-id idempotency-key amount]
+  (payments/charge! customer-id amount)
+  (email/send-charge-email customer-id amount)
+  {:status :OK})
+```
+
+It is a macro, so it needs no `data_readers.clj` entry - just require `tenon.workflow`.
+
 ## Try it in the REPL
 
 Start the REPL with `./run repl`.

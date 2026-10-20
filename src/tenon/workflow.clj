@@ -347,6 +347,19 @@
          (throw (not-restartable (:state (db/get-workflow ds (:invocation_id wf))))))))))
 
 
+(defn- registration-form
+  "The form #workflow and defworkflow both expand to: declares fname, defines
+   it as a wrapper that runs each call through run-invocation, and registers
+   the raw fn-form under it."
+  [fname fn-form]
+  `(do
+     (declare ~fname)
+     (let [raw-fn# ~fn-form]
+       (def ~fname
+         (fn [& args#]
+           (run-invocation (var ~fname) raw-fn# args#)))
+       (register! (var ~fname) raw-fn#))))
+
 (defn workflow
   "Tag reader for #workflow to be placed in front of (defn) forms.
    Registers the function into the tenon engine."
@@ -354,10 +367,15 @@
   (when-not (and (list? form) (= 'defn (first form)))
     (throw (ex-info "#workflow only supports defn forms" {:form form})))
   (let [[_ fname fn-form] (macroexpand-1 form)]
-    `(do
-       (declare ~fname)
-       (let [raw-fn# ~fn-form]
-         (def ~fname
-           (fn [& args#]
-             (run-invocation (var ~fname) raw-fn# args#)))
-         (register! (var ~fname) raw-fn#)))))
+    (registration-form fname fn-form)))
+
+(defmacro defworkflow
+  "Alternative to the #workflow tag reader: takes the same arguments as defn
+   and registers the function into the tenon engine the same way, but as a
+   macro, so it needs no data_readers entry - just require tenon.workflow.
+
+     (defworkflow charge-card [customer-id idempotency-key amount]
+       ...)"
+  [& form]
+  (let [[_ fname fn-form] (macroexpand-1 (list* `defn form))]
+    (registration-form fname fn-form)))
