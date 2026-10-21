@@ -16,7 +16,9 @@
     (let [events (atom [])]
       (binding [*emitted-events* events
                 engine/*workflow-engine* (assoc engine/*workflow-engine*
-                                                :tenon/on-event #(swap! events conj [%1 %2]))]
+                                                :tenon/on-event #(swap! events conj [%1 %2])
+                                                ;; most tests expect no metadata
+                                                :tenon/metadata-fn (constantly nil))]
         (f)))))
 
 (def ^:private add-fn (fn [a b] (+ a b)))
@@ -55,8 +57,10 @@
                          :result 5}]]
                 @*emitted-events*))))
 
-(deftest run-invocation-stores-bound-workflow-meta-test
-  (binding [engine/*workflow-meta* {:actor-id 42 :trace-id "abc"}]
+(deftest run-invocation-stores-metadata-from-metadata-fn-test
+  (binding [engine/*workflow-engine*
+            (assoc engine/*workflow-engine*
+                   :tenon/metadata-fn (constantly {:actor-id 42 :trace-id "abc"}))]
     (engine/run-invocation #'meta-fn meta-fn [1]))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))]
     (is (= {:actor-id 42 :trace-id "abc"} (edn/read-string (:metadata wf))))
@@ -64,10 +68,46 @@
                  [:done {}]]
                 @*emitted-events*))))
 
-(deftest run-invocation-without-bound-workflow-meta-stores-nil-test
-  (engine/run-invocation #'no-meta-fn no-meta-fn [1])
-  (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/no-meta-fn"))]
-    (is (nil? (:metadata wf)))))
+(deftest metadata-fn-returning-nil-stores-nil-test
+  (binding [engine/*workflow-engine* (assoc engine/*workflow-engine* :tenon/metadata-fn (constantly nil))]
+    (engine/run-invocation #'no-meta-fn no-meta-fn [1]))
+  (is (nil? (:metadata (first (test-util/find-by-wf-def "tenon.workflow-test/no-meta-fn"))))))
+
+(deftest metadata-fn-receives-workflow-type-and-args-test
+  (let [calls (atom [])]
+    (binding [engine/*workflow-engine*
+              (assoc engine/*workflow-engine*
+                     :tenon/metadata-fn (fn [wf-type args] (swap! calls conj [wf-type args]) nil))]
+      (engine/run-invocation #'add-fn add-fn [2 3]))
+    (is (= [['tenon.workflow-test/add-fn [2 3]]] @calls))))
+
+(deftest empty-metadata-fn-test
+  (is (= {} (engine/empty-metadata-fn 'some.ns/wf [1 2]))))
+
+(deftest host-thread-metadata-fn-test
+  (let [meta (engine/host-thread-metadata-fn 'some.ns/wf [1 2])]
+    (is (= (.getName (Thread/currentThread)) (:thread meta)))
+    (is (string? (:host meta)))
+    (is (= meta (engine/host-thread-metadata-fn 'other.ns/wf [])) "independent of workflow and args")))
+
+(deftest init-defaults-to-empty-metadata-fn-test
+  (let [path (str (java.io.File/createTempFile "tenon-meta" ".db"))
+        eng (engine/init path)]
+    (try
+      (is (identical? engine/empty-metadata-fn (:tenon/metadata-fn eng)))
+      (binding [engine/*workflow-engine* eng]
+        (engine/run-invocation eng #'meta-fn meta-fn [7])
+        (is (= "{}" (:metadata (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))))))
+      (finally
+        (.close ^java.io.Closeable (:tenon/db eng))
+        (doseq [suffix ["" "-wal" "-shm"]]
+          (.delete (java.io.File. (str path suffix))))))))
+
+(deftest host-thread-metadata-fn-stores-calling-thread-test
+  (let [eng (assoc engine/*workflow-engine* :tenon/metadata-fn engine/host-thread-metadata-fn)]
+    (.join (doto (Thread. #(engine/run-invocation eng #'meta-fn meta-fn [7]) "meta-test-thread") .start))
+    (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))]
+      (is (= "meta-test-thread" (:thread (edn/read-string (:metadata wf))))))))
 
 (deftest nested-invocation-records-parent-workflow-id-test
   ;; A #workflow fn invoked from inside another running #workflow fn must
@@ -128,6 +168,26 @@
                    [:restarted {:previous-invocation-id id}]
                    [:done {:result :recovered}]]
                   @*emitted-events*)))))
+
+(deftest restart-invocation-replaces-metadata-test
+  (let [id (binding [engine/*workflow-engine* (assoc engine/*workflow-engine*
+                                                     :tenon/metadata-fn (constantly {:run 1}))]
+             (is (thrown? clojure.lang.ExceptionInfo
+                   (engine/run-invocation #'boom-fn boom-fn ["x"])))
+             (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow-test/boom-fn"))))
+        calls (atom [])]
+    (engine/register! #'boom-fn (fn [_] :ok))
+    (binding [engine/*workflow-engine* (assoc engine/*workflow-engine*
+                                              :tenon/metadata-fn (fn [wf-type args]
+                                                                   (swap! calls conj [wf-type args])
+                                                                   {:run 2}))]
+      (engine/restart-invocation id))
+    (is (= [['tenon.workflow-test/boom-fn ["x"]]] @calls))
+    (is (= {:run 2} (edn/read-string (:metadata (engine/get-invocation id)))))
+    (is (match? [{:state "STARTED" :data (pr-str {:run 1})} {:state "ERROR"}
+                 {:state "STARTED" :data (pr-str {:run 2})} {:state "DONE"}]
+                (test-util/timeline id)))
+    (is (match? [:restarted {:metadata {:run 2}}] (nth @*emitted-events* 2)))))
 
 (deftest run-invocation-preserves-full-args-and-result-despite-print-length-test
   ;; A caller-bound *print-length*/*print-level* (common in REPLs/editors) must
@@ -231,7 +291,8 @@
         parent (test-util/insert! "test.ns/reusing-parent")]
     (test-util/finish! id "DONE" (pr-str 80))
     (is (= 80 (binding [engine/*invocation-stack* (list parent)
-                        engine/*workflow-meta* {:actor-id 42}]
+                        engine/*workflow-engine* (assoc engine/*workflow-engine*
+                                                        :tenon/metadata-fn (constantly {:actor-id 42}))]
                 (engine/run-invocation #'dedup-fn dedup-fn [8]))))
     (is (match? [{:invocation_id id :data (pr-str {:actor-id 42})}]
                 (reuse-rows "tenon.workflow-test/dedup-fn")))

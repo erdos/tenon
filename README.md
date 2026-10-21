@@ -48,14 +48,15 @@ You can find the invocations in the web UI started at http://localhost:3000.
 
 ## Metadata
 
-Attach arbitrary caller-supplied data (for example, an actor id, span id, trace id, etc) to a workflow row by binding `*workflow-meta*` around a call:
+Every invocation is stored with metadata, which shows up in the web UI and as `:metadata` in the `:started`, `:restarted` and `:reused` events. By default it is an empty map (`empty-metadata-fn`). `host-thread-metadata-fn` provides the host name and the Java thread name the invocation was started from, e.g. `{:host "app-1" :thread "http-nio-8080-exec-3"}`.
+
+To change it, pass a `:tenon/metadata-fn` when initializing the engine. It is called with the workflow type (the workflow function's qualified symbol) and the vector of its arguments, on the thread making the call, and returns the metadata to persist (any EDN-printable value, usually a map; `nil` stores nothing):
 
 ```clojure
-(require '[tenon.workflow :as wf])
-
-(binding [wf/*workflow-meta* {:actor-id 42 :trace-id "abc"}]
-  (charge-card customer-id amount))
+(tenon.workflow/init "app.db" :tenon/metadata-fn (fn [wf-type args] {:actor-id 42}))
 ```
+
+The function runs once per call: for a call that reuses a stored result, the metadata describes the reusing call, and a restart replaces the metadata with the restarting call's.
 
 ## State transitions
 
