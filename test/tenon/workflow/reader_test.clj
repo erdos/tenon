@@ -97,10 +97,10 @@
   (is (= "Hello Bob" (fixtures/say-hi-twice "Bob")))
   (let [parent (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/say-hi-twice")))
         child (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/say-hi")))]
-    (is (match? [{:depth 0 :invocation_id parent :parent_invocation_id nil? :wf_def "tenon.workflow.fixtures/say-hi-twice" :state "STARTED" :data nil?}
-                 {:depth 1 :invocation_id child :parent_invocation_id parent :wf_def "tenon.workflow.fixtures/say-hi" :state "STARTED" :data nil?}
+    (is (match? [{:depth 0 :invocation_id parent :parent_invocation_id nil? :wf_def "tenon.workflow.fixtures/say-hi-twice" :state "STARTED" :data "{}"}
+                 {:depth 1 :invocation_id child :parent_invocation_id parent :wf_def "tenon.workflow.fixtures/say-hi" :state "STARTED" :data "{}"}
                  {:depth 1 :invocation_id child :parent_invocation_id parent :wf_def "tenon.workflow.fixtures/say-hi" :state "DONE" :data (pr-str "Hello Bob")}
-                 {:depth 1 :invocation_id child :parent_invocation_id parent :wf_def "tenon.workflow.fixtures/say-hi" :state "REUSED" :data nil?}
+                 {:depth 1 :invocation_id child :parent_invocation_id parent :wf_def "tenon.workflow.fixtures/say-hi" :state "REUSED" :data "{}"}
                  {:depth 0 :invocation_id parent :parent_invocation_id nil? :wf_def "tenon.workflow.fixtures/say-hi-twice" :state "DONE" :data (pr-str "Hello Bob")}]
                 (engine/full-timeline parent)))))
 
@@ -113,17 +113,17 @@
                                     "tenon.workflow.fixtures/fibonacci" (pr-str [n]))))
         [f0 f1 f2 f3 f4] (map id (range 5))
         fib "tenon.workflow.fixtures/fibonacci"]
-    (is (match? [{:depth 0 :invocation_id f4 :parent_invocation_id nil? :wf_def fib :state "STARTED" :data nil?}
-                 {:depth 1 :invocation_id f3 :parent_invocation_id f4   :wf_def fib :state "STARTED" :data nil?}
-                 {:depth 2 :invocation_id f2 :parent_invocation_id f3   :wf_def fib :state "STARTED" :data nil?}
-                 {:depth 3 :invocation_id f1 :parent_invocation_id f2   :wf_def fib :state "STARTED" :data nil?}
+    (is (match? [{:depth 0 :invocation_id f4 :parent_invocation_id nil? :wf_def fib :state "STARTED" :data "{}"}
+                 {:depth 1 :invocation_id f3 :parent_invocation_id f4   :wf_def fib :state "STARTED" :data "{}"}
+                 {:depth 2 :invocation_id f2 :parent_invocation_id f3   :wf_def fib :state "STARTED" :data "{}"}
+                 {:depth 3 :invocation_id f1 :parent_invocation_id f2   :wf_def fib :state "STARTED" :data "{}"}
                  {:depth 3 :invocation_id f1 :parent_invocation_id f2   :wf_def fib :state "DONE"    :data (pr-str 1)}
-                 {:depth 3 :invocation_id f0 :parent_invocation_id f2   :wf_def fib :state "STARTED" :data nil?}
+                 {:depth 3 :invocation_id f0 :parent_invocation_id f2   :wf_def fib :state "STARTED" :data "{}"}
                  {:depth 3 :invocation_id f0 :parent_invocation_id f2   :wf_def fib :state "DONE"    :data (pr-str 0)}
                  {:depth 2 :invocation_id f2 :parent_invocation_id f3   :wf_def fib :state "DONE"    :data (pr-str 1)}
-                 {:depth 2 :invocation_id f1 :parent_invocation_id f3   :wf_def fib :state "REUSED"  :data nil?}
+                 {:depth 2 :invocation_id f1 :parent_invocation_id f3   :wf_def fib :state "REUSED"  :data "{}"}
                  {:depth 1 :invocation_id f3 :parent_invocation_id f4   :wf_def fib :state "DONE"    :data (pr-str 2)}
-                 {:depth 1 :invocation_id f2 :parent_invocation_id f4   :wf_def fib :state "REUSED"  :data nil?}
+                 {:depth 1 :invocation_id f2 :parent_invocation_id f4   :wf_def fib :state "REUSED"  :data "{}"}
                  {:depth 0 :invocation_id f4 :parent_invocation_id nil? :wf_def fib :state "DONE"    :data (pr-str 3)}]
                 (engine/full-timeline f4)))))
 
@@ -139,9 +139,9 @@
                                     "tenon.workflow.fixtures/fibonacci" (pr-str [n]))))
         [f2 f3 f4] (map id [2 3 4])
         fib "tenon.workflow.fixtures/fibonacci"]
-    (is (match? [{:depth 0 :invocation_id f4 :parent_invocation_id nil? :wf_def fib :state "STARTED" :data nil?}
-                 {:depth 1 :invocation_id f3 :parent_invocation_id f4   :wf_def fib :state "REUSED"  :data nil?}
-                 {:depth 1 :invocation_id f2 :parent_invocation_id f4   :wf_def fib :state "REUSED"  :data nil?}
+    (is (match? [{:depth 0 :invocation_id f4 :parent_invocation_id nil? :wf_def fib :state "STARTED" :data "{}"}
+                 {:depth 1 :invocation_id f3 :parent_invocation_id f4   :wf_def fib :state "REUSED"  :data "{}"}
+                 {:depth 1 :invocation_id f2 :parent_invocation_id f4   :wf_def fib :state "REUSED"  :data "{}"}
                  {:depth 0 :invocation_id f4 :parent_invocation_id nil? :wf_def fib :state "DONE"    :data (pr-str 3)}]
                 (engine/full-timeline f4)))))
 
