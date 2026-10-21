@@ -121,15 +121,19 @@
   (when epoch-ms
     [:span [:code (timestamp-str epoch-ms) " UTC"] " " (muted "(" (relative-time epoch-ms now) ")")]))
 
+(def state-info
+  {"DONE"    {:symbol "\u2713" :verb "Completed"}
+   "ERROR"   {:symbol "\u2717" :verb "Failed"}
+   "STARTED" {:symbol "\u25B6" :verb "Called"}
+   "REUSED"  {:symbol "\u21BA" :verb "Called"}})
+
+(defn effective-state [{:keys [reused state]}]
+  (if reused "REUSED" state))
+
 (defn state-symbol
   "A one-character symbol for a state, e.g. for a browser tab's title."
   [state]
-  (case state
-    "DONE" "\u2713"
-    "ERROR" "\u2717"
-    "STARTED" "\u25B6"
-    "REUSED" "\u21BA"
-    "?"))
+  (get-in state-info [state :symbol] "?"))
 
 (defn state
   "A state's chip: its name, coloured by the state."

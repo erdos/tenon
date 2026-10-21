@@ -9,19 +9,18 @@
 (defn- call-duration
   "How long the call ran - from its first start to its outcome, or while
    still STARTED, for how long it has been running. A reuse didn't run."
-  [{:keys [reused state created_at state_changed_at]} now]
-  (cond
-    reused (ui/muted "—")
-    (= "STARTED" state) (let [d (ui/format-duration (- now created_at))]
-                          [:span {:title (str "running for " d)} "running " d])
-    :else (ui/format-duration (- state_changed_at created_at))))
+  [{:keys [created_at state_changed_at] :as row} now]
+  (case (ui/effective-state row)
+    "REUSED" (ui/muted "—")
+    "STARTED" (let [d (ui/format-duration (- now created_at))]
+                [:span {:title (str "running for " d)} "running " d])
+    (ui/format-duration (- state_changed_at created_at))))
 
 (defn- call-state
   "The state chip - Reused for a call that got a stored result instead of
    running - flagged when a STARTED workflow's lease has run out."
-  [{:keys [reused state expires_at]} now]
-  (if reused
-    (ui/state "REUSED")
+  [{:keys [expires_at] :as row} now]
+  (let [state (ui/effective-state row)]
     (list (ui/state state)
           (when (and (= "STARTED" state) expires_at (< expires_at now))
             [:span.wf-expired {:title (str "lease expired " (ui/format-duration (- now expires_at)) " ago")}
@@ -34,9 +33,9 @@
      [:thead [:tr [:th "Timestamp"] [:th "Id"] [:th "Workflow"] (when show-all? [:th "Parent"])
               [:th "Duration"] [:th.state "State"]]]
      [:tbody
-      (for [{:keys [invocation_id wf_def created_at reused parent_invocation_id] :as row} rows
+      (for [{:keys [invocation_id wf_def created_at parent_invocation_id] :as row} rows
             :let [href (ui/uri :workflows invocation_id)]]
-        [:tr {:class (str "state-" (if reused "REUSED" (:state row)))}
+        [:tr {:class (str "state-" (ui/effective-state row))}
          [:td [:a {:href href} (ui/timestamp created_at)]]
          [:td (ui/workflow-link invocation_id)]
          [:td [:a {:href href} (ui/workflow-name wf_def)]]

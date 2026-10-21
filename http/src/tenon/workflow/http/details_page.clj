@@ -28,21 +28,26 @@
 (defn- metadata-html [metadata-str]
   (ui/panel {:title "Metadata"} (metadata-body metadata-str)))
 
-(defn- result-html [wf]
-  (case (:state wf)
-    "DONE" (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:result wf)))
-    "ERROR" (let [error (ui/read-edn (:result wf))]
-              (ui/panel {:title "Error"}
-                        (if (map? error)
-                          (let [{:keys [type message data]} (first (:via error))
-                                class (or (:class error) type)
-                                msg (or (:message error) (:cause error) message)
-                                ex-data (or (:data error) data)]
-                            (ui/error-details class msg
-                                              (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])))
-                          (ui/edn-block (:result wf)))))
-    (ui/panel {:title "Result"}
-              (ui/muted "Pending \u2014 no result yet."))))
+(defmulti ^:private result-panel :state)
+
+(defmethod result-panel "DONE" [wf]
+  (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:result wf))))
+
+(defmethod result-panel "ERROR" [wf]
+  (let [error (ui/read-edn (:result wf))]
+    (ui/panel {:title "Error"}
+              (if (map? error)
+                (let [{:keys [type message data]} (first (:via error))
+                      class (or (:class error) type)
+                      msg (or (:message error) (:cause error) message)
+                      ex-data (or (:data error) data)]
+                  (ui/error-details class msg
+                                    (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])))
+                (ui/edn-block (:result wf))))))
+
+(defmethod result-panel :default [_]
+  (ui/panel {:title "Result"}
+            (ui/muted "Pending \u2014 no result yet.")))
 
 (defn- timeline-tree
   "Groups full-timeline events (in chronological order) into a tree of
@@ -136,11 +141,8 @@
    [:code.tree-offset {:title (str (ui/timestamp-str (:state_changed_at ev)) " UTC")}
     (ui/format-offset (- (:state_changed_at ev) start))]
    [:span.tree-verb (or verb
-                        (case (:state ev)
-                          ("STARTED" "REUSED") "Called"
-                          "DONE" "Completed"
-                          "ERROR" "Failed"
-                          (str (:state ev))))]))
+                        (get-in ui/state-info [(:state ev) :verb])
+                        (str (:state ev)))]))
 
 (defn- error-body
   "The full error of an ERROR event as saved (a Throwable->map): class,
@@ -168,14 +170,28 @@
                              [:div (ui/muted "stack trace")
                               (ui/stack-trace trace)]))]))))
 
+(defmulti ^:private event-fold-body :state)
+
+(defmethod event-fold-body "ERROR" [ev]
+  (when (:data ev) (error-body (:data ev))))
+
+(defmethod event-fold-body "STARTED" [ev]
+  (when (:data ev)
+    [:div.event-error-body (ui/muted "Metadata") (metadata-body (:data ev))]))
+
+(defmethod event-fold-body "REUSED" [ev]
+  (when (:data ev)
+    [:div.event-error-body (ui/muted "Metadata") (metadata-body (:data ev))]))
+
+(defmethod event-fold-body :default [_] nil)
+
 (defn- timeline-tree-event
   "An event of a node's run. A REUSED one (the workflow's own reuses -
    ones within the tree are leaves of their own) names the invocation
    whose result was reused and the caller that reused it - nothing for a
    top-level call, which had no caller. A STARTED one other than the
-   node's first event (its run always opens with one) is a restart. An
-   ERROR one folds (closed) to its full error, a STARTED or REUSED one
-   to the invocation's metadata."
+   node's first event (its run always opens with one) is a restart. One
+   with something to show folds (closed) to it, see event-fold-body."
   [start ev root? restart?]
   (let [row (list
              (tree-offset start ev (when restart? "Restarted"))
@@ -188,20 +204,11 @@
               nil
               nil
               (ui/state-with-tooltip (:state ev) (when (= "ERROR" (:state ev)) (error-title ev)))))]
-    (cond
-      (and (= "ERROR" (:state ev)) (:data ev))
-      [:li.tree-error
+    (if-let [body (event-fold-body ev)]
+      [:li {:class (str "tree-error" (when (not= "ERROR" (:state ev)) " tree-meta"))}
        [:details
         (into [:summary {:class (str "state-" (:state ev))}] row)
-        (error-body (:data ev))]]
-
-      (and (#{"STARTED" "REUSED"} (:state ev)) (:data ev))
-      [:li.tree-error.tree-meta
-       [:details
-        (into [:summary {:class (str "state-" (:state ev))}] row)
-        [:div.event-error-body (ui/muted "Metadata") (metadata-body (:data ev))]]]
-
-      :else
+        body]]
       (into [:li {:class (str "tree-event state-" (:state ev))}] row))))
 
 (defn- timeline-tree-reuse
@@ -364,7 +371,7 @@
                (workflow-summary wf requested-id events restart-error)
                [:div.panels
                 (params-html (:params wf))
-                (result-html wf)
+                (result-panel wf)
                 (when (:metadata wf) (metadata-html (:metadata wf)))]
                [:div.page-head
                 [:h2 "Timeline"]
