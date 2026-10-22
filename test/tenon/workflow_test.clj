@@ -43,15 +43,15 @@
   (let [result (engine/run-invocation #'add-fn add-fn [2 3])
         wf (first (test-util/find-by-wf-def "tenon.workflow-test/add-fn"))]
     (is (= 5 result))
-    (is (match? {:params "[2 3]" :parent_invocation_id nil?} wf))
-    (is (match? [{:state "STARTED"} {:state "DONE" :data "5"}]
-                (test-util/timeline (:invocation_id wf))))
-    (is (match? [[:started {:invocation-id (:invocation_id wf)
+    (is (match? {:workflow/params "[2 3]" :workflow/parent-invocation-id nil?} wf))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :workflow/data "5"}]
+                (test-util/timeline (:workflow/invocation-id wf))))
+    (is (match? [[:started {:invocation-id (:workflow/invocation-id wf)
                             :parent-invocation-id nil
                             :wf-def "tenon.workflow-test/add-fn"
                             :args [2 3]
                             :metadata nil}]
-                 [:done {:invocation-id (:invocation_id wf)
+                 [:done {:invocation-id (:workflow/invocation-id wf)
                          :parent-invocation-id nil
                          :wf-def "tenon.workflow-test/add-fn"
                          :args [2 3]
@@ -64,7 +64,7 @@
                    :tenon/metadata-fn (constantly {:actor-id 42 :trace-id "abc"}))]
     (engine/run-invocation #'meta-fn meta-fn [1]))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))]
-    (is (= {:actor-id 42 :trace-id "abc"} (edn/read-string (:metadata wf))))
+    (is (= {:actor-id 42 :trace-id "abc"} (edn/read-string (:workflow/metadata wf))))
     (is (match? [[:started {:metadata {:actor-id 42 :trace-id "abc"}}]
                  [:done {}]]
                 @*emitted-events*))))
@@ -72,7 +72,7 @@
 (deftest metadata-fn-returning-nil-stores-nil-test
   (binding [engine/*workflow-engine* (assoc engine/*workflow-engine* :tenon/metadata-fn (constantly nil))]
     (engine/run-invocation #'no-meta-fn no-meta-fn [1]))
-  (is (nil? (:metadata (first (test-util/find-by-wf-def "tenon.workflow-test/no-meta-fn"))))))
+  (is (nil? (:workflow/metadata (first (test-util/find-by-wf-def "tenon.workflow-test/no-meta-fn"))))))
 
 (deftest metadata-fn-receives-workflow-type-and-args-test
   (let [calls (atom [])]
@@ -98,7 +98,7 @@
       (is (identical? engine/empty-metadata-fn (:tenon/metadata-fn eng)))
       (binding [engine/*workflow-engine* eng]
         (engine/run-invocation eng #'meta-fn meta-fn [7])
-        (is (= "{}" (:metadata (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))))))
+        (is (= "{}" (:workflow/metadata (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))))))
       (finally
         (.close ^java.io.Closeable (:tenon/db eng))
         (doseq [suffix ["" "-wal" "-shm"]]
@@ -108,7 +108,7 @@
   (let [eng (assoc engine/*workflow-engine* :tenon/metadata-fn engine/host-thread-metadata-fn)]
     (.join (doto (Thread. #(engine/run-invocation eng #'meta-fn meta-fn [7]) "meta-test-thread") .start))
     (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/meta-fn"))]
-      (is (= "meta-test-thread" (:thread (edn/read-string (:metadata wf))))))))
+      (is (= "meta-test-thread" (:thread (edn/read-string (:workflow/metadata wf))))))))
 
 (deftest nested-invocation-records-parent-workflow-id-test
   ;; A #workflow fn invoked from inside another running #workflow fn must
@@ -118,11 +118,11 @@
         outer-wf (first (test-util/find-by-wf-def "tenon.workflow-test/nested-outer-fn"))
         inner-wf (first (test-util/find-by-wf-def "tenon.workflow-test/nested-inner-fn"))]
     (is (= 11 result))
-    (is (match? {:parent_invocation_id nil?} outer-wf))
-    (is (match? {:parent_invocation_id (:invocation_id outer-wf)} inner-wf))
+    (is (match? {:workflow/parent-invocation-id nil?} outer-wf))
+    (is (match? {:workflow/parent-invocation-id (:workflow/invocation-id outer-wf)} inner-wf))
     (is (match? [[:started {:parent-invocation-id nil}]
-                 [:started {:parent-invocation-id (:invocation_id outer-wf)}]
-                 [:done {:parent-invocation-id (:invocation_id outer-wf)}]
+                 [:started {:parent-invocation-id (:workflow/invocation-id outer-wf)}]
+                 [:done {:parent-invocation-id (:workflow/invocation-id outer-wf)}]
                  [:done {:parent-invocation-id nil}]]
                 @*emitted-events*))
     (is (nil? (seq engine/*invocation-stack*))
@@ -132,10 +132,10 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
         (engine/run-invocation #'boom-fn boom-fn ["boom"])))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/boom-fn"))
-        events (test-util/timeline (:invocation_id wf))]
-    (is (match? [{:state "STARTED"} {:state "ERROR"}] events))
+        events (test-util/timeline (:workflow/invocation-id wf))]
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"}] events))
     (is (match? {:cause "boom" :via vector? :trace vector?}
-                (edn/read-string (:data (last events)))))
+                (edn/read-string (:workflow/data (last events)))))
     (is (match? [[:started {:wf-def "tenon.workflow-test/boom-fn"}]
                  [:error {:wf-def "tenon.workflow-test/boom-fn"
                           :error #(instance? clojure.lang.ExceptionInfo %)}]]
@@ -143,26 +143,26 @@
 
 (deftest list-pending-test
   (let [id (test-util/insert! "test.ns/crashed" :params (pr-str [1]))]
-    (is (match? [{:invocation_id id :params (pr-str [1])}]
+    (is (match? [{:workflow/invocation-id id :workflow/params (pr-str [1])}]
                 (engine/list-pending))
         "pending rows carry their params")
     (let [child-id (test-util/insert! "test.ns/crashed-child" :params (pr-str [2]) :parent id)]
-      (is (match? (m/in-any-order [{:invocation_id id} {:invocation_id child-id}])
+      (is (match? (m/in-any-order [{:workflow/invocation-id id} {:workflow/invocation-id child-id}])
                   (engine/list-pending))
           "nested workflows are listed too"))
     (engine/run-invocation #'finished-fn finished-fn [])
-    (is (not-any? #(= "tenon.workflow-test/finished-fn" (:wf_def %)) (engine/list-pending)))))
+    (is (not-any? #(= "tenon.workflow-test/finished-fn" (:workflow/name %)) (engine/list-pending)))))
 
 (deftest restart-invocation-test
   (engine/register! #'flaky-fn flaky-fn)
   (is (thrown? clojure.lang.ExceptionInfo
         (engine/run-invocation #'flaky-fn flaky-fn [0])))
-  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow-test/flaky-fn")))]
-    (is (= "ERROR" (:state (engine/get-invocation id))))
+  (let [id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/flaky-fn")))]
+    (is (= "ERROR" (:workflow/state (engine/get-invocation id))))
     (engine/register! #'flaky-fn (fn [_n] :recovered))
     (let [result (engine/restart-invocation id)]
       (is (= :recovered result))
-      (is (match? [{:state "STARTED"} {:state "ERROR"} {:state "STARTED"} {:state "DONE"}]
+      (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "STARTED"} {:workflow/state "DONE"}]
                   (test-util/timeline id)))
       (is (match? [[:started {}]
                    [:error {}]
@@ -175,7 +175,7 @@
                                                      :tenon/metadata-fn (constantly {:run 1}))]
              (is (thrown? clojure.lang.ExceptionInfo
                    (engine/run-invocation #'boom-fn boom-fn ["x"])))
-             (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow-test/boom-fn"))))
+             (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/boom-fn"))))
         calls (atom [])]
     (engine/register! #'boom-fn (fn [_] :ok))
     (binding [engine/*workflow-engine* (assoc engine/*workflow-engine*
@@ -184,9 +184,9 @@
                                                                    {:run 2}))]
       (engine/restart-invocation id))
     (is (= [['tenon.workflow-test/boom-fn ["x"]]] @calls))
-    (is (= {:run 2} (edn/read-string (:metadata (engine/get-invocation id)))))
-    (is (match? [{:state "STARTED" :data (pr-str {:run 1})} {:state "ERROR"}
-                 {:state "STARTED" :data (pr-str {:run 2})} {:state "DONE"}]
+    (is (= {:run 2} (edn/read-string (:workflow/metadata (engine/get-invocation id)))))
+    (is (match? [{:workflow/state "STARTED" :workflow/data (pr-str {:run 1})} {:workflow/state "ERROR"}
+                 {:workflow/state "STARTED" :workflow/data (pr-str {:run 2})} {:workflow/state "DONE"}]
                 (test-util/timeline id)))
     (is (match? [:restarted {:metadata {:run 2}}] (nth @*emitted-events* 2)))))
 
@@ -199,9 +199,9 @@
                  (engine/run-invocation #'long-args-fn long-args-fn [long-arg]))]
     (is (= long-arg result)))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/long-args-fn"))
-        events (test-util/timeline (:invocation_id wf))]
-    (is (= [(vec (range 500))] (edn/read-string (:params wf))))
-    (is (= (vec (range 500)) (edn/read-string (:data (last events)))))))
+        events (test-util/timeline (:workflow/invocation-id wf))]
+    (is (= [(vec (range 500))] (edn/read-string (:workflow/params wf))))
+    (is (= (vec (range 500)) (edn/read-string (:workflow/data (last events)))))))
 
 (deftest done-recording-failure-not-misclassified-as-error-test
   ;; If the underlying fn succeeds (its side effect already happened) but
@@ -238,10 +238,10 @@
             (engine/run-invocation #'transactional-fn transactional-fn [10 20])
             (throw (ex-info "caller failure after the workflow call" {})))))
     (let [wf (first (test-util/find-by-wf-def "tenon.workflow-test/transactional-fn"))
-          events (test-util/timeline (:invocation_id wf))]
+          events (test-util/timeline (:workflow/invocation-id wf))]
       (is (some? wf)
           "the workflow row survived the enclosing transaction's rollback")
-      (is (match? [{:state "STARTED"} {:state "DONE" :data (pr-str 30)}] events)
+      (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :workflow/data (pr-str 30)}] events)
           "both events were committed, not undone by the caller's rollback"))))
 
 (deftest run-invocation-dedups-completed-invocation-test
@@ -284,8 +284,8 @@
       (is (zero? @calls) "must not have re-executed - it polled the STARTED row instead"))))
 
 (defn- reuse-rows [wf-def]
-  (let [id (:invocation_id (first (test-util/find-by-wf-def wf-def)))]
-    (filterv #(= "REUSED" (:state %)) (test-util/timeline id))))
+  (let [id (:workflow/invocation-id (first (test-util/find-by-wf-def wf-def)))]
+    (filterv #(= "REUSED" (:workflow/state %)) (test-util/timeline id))))
 
 (deftest run-invocation-logs-reused-result-test
   (let [id (test-util/insert! "tenon.workflow-test/dedup-fn" :params (pr-str [8]))
@@ -295,10 +295,10 @@
                         engine/*workflow-engine* (assoc engine/*workflow-engine*
                                                         :tenon/metadata-fn (constantly {:actor-id 42}))]
                 (engine/run-invocation #'dedup-fn dedup-fn [8]))))
-    (is (match? [{:invocation_id id :data (pr-str {:actor-id 42})}]
+    (is (match? [{:workflow/invocation-id id :workflow/data (pr-str {:actor-id 42})}]
                 (reuse-rows "tenon.workflow-test/dedup-fn")))
-    (is (match? [{:depth 1 :invocation_id id :state "REUSED"}]
-                (filter #(= "REUSED" (:state %)) (engine/full-timeline parent)))
+    (is (match? [{:workflow/depth 1 :workflow/invocation-id id :workflow/state "REUSED"}]
+                (filter #(= "REUSED" (:workflow/state %)) (engine/full-timeline parent)))
         "the reuse shows up in the reusing parent's timeline as its sub-workflow")))
 
 (deftest run-invocation-logs-reused-failure-test
@@ -306,7 +306,7 @@
         (engine/run-invocation #'dedup-error-fn dedup-error-fn ["reused boom"])))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"previously failed"
         (engine/run-invocation #'dedup-error-fn dedup-error-fn ["reused boom"])))
-  (is (match? [{:data nil}] (reuse-rows "tenon.workflow-test/dedup-error-fn"))
+  (is (match? [{:workflow/data nil}] (reuse-rows "tenon.workflow-test/dedup-error-fn"))
       "a top-level reuse of a failure is logged too"))
 
 (deftest run-invocation-logs-reuse-after-polling-test
@@ -315,7 +315,7 @@
       (Thread/sleep 50)
       (test-util/finish! id "DONE" (pr-str :polled)))
     (is (= :polled (engine/run-invocation #'dedup-started-fn dedup-started-fn [43])))
-    (is (match? [{:state "STARTED"} {:state "DONE"} {:state "REUSED"}]
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE"} {:workflow/state "REUSED"}]
                 (test-util/timeline id))
         "logged once, after the awaited result arrived")))
 
@@ -389,7 +389,7 @@
                         :failure {:data {:type ::engine/timed-out}}}
                        (engine/run-invocation #'dedup-started-fn (fn [n] (swap! calls inc) n) [5])))
     (is (zero? @calls))
-    (is (match? [{:state "STARTED"} {:state "ERROR"} {:state "REUSED"}]
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "REUSED"}]
                 (test-util/timeline id))
         "the caller that timed it out reused the timeout failure")
     (is (match? [[:timed-out {:invocation-id id}]
@@ -413,7 +413,7 @@
   (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [2]) :timeout-ms 60000)]
     (test-util/expire! (test-util/ds) id)
     (is (= 2 (engine/restart-invocation id)))
-    (is (match? [{:state "STARTED"} {:state "ERROR"} {:state "STARTED"} {:state "DONE"}]
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "STARTED"} {:workflow/state "DONE"}]
                 (test-util/timeline id)))))
 
 (deftest run-invocation-without-timeout-waits-without-limit-test
@@ -448,7 +448,7 @@
         (deliver release true)
         (is (= 4 @first-restart))
         (is (= 1 @calls))
-        (is (match? [{:state "STARTED"} {:state "DONE"} {:state "STARTED"} {:state "DONE"}]
+        (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE"} {:workflow/state "STARTED"} {:workflow/state "DONE"}]
                     (test-util/timeline id)))))))
 
 (deftest late-finish-after-timeout-keeps-timeout-test
@@ -460,7 +460,7 @@
         f (fn [x] (deliver running true) @release x)
         caller (future (engine/run-invocation #'echo-fn f [8]))]
     @running
-    (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn")))]
+    (let [id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn")))]
       (test-util/expire! (test-util/ds) id)
       (is (thrown-match? clojure.lang.ExceptionInfo
                          {:type ::engine/previous-failure
@@ -469,7 +469,7 @@
           "a waiter times it out")
       (deliver release true)
       (is (= 8 @caller))
-      (is (match? [{:state "STARTED"} {:state "ERROR"} {:state "REUSED"}]
+      (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "REUSED"}]
                   (test-util/timeline id))
           "only the waiter's reuse of the timeout is logged - no late DONE"))))
 
@@ -543,7 +543,7 @@
     (is (thrown-match? clojure.lang.ExceptionInfo
                        {:type ::engine/cycle-detected}
                        (engine/run-invocation #'echo-fn direct [1])))
-    (is (match? [{:state "ERROR"}] (test-util/find-by-wf-def "tenon.workflow-test/echo-fn"))))
+    (is (match? [{:workflow/state "ERROR"}] (test-util/find-by-wf-def "tenon.workflow-test/echo-fn"))))
   (let [step-b (fn [step-a x] (engine/run-invocation #'nested-outer-fn (fn [y] (step-a y)) [x]))
         step-a (fn step-a [x] (engine/run-invocation #'nested-inner-fn (fn [y] (step-b step-a y)) [x]))]
     (is (thrown-match? clojure.lang.ExceptionInfo
@@ -566,14 +566,14 @@
   (is (thrown? Exception (recursive-outer 5)))
   (let [outer (first (test-util/find-by-wf-def "tenon.workflow-test/recursive-outer"))]
     (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/previous-failure}
-                       (engine/restart-invocation (:invocation_id outer)))
+                       (engine/restart-invocation (:workflow/invocation-id outer)))
         "a plain restart trips over the cached failure")
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"inner down"
-                          (engine/restart-invocation-recursively (:invocation_id outer)))
+                          (engine/restart-invocation-recursively (:workflow/invocation-id outer)))
         "a nested workflow failing again aborts the restart with its own failure")
     (engine/register! #'recursive-inner (fn [n] (* n 2)))
-    (is (= 12 (engine/restart-invocation-recursively (:invocation_id outer))))
-    (is (every? #(= "DONE" (:state (first (test-util/find-by-wf-def %))))
+    (is (= 12 (engine/restart-invocation-recursively (:workflow/invocation-id outer))))
+    (is (every? #(= "DONE" (:workflow/state (first (test-util/find-by-wf-def %))))
                 ["tenon.workflow-test/recursive-outer"
                  "tenon.workflow-test/recursive-middle"
                  "tenon.workflow-test/recursive-inner"]))))
@@ -581,9 +581,9 @@
 (deftest restart-invocation-recursively-leaves-done-nested-workflows-test
   (fixtures/nested-parent 2)
   (let [parent (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-parent"))
-        child-id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-child")))]
-    (is (= 5 (engine/restart-invocation-recursively (:invocation_id parent))))
-    (is (= child-id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-child"))))
+        child-id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-child")))]
+    (is (= 5 (engine/restart-invocation-recursively (:workflow/invocation-id parent))))
+    (is (= child-id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-child"))))
         "the done child keeps its invocation")))
 
 #workflow
@@ -601,14 +601,14 @@
 (defn- started-count [wf-def]
   (->> (test-util/find-by-wf-def wf-def)
        first
-       :invocation_id
+       :workflow/invocation-id
        test-util/timeline
-       (filter (comp #{"STARTED"} :state))
+       (filter (comp #{"STARTED"} :workflow/state))
        count))
 
 (deftest restart-invocation-recursively-restarts-one-failed-callee-at-a-time-test
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"first down" (fan-out-parent)))
-  (let [parent-id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow-test/fan-out-parent")))]
+  (let [parent-id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/fan-out-parent")))]
     (engine/register! #'fan-out-first (fn [] :first-ok))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"second down"
                           (engine/restart-invocation-recursively parent-id))
@@ -616,7 +616,7 @@
     (engine/register! #'fan-out-second (fn [] :second-ok))
     (is (= [:first-ok :second-ok] (engine/restart-invocation-recursively parent-id)))
     (is (= ["DONE" "DONE" "DONE"]
-           (map #(:state (first (test-util/find-by-wf-def %)))
+           (map #(:workflow/state (first (test-util/find-by-wf-def %)))
                 ["tenon.workflow-test/fan-out-parent"
                  "tenon.workflow-test/fan-out-first"
                  "tenon.workflow-test/fan-out-second"])))

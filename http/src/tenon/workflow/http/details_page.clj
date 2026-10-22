@@ -28,13 +28,13 @@
 (defn- metadata-html [metadata-str]
   (ui/panel {:title "Metadata"} (metadata-body metadata-str)))
 
-(defmulti ^:private result-panel :state)
+(defmulti ^:private result-panel :workflow/state)
 
 (defmethod result-panel "DONE" [wf]
-  (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:result wf))))
+  (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:workflow/result wf))))
 
 (defmethod result-panel "ERROR" [wf]
-  (let [error (ui/read-edn (:result wf))]
+  (let [error (ui/read-edn (:workflow/result wf))]
     (ui/panel {:title "Error"}
               (if (map? error)
                 (let [{:keys [type message data]} (first (:via error))
@@ -43,7 +43,7 @@
                       ex-data (or (:data error) data)]
                   (ui/error-details class msg
                                     (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])))
-                (ui/edn-block (:result wf))))))
+                (ui/edn-block (:workflow/result wf))))))
 
 (defmethod result-panel :default [_]
   (ui/panel {:title "Result"}
@@ -52,7 +52,7 @@
 (defn- timeline-tree
   "Groups full-timeline events (in chronological order) into a tree of
    workflow nodes, as a map from node key to {:events [[index event] ...]}.
-   A node key is the path of current_invocation_ids from the root down:
+   A node key is the path of current invocation ids from the root down:
    [:root] for the workflow itself (every depth 0 event, its own REUSED
    rows included), the parent's key plus the workflow's id below it. A
    REUSED row hangs under the reusing invocation's node, as a node of its
@@ -60,26 +60,25 @@
   [events]
   (let [indexed (map-indexed vector events)
         by-invocation (->> indexed
-                           (remove (fn [[_ ev]] (= "REUSED" (:state ev))))
-                           (reduce (fn [m [_ ev]] (update m (:invocation_id ev) #(or % ev))) {}))
-        node-key (fn node-key [{:keys [depth current_invocation_id parent_invocation_id]}]
+                           (remove (comp engine/reused? second))
+                           (reduce (fn [m [_ ev]] (update m (:workflow/invocation-id ev) #(or % ev))) {}))
+        node-key (fn node-key [{:workflow/keys [depth current-invocation-id parent-invocation-id]}]
                    (if (zero? depth)
                      [:root]
-                     (conj (if-let [parent (by-invocation parent_invocation_id)]
+                     (conj (if-let [parent (by-invocation parent-invocation-id)]
                              (node-key parent)
                              [:root])
-                           current_invocation_id)))]
+                           current-invocation-id)))]
     (reduce (fn [nodes [i ev]] (update-in nodes [(node-key ev) :events] (fnil conj []) [i ev]))
             {} indexed)))
 
-(defn- reused? [ev] (= "REUSED" (:state ev)))
 
 (defn- run-state
   "The outcome of a node's run - its latest state other than REUSED (a
    reuse doesn't change it). A node with nothing but REUSED rows is a reuse
    within the tree: REUSED."
   [events]
-  (or (->> events (map second) (remove reused?) last :state) "REUSED"))
+  (or (->> events (map second) (remove engine/reused?) last :workflow/state) "REUSED"))
 
 (defn- run-duration
   "The node's run from its first STARTED (or, with :last-attempt, its
@@ -88,18 +87,18 @@
    been running (saying so in its tooltip). nil for a reuse-only node."
   ([events] (run-duration events :whole-run))
   ([events from]
-   (let [run (remove reused? (map second events))
-         starts (filter #(= "STARTED" (:state %)) run)]
-     (when-let [start (:state_changed_at (if (= :last-attempt from) (last starts) (first starts)))]
-       (if (= "STARTED" (:state (last run)))
+   (let [run (remove engine/reused? (map second events))
+         starts (filter engine/started? run)]
+     (when-let [start (:workflow/state-changed-at (if (= :last-attempt from) (last starts) (first starts)))]
+       (if (engine/started? (last run))
          (let [d (ui/format-duration (- (System/currentTimeMillis) start))]
            [:span {:title (str "running for " d)} d])
-         (ui/format-duration (- (:state_changed_at (last run)) start)))))))
+         (ui/format-duration (- (:workflow/state-changed-at (last run)) start)))))))
 
 (defn- error-title
   "\"class: message\" of an ERROR event, for a chip's tooltip."
   [ev]
-  (let [error (ui/read-edn (:data ev))
+  (let [error (ui/read-edn (:workflow/data ev))
         {:keys [type message]} (first (:via error))]
     (str (or (:class error) type) ": " (or (:message error) (:cause error) message))))
 
@@ -107,7 +106,7 @@
   "The exception class of an ERROR event, its package muted so the class
    name stands out - nil if the saved error has none."
   [ev]
-  (let [error (ui/read-edn (:data ev))
+  (let [error (ui/read-edn (:workflow/data ev))
         cls (when (map? error) (or (:class error) (:type (first (:via error)))))]
     (when cls
       (let [cls (str cls)
@@ -138,11 +137,11 @@
    derived from the event's state."
   [start ev & [verb]]
   (list
-   [:code.tree-offset {:title (str (ui/timestamp-str (:state_changed_at ev)) " UTC")}
-    (ui/format-offset (- (:state_changed_at ev) start))]
+   [:code.tree-offset {:title (str (ui/timestamp-str (:workflow/state-changed-at ev)) " UTC")}
+    (ui/format-offset (- (:workflow/state-changed-at ev) start))]
    [:span.tree-verb (or verb
-                        (get-in ui/state-info [(:state ev) :verb])
-                        (str (:state ev)))]))
+                        (get-in ui/state-info [(:workflow/state ev) :verb])
+                        (str (:workflow/state ev)))]))
 
 (defn- error-body
   "The full error of an ERROR event as saved (a Throwable->map): class,
@@ -170,18 +169,18 @@
                              [:div (ui/muted "stack trace")
                               (ui/stack-trace trace)]))]))))
 
-(defmulti ^:private event-fold-body :state)
+(defmulti ^:private event-fold-body :workflow/state)
 
 (defmethod event-fold-body "ERROR" [ev]
-  (when (:data ev) (error-body (:data ev))))
+  (when-some [data (:workflow/data ev)] (error-body data)))
 
 (defmethod event-fold-body "STARTED" [ev]
-  (when (:data ev)
-    [:div.event-error-body (ui/muted "Metadata") (metadata-body (:data ev))]))
+  (when-some [data (:workflow/data ev)]
+    [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]))
 
 (defmethod event-fold-body "REUSED" [ev]
-  (when (:data ev)
-    [:div.event-error-body (ui/muted "Metadata") (metadata-body (:data ev))]))
+  (when-some [data (:workflow/data ev)]
+    [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]))
 
 (defmethod event-fold-body :default [_] nil)
 
@@ -195,34 +194,34 @@
   [start ev root? restart?]
   (let [row (list
              (tree-offset start ev (when restart? "Restarted"))
-             (when (= "ERROR" (:state ev)) (error-class-html ev))
-             (when-let [caller (and (reused? ev) root? (:parent_invocation_id ev))]
+             (when (engine/error? ev) (error-class-html ev))
+             (when-let [caller (and (engine/reused? ev) root? (:workflow/parent-invocation-id ev))]
                [:span.tree-reuse
-                "from " (ui/workflow-link (:invocation_id ev))
+                "from " (ui/workflow-link (:workflow/invocation-id ev))
                 " for " (ui/workflow-link caller)])
              (tree-columns
               nil
               nil
-              (ui/state-with-tooltip (:state ev) (when (= "ERROR" (:state ev)) (error-title ev)))))]
+              (ui/state-with-tooltip (:workflow/state ev) (when (engine/error? ev) (error-title ev)))))]
     (if-let [body (event-fold-body ev)]
-      [:li {:class (str "tree-error" (when (not= "ERROR" (:state ev)) " tree-meta"))}
+      [:li {:class (str "tree-error" (when-not (engine/error? ev) " tree-meta"))}
        [:details
-        (into [:summary {:class (str "state-" (:state ev))}] row)
+        (into [:summary {:class (str "state-" (:workflow/state ev))}] row)
         body]]
-      (into [:li {:class (str "tree-event state-" (:state ev))}] row))))
+      (into [:li {:class (str "tree-event state-" (:workflow/state ev))}] row))))
 
 (defn- timeline-tree-reuse
   "A reuse within the tree: its single REUSED row, as a leaf. It names the
    producing invocation only when that isn't the reused workflow's current
    one (it was restarted since). With metadata it folds (closed) to it,
    otherwise there is nothing in it to fold."
-  [start {:keys [current_invocation_id invocation_id wf_def data] :as ev}]
+  [start {wf-name :workflow/name :workflow/keys [current-invocation-id invocation-id data] :as ev}]
   (let [row (list
              (tree-offset start ev "Invoked")
-             (ui/workflow-name wf_def)
-             (ui/workflow-link current_invocation_id)
-             (when (not= invocation_id current_invocation_id)
-               [:span.tree-reuse "from " (ui/workflow-link invocation_id)])
+             (ui/workflow-name wf-name)
+             (ui/workflow-link current-invocation-id)
+             (when (not= invocation-id current-invocation-id)
+               [:span.tree-reuse "from " (ui/workflow-link invocation-id)])
              (tree-columns
               nil
               nil
@@ -236,11 +235,11 @@
 
 (defn- timeline-tree-node [nodes children start k]
   (let [events (get-in nodes [k :events])
-        {:keys [current_invocation_id wf_def]} (second (first events))
+        {wf-name :workflow/name :workflow/keys [current-invocation-id]} (second (first events))
         state (run-state events)
-        reuses (count (filter (comp reused? second) events))
+        reuses (count (filter (comp engine/reused? second) events))
         duration (run-duration events)
-        last-error (->> events (map second) (filter #(= "ERROR" (:state %))) last)
+        last-error (->> events (map second) (filter engine/error?) last)
         items (->> (concat (for [[i ev] events] [i :event ev])
                            (for [ck (children k)] [(ffirst (get-in nodes [ck :events])) :node ck]))
                    (sort-by first))]
@@ -250,9 +249,9 @@
      [:details (when (or (= [:root] k) (problem? nodes children k)) {:open true})
       [:summary {:class (str "state-" state)}
        [:span.tree-verb "Invoked"]
-       (ui/workflow-name wf_def)
+       (ui/workflow-name wf-name)
        (when-not (= [:root] k)
-         (ui/workflow-link current_invocation_id))
+         (ui/workflow-link current-invocation-id))
        (tree-columns
         duration
         (when (pos? reuses)
@@ -263,7 +262,7 @@
        (for [[i kind x] items]
          (case kind
            :event (timeline-tree-event start x (= [:root] k)
-                                       (and (= "STARTED" (:state x)) (not= i (ffirst events))))
+                                       (and (engine/started? x) (not= i (ffirst events))))
            :node (timeline-tree-node nodes children start x)))]]])))
 
 (defn- full-timeline-tree
@@ -278,16 +277,15 @@
           children (->> (keys nodes)
                         (remove #{[:root]})
                         (group-by pop))
-          start (reduce min (map :state_changed_at events))]
+          start (reduce min (map :workflow/state-changed-at events))]
       [:ul.tree (timeline-tree-node nodes children start [:root])])))
 
 (defn- can-restart? [wf]
-  (and (or (#{"DONE" "ERROR"} (:state wf))
-           (:expired wf))
-       (some? (engine/lookup (symbol (:wf_def wf))))))
+  (and (or (engine/done? wf) (engine/error? wf) (engine/expired? wf))
+       (some? (engine/lookup (symbol (:workflow/name wf))))))
 
 (defn- unregistered? [wf]
-  (nil? (engine/lookup (symbol (:wf_def wf)))))
+  (nil? (engine/lookup (symbol (:workflow/name wf)))))
 
 (defn- workflow-summary
   "The card at the top of the detail page: the workflow's state, how it ran
@@ -295,17 +293,17 @@
    URL - a past invocation of a since restarted workflow shows the current
    one, saying so. events is its full-timeline."
   [wf requested-id events restart-error]
-  (let [id (:invocation_id wf)
-        own (filter (comp zero? :depth) events)
-        runs (remove reused? own)
-        started-at (:state_changed_at (first (filter (comp #{"STARTED"} :state) runs)))
-        attempts (count (filter (comp #{"STARTED"} :state) runs))
-        reuses (count (filter reused? own))
+  (let [id (:workflow/invocation-id wf)
+        own (filter (comp zero? :workflow/depth) events)
+        runs (remove engine/reused? own)
+        started-at (:workflow/state-changed-at (first (filter engine/started? runs)))
+        attempts (count (filter engine/started? runs))
+        reuses (count (filter engine/reused? own))
         duration (run-duration (map vector (range) own) :last-attempt)
         now (System/currentTimeMillis)]
     (ui/summary-card
-     {:state (:state wf)
-      :head [(when (:expired wf) [:span.chip.wf-expired "Expired"])
+     {:state (:workflow/state wf)
+      :head [(when (engine/expired? wf) [:span.chip.wf-expired "Expired"])
              (when duration [:span.wf-summary-duration duration])
              (when (can-restart? wf)
                (ui/panel-toggle-btn
@@ -327,14 +325,14 @@
               ["Invocation " (ui/workflow-id requested-id)
                " was restarted - showing the workflow's current invocation."])}
      (ui/fact "Id" (ui/workflow-link id))
-     (ui/fact "Parent" (if-let [parent-id (:parent_invocation_id wf)]
+     (ui/fact "Parent" (if-let [parent-id (:workflow/parent-invocation-id wf)]
                          (ui/workflow-link parent-id)
                          "\u2014 (top level)"))
      (ui/fact "Started" (ui/timestamp-with-relative started-at now))
-     (ui/fact (if (= "STARTED" (:state wf)) "Last change" "Finished")
-              (ui/timestamp-with-relative (:state_changed_at wf) now))
-     (when (and (= "STARTED" (:state wf)) (:expires_at wf))
-       (let [left (- (:expires_at wf) now)]
+     (ui/fact (if (engine/started? wf) "Last change" "Finished")
+              (ui/timestamp-with-relative (:workflow/state-changed-at wf) now))
+     (when (and (engine/started? wf) (:workflow/expires-at wf))
+       (let [left (- (:workflow/expires-at wf) now)]
          (ui/fact "Lease"
                   (if (pos? left)
                     (str "expires in " (ui/format-duration left))
@@ -345,10 +343,10 @@
 (defn- ancestors-of
   "The workflows wf runs nested under, top-level first."
   [wf]
-  (loop [parent-id (:parent_invocation_id wf) acc ()]
+  (loop [parent-id (:workflow/parent-invocation-id wf) acc ()]
     (if-let [parent (when (and parent-id (< (count acc) 100))
                       (engine/get-invocation parent-id))]
-      (recur (:parent_invocation_id parent) (cons parent acc))
+      (recur (:workflow/parent-invocation-id parent) (cons parent acc))
       acc)))
 
 (def ^:private expand-all-js
@@ -360,24 +358,24 @@
    failed restart's message to show. theme is the colour theme map."
   [theme requested-id restart-error]
   (when-let [wf (engine/get-invocation requested-id)]
-    (let [id (:invocation_id wf)
+    (let [id (:workflow/invocation-id wf)
           events (engine/full-timeline id)
           ancestors (ancestors-of wf)]
-      (ui/layout (:wf_def wf)
+      (ui/layout (:workflow/name wf)
               {:theme theme
                :back [(ui/uri) "Workflows"]
-               :tab-title (str (ui/state-symbol (:state wf)) " " (:wf_def wf) " \u00B7 " id)}
+               :tab-title (str (ui/state-symbol (:workflow/state wf)) " " (:workflow/name wf) " \u00B7 " id)}
               [:div
                (when (seq ancestors)
                  (ui/breadcrumb (concat (for [a ancestors]
-                                          [[:span (ui/workflow-name (:wf_def a)) " " (ui/workflow-id (:invocation_id a))]
-                                           (ui/uri :workflows (:invocation_id a))])
-                                        [[[:span (ui/workflow-name (:wf_def wf)) " " (ui/workflow-id id)] nil]])))
+                                          [[:span (ui/workflow-name (:workflow/name a)) " " (ui/workflow-id (:workflow/invocation-id a))]
+                                           (ui/uri :workflows (:workflow/invocation-id a))])
+                                        [[[:span (ui/workflow-name (:workflow/name wf)) " " (ui/workflow-id id)] nil]])))
                (workflow-summary wf requested-id events restart-error)
                [:div.panels
-                (params-html (:params wf))
+                (params-html (:workflow/params wf))
                 (result-panel wf)
-                (when (:metadata wf) (metadata-html (:metadata wf)))]
+                (when (:workflow/metadata wf) (metadata-html (:workflow/metadata wf)))]
                [:div.page-head
                 [:h2 "Timeline"]
                 (when (seq events)

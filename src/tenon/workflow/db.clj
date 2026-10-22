@@ -11,6 +11,11 @@
    running it. Every history row carries the parent_invocation_id it was
    recorded under - for REUSED rows, the reusing caller's.
 
+   Rows returned by the methods below are maps whose keys are the column
+   names in kebab-case, qualified with :workflow - e.g. :workflow/name,
+   :workflow/invocation-id, :workflow/state-changed-at. Arguments and filter
+   maps use plain keys, as before.
+
    Timestamps are UTC milliseconds since the epoch, supplied by the
    storage's own clock - never the JVM's, so they can be compared without
    mixing in a second clock.")
@@ -53,8 +58,8 @@
   (get-workflow [this invocation-id]
     "The workflow row invocation-id belongs to, or nil. invocation-id may
      also be an earlier invocation_id of a since restarted workflow - its
-     current row is returned then, whose invocation_id differs. The row
-     also carries expired: true if its lease has run out (by the storage's
+     current row is returned then, whose :workflow/invocation-id differs. The
+     row also carries :workflow/expired true if its lease has run out (by the storage's
      clock), so time-out! would succeed.")
 
   (find-by-wf-def-and-params [this wf-def params-edn-str])
@@ -65,9 +70,10 @@
     "One row per call of a workflow fn, newest first: a workflow's first
      start (restarts are not new calls), plus one for each later call that
      reused its stored result. Each row is the called workflow's row
-     (every column but idempotence_key), except that parent_invocation_id
-     is the caller's, plus call_id (identifies the call), created_at (when
-     the call happened) and reused (true for a reuse). filters is an
+     (every column but idempotence_key), except that
+     :workflow/parent-invocation-id is the caller's, plus :workflow/call-id
+     (identifies the call), :workflow/created-at (when the call happened)
+     and :workflow/reused (true for a reuse). filters is an
      optional map of {:state s :wf-def w :top-level-only? t :limit n
      :before call-id}.
 
@@ -79,7 +85,7 @@
 
      :limit caps the number of rows returned - pagination is seek-based,
      not OFFSET-based (which gets slower, and can skip/repeat rows under
-     concurrent writes, as the offset grows): pass the call_id of the
+     concurrent writes, as the offset grows): pass the :workflow/call-id of the
      last row of the previous page as :before to fetch the rows
      immediately after it. Callers asking for n rows and wanting to know
      whether a further page exists should request :limit (inc n) and check
@@ -95,12 +101,12 @@
     "Every state (from workflow_history, the current one included) of
      the workflow invocation-id belongs to and of every workflow nested
      under any of its invocations at any depth, interleaved into a single
-     chronological sequence. Each row carries invocation_id (the
-     invocation it was recorded under), current_invocation_id,
-     parent_invocation_id (the caller's invocation - for REUSED, the
-     reusing one's; nil at the top level), wf_def, state,
-     state_changed_at, data (metadata for STARTED and REUSED, the result
-     otherwise) and depth (0 for the workflow itself, 1 for a direct
+     chronological sequence. Each row carries :workflow/invocation-id (the
+     invocation it was recorded under), :workflow/current-invocation-id,
+     :workflow/parent-invocation-id (the caller's invocation - for REUSED, the
+     reusing one's; nil at the top level), :workflow/name,
+     :workflow/state, :workflow/state-changed-at, :workflow/data (metadata
+     for STARTED and REUSED, the result otherwise) and :workflow/depth (0 for the workflow itself, 1 for a direct
      sub-workflow, and so on). A workflow whose result an invocation reused
      didn't run under it, so it isn't part of the tree: only the REUSED
      row is, a level below the reusing invocation. The workflow's own

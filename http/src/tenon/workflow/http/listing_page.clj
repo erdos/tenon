@@ -9,21 +9,21 @@
 (defn- call-duration
   "How long the call ran - from its first start to its outcome, or while
    still STARTED, for how long it has been running. A reuse didn't run."
-  [{:keys [created_at state_changed_at] :as row} now]
+  [{:workflow/keys [created-at state-changed-at] :as row} now]
   (case (ui/effective-state row)
     "REUSED" (ui/muted "—")
-    "STARTED" (let [d (ui/format-duration (- now created_at))]
+    "STARTED" (let [d (ui/format-duration (- now created-at))]
                 [:span {:title (str "running for " d)} "running " d])
-    (ui/format-duration (- state_changed_at created_at))))
+    (ui/format-duration (- state-changed-at created-at))))
 
 (defn- call-state
   "The state chip - Reused for a call that got a stored result instead of
    running - flagged when a STARTED workflow's lease has run out."
-  [{:keys [expires_at] :as row} now]
+  [{:workflow/keys [expires-at] :as row} now]
   (let [state (ui/effective-state row)]
     (list (ui/state state)
-          (when (and (= "STARTED" state) expires_at (< expires_at now))
-            [:span.wf-expired {:title (str "lease expired " (ui/format-duration (- now expires_at)) " ago")}
+          (when (and (= "STARTED" state) expires-at (< expires-at now))
+            [:span.wf-expired {:title (str "lease expired " (ui/format-duration (- now expires-at)) " ago")}
              " lease expired"]))))
 
 (defn- workflows-table [rows show-all? now footer]
@@ -33,15 +33,15 @@
      [:thead [:tr [:th "Timestamp"] [:th "Id"] [:th "Workflow"] (when show-all? [:th "Parent"])
               [:th "Duration"] [:th.state "State"]]]
      [:tbody
-      (for [{:keys [invocation_id wf_def created_at parent_invocation_id] :as row} rows
-            :let [href (ui/uri :workflows invocation_id)]]
+      (for [{wf-name :workflow/name :workflow/keys [invocation-id created-at parent-invocation-id] :as row} rows
+            :let [href (ui/uri :workflows invocation-id)]]
         [:tr {:class (str "state-" (ui/effective-state row))}
-         [:td [:a {:href href} (ui/timestamp created_at)]]
-         [:td (ui/workflow-link invocation_id)]
-         [:td [:a {:href href} (ui/workflow-name wf_def)]]
+         [:td [:a {:href href} (ui/timestamp created-at)]]
+         [:td (ui/workflow-link invocation-id)]
+         [:td [:a {:href href} (ui/workflow-name wf-name)]]
          (when show-all?
-           [:td (if parent_invocation_id
-                  (ui/workflow-link parent_invocation_id)
+           [:td (if parent-invocation-id
+                  (ui/workflow-link parent-invocation-id)
                   [:a {:href href} (ui/muted "—")])])
          [:td.duration [:a {:href href} (call-duration row now)]]
          [:td.state [:a {:href href} (call-state row now)]]])]
@@ -98,7 +98,7 @@
                                        :limit page-size :before before})
         has-more? (> (count rows) page-size)
         page-rows (vec (take page-size rows))
-        next-cursor (when has-more? (:call_id (last page-rows)))]
+        next-cursor (when has-more? (:workflow/call-id (last page-rows)))]
     (ui/layout "Workflows"
                {:refresh (when refresh? refresh-seconds)}
                [:div

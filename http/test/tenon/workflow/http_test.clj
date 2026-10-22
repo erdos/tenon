@@ -474,7 +474,7 @@
   (engine/register! #'http-flaky-fn http-flaky-fn)
   (is (thrown? clojure.lang.ExceptionInfo
         (engine/run-invocation #'http-flaky-fn http-flaky-fn [])))
-  (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn"))))
+  (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-flaky-fn"))))
 
 (deftest workflow-detail-page-shows-restart-button-when-restartable-test
   (let [id (flaky-invocation!)]
@@ -493,7 +493,7 @@
         state (-> (visit (href id))
                   (k/press "Restart")
                   (has (status? 303)))
-        current (:invocation_id (engine/get-invocation id))]
+        current (:workflow/invocation-id (engine/get-invocation id))]
     (is (not= id current) "restarted under a new invocation id")
     (is (= (href current) (get-in state [:response :headers "Location"])))
     (-> state
@@ -533,7 +533,7 @@
                     (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
                     (k/press "Restart")
                     (has (status? 303)))
-          current (:invocation_id (engine/get-invocation id))]
+          current (:workflow/invocation-id (engine/get-invocation id))]
       (is (not= id current))
       (-> state
           k/follow-redirect
@@ -808,11 +808,11 @@
   (is (thrown? clojure.lang.ExceptionInfo
         (engine/run-invocation #'http-recursive-outer http-recursive-outer [])))
   (engine/register! #'http-recursive-inner (fn [] :ok))
-  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-recursive-outer")))
+  (let [id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-recursive-outer")))
         state (-> (visit (href id))
                   (k/press "Restart recursively")
                   (has (status? 303)))
-        current (:invocation_id (engine/get-invocation id))]
+        current (:workflow/invocation-id (engine/get-invocation id))]
     (is (not= id current))
     (-> state
         k/follow-redirect

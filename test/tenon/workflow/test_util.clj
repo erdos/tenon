@@ -1,5 +1,6 @@
 (ns tenon.workflow.test-util
-  (:require [next.jdbc :as jdbc]
+  (:require [clojure.string :as str]
+            [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]))
@@ -19,7 +20,8 @@
 (defn history
   "Every state - the current one included - of the workflow invocation-id
    belongs to, oldest first, straight from the event table (by a plain scan,
-   not the per-workflow event list the library walks). Test-only - the
+   not the per-workflow event list the library walks), keyed like
+   full-timeline's rows. Test-only - the
    library reads it only as part of db/full-timeline."
   [ds invocation-id]
   (jdbc/execute! ds ["SELECT e.id, coalesce(e.invocation_id, e.id) AS invocation_id,
@@ -31,25 +33,28 @@
                        WHERE e.workflow_id = (SELECT workflow_id FROM event WHERE id = ?)
                        ORDER BY e.id"
                      invocation-id]
-                 {:builder-fn rs/as-unqualified-lower-maps}))
+                 {:builder-fn (fn [rs opts]
+                                (rs/as-modified-maps rs (assoc opts
+                                                               :label-fn #(str/replace (str/lower-case %) \_ \-)
+                                                               :qualifier-fn (constantly "workflow"))))}))
 
 (defn timeline
   "The states of the workflow invocation-id belongs to - not those of its
    sub-workflows - oldest first, via the public tenon.workflow/full-timeline."
   [invocation-id]
-  (filterv #(zero? (:depth %)) (engine/full-timeline invocation-id)))
+  (filterv #(zero? (:workflow/depth %)) (engine/full-timeline invocation-id)))
 
 (defn find-by-wf-def
   "Workflows (of any nesting) whose wf_def is exactly wf-def, newest
    first, via the public tenon.workflow/list-invocations - reuses left out."
   [wf-def]
-  (remove :reused (engine/list-invocations {:wf-def wf-def :top-level-only? false})))
+  (remove :workflow/reused (engine/list-invocations {:wf-def wf-def :top-level-only? false})))
 
 (defn find-by-wf-def-and-params
   "The workflow run with exactly this wf-def and params (an edn string), or
    nil."
   [wf-def params]
-  (first (filter #(= params (:params %)) (find-by-wf-def wf-def))))
+  (first (filter #(= params (:workflow/params %)) (find-by-wf-def wf-def))))
 
 (defn insert!
   "Inserts a STARTED workflow row for tests setting up a workflow's history,

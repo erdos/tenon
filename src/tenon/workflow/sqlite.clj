@@ -120,7 +120,7 @@
     END"
    ;; A workflow's current state, all fields: the pointers resolved.
    "CREATE VIEW IF NOT EXISTS workflow_state AS
-    SELECT w.id AS workflow_id, w.invocation_id, d.name AS wf_def, f.params, f.parent_invocation_id,
+    SELECT w.id AS workflow_id, w.invocation_id, d.name, f.params, f.parent_invocation_id,
            w.state, s.at AS state_changed_at, s.expires_at, i.data AS metadata,
            iif(w.state = 'STARTED', NULL, s.data) AS result
       FROM workflow w
@@ -150,15 +150,25 @@
 
 (def ^:private state-columns
   "The columns of a workflow_state row (aliased s) returned by Storage."
-  "s.invocation_id, s.wf_def, s.params, s.parent_invocation_id, s.state,
+  "s.invocation_id, s.name, s.params, s.parent_invocation_id, s.state,
    s.state_changed_at, s.expires_at, s.metadata, s.result")
 
-(def ^:private opts {:builder-fn rs/as-unqualified-lower-maps})
+(def ^:private plain-opts
+  "Rows keyed by their lower-case column labels, as in the SQL."
+  {:builder-fn rs/as-unqualified-lower-maps})
+
+(def ^:private opts
+  "Rows of Storage methods: column labels become kebab-case keywords
+   qualified with :workflow, e.g. state_changed_at -> :workflow/state-changed-at."
+  {:builder-fn (fn [rs opts]
+                 (rs/as-modified-maps rs (assoc opts
+                                                :label-fn #(str/replace (str/lower-case %) \_ \-)
+                                                :qualifier-fn (constantly "workflow"))))})
 
 (defn- write!
   "Runs a write statement, returning its first row (RETURNING) if any."
   [ds sql-params]
-  (pool/write! ds #(jdbc/execute-one! % sql-params opts)))
+  (pool/write! ds #(jdbc/execute-one! % sql-params plain-opts)))
 
 (defn- finish!
   "Appends a state-ended event for invocation-id - if it is still the
@@ -176,7 +186,7 @@
 
 (def ^:private call-columns
   (str "c.id AS call_id, c.at AS created_at, c.parent_invocation_id, c.state = 'REUSED' AS reused, "
-       "s.invocation_id, s.wf_def, s.params, s.state, s.state_changed_at, s.expires_at, s.metadata, s.result"))
+       "s.invocation_id, s.name, s.params, s.state, s.state_changed_at, s.expires_at, s.metadata, s.result"))
 
 (defn- calls-sql
   "SQL and params for top-level-workflows. Calls are found
@@ -309,7 +319,7 @@
                                             WHERE i.id = ? AND i.state = 'STARTED'")
                                      invocation-id]
                                opts)
-            (update :expired pos?)))
+            (update :workflow/expired pos?)))
 
   (find-by-wf-def-and-params [this wf-def params-edn-str]
     (jdbc/execute-one! this [(str "SELECT " state-columns "
@@ -324,12 +334,12 @@
      (db/top-level-workflows this nil))
     ([this filters]
      (let [[sql params] (calls-sql filters)]
-       (mapv #(update % :reused pos?) (jdbc/execute! this (into [sql] params) opts)))))
+       (mapv #(update % :workflow/reused pos?) (jdbc/execute! this (into [sql] params) opts)))))
 
   (top-level-wf-defs [this top-level-only?]
     (mapv :name (jdbc/execute! this ["SELECT name FROM wf_def WHERE top_level OR NOT ? ORDER BY name"
                                      (boolean top-level-only?)]
-                               opts)))
+                               plain-opts)))
 
   (full-timeline [this invocation-id]
     ;; The tree is found by walking call lists: the root's calls, and the
@@ -378,7 +388,7 @@
           )
         SELECT coalesce(e.invocation_id, e.id) AS invocation_id, w.invocation_id AS current_invocation_id,
                iif(e.state = 'REUSED', e.parent_invocation_id, f.parent_invocation_id) AS parent_invocation_id,
-               d.name AS wf_def, e.state, e.at AS state_changed_at, e.data, x.depth
+               d.name, e.state, e.at AS state_changed_at, e.data, x.depth
           FROM entry x
           CROSS JOIN event e ON e.id = x.id
           CROSS JOIN workflow w ON w.id = e.workflow_id

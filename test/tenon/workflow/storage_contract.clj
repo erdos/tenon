@@ -13,37 +13,37 @@
 
 (def workflow-shape
   "find-by-wf-def-and-params rows."
-  {:invocation_id        int?
-   :wf_def               string?
-   :params               string?
-   :parent_invocation_id (nilable int?)
-   :state                run-state?
-   :state_changed_at     int?
-   :expires_at           (nilable int?)
-   :metadata             (nilable string?)
-   :result               (nilable string?)})
+  {:workflow/invocation-id        int?
+   :workflow/name               string?
+   :workflow/params               string?
+   :workflow/parent-invocation-id (nilable int?)
+   :workflow/state                run-state?
+   :workflow/state-changed-at     int?
+   :workflow/expires-at           (nilable int?)
+   :workflow/metadata             (nilable string?)
+   :workflow/result               (nilable string?)})
 
 (def get-workflow-shape
   "get-workflow rows."
-  (assoc workflow-shape :expired boolean?))
+  (assoc workflow-shape :workflow/expired boolean?))
 
 (def call-shape
   "top-level-workflows rows."
   (assoc workflow-shape
-         :call_id    int?
-         :created_at int?
-         :reused     boolean?))
+         :workflow/call-id    int?
+         :workflow/created-at int?
+         :workflow/reused     boolean?))
 
 (def timeline-shape
   "full-timeline rows."
-  {:invocation_id         int?
-   :current_invocation_id int?
-   :parent_invocation_id  (nilable int?)
-   :wf_def                string?
-   :state                 #{"STARTED" "DONE" "ERROR" "REUSED"}
-   :state_changed_at      int?
-   :data                  (nilable string?)
-   :depth                 nat-int?})
+  {:workflow/invocation-id         int?
+   :workflow/current-invocation-id int?
+   :workflow/parent-invocation-id  (nilable int?)
+   :workflow/name                string?
+   :workflow/state                 #{"STARTED" "DONE" "ERROR" "REUSED"}
+   :workflow/state-changed-at      int?
+   :workflow/data                  (nilable string?)
+   :workflow/depth                 nat-int?})
 
 (defn- check-shape [shape row]
   (is (map? row) (str "a map, not " (pr-str row)))
@@ -82,7 +82,7 @@
     (let [expired (db/get-workflow storage expiring)]
       (testing "get-workflow of an expired lease"
         (check-shape get-workflow-shape expired)
-        (is (true? (:expired expired)) "expired")))
+        (is (true? (:workflow/expired expired)) "expired")))
     (testing "time-out! returns whether it timed the invocation out"
       (is (false? (db/time-out! storage root "{:message \"timed out\"}")))
       (is (true? (db/time-out! storage expiring "{:message \"timed out\"}"))))
@@ -108,14 +108,14 @@
       (doseq [filters [nil {} {:state "STARTED"} {:state "ERROR"} {:state "ERROR" :top-level-only? false}
                        {:state "DONE" :top-level-only? false} {:wf-def "contract/child"}
                        {:wf-def "contract/child" :top-level-only? false} {:limit 1}
-                       {:before (:call_id (first calls)) :top-level-only? false}]]
+                       {:before (:workflow/call-id (first calls)) :top-level-only? false}]]
         (testing (str "top-level-workflows " filters)
           (let [rows (if (nil? filters) (db/top-level-workflows storage) (db/top-level-workflows storage filters))]
             (is (seq rows))
             (doseq [row rows] (check-shape call-shape row)))))
       (testing "filtering by ERROR only matches workflows whose latest run is in ERROR"
         (is (= ["contract/expiring"]
-               (mapv :wf_def (db/top-level-workflows storage {:state "ERROR" :top-level-only? false}))))))
+               (mapv :workflow/name (db/top-level-workflows storage {:state "ERROR" :top-level-only? false}))))))
 
     (check-rows "full-timeline" timeline-shape (db/full-timeline storage root))
 

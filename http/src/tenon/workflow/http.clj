@@ -11,9 +11,9 @@
 
 (defn- workflow->response [wf]
   (try
-    {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params (edn/read-string (:params wf))}
+    {:invocation_id (:workflow/invocation-id wf) :wf_def (:workflow/name wf) :params (edn/read-string (:workflow/params wf))}
     (catch Throwable _
-      {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params_raw (:params wf)})))
+      {:invocation_id (:workflow/invocation-id wf) :wf_def (:workflow/name wf) :params_raw (:workflow/params wf)})))
 
 (defn- restart!
   "Restarts workflow id from the detail page's restart form - along with
@@ -27,7 +27,7 @@
                   (engine/restart-invocation id))
                 nil
                 (catch Throwable e (or (ex-message e) (str (class e)))))
-        current (or (:invocation_id (some-> id engine/get-invocation)) id)]
+        current (or (some-> id engine/get-invocation :workflow/invocation-id) id)]
     (response/redirect (ui/uri :workflows current {:restart_error error}) :see-other)))
 
 (defn- pending! []
