@@ -16,12 +16,15 @@
       {:invocation_id (:invocation_id wf) :wf_def (:wf_def wf) :params_raw (:params wf)})))
 
 (defn- restart!
-  "Restarts workflow id from the detail page's restart form, then redirects
-   (303) back to the page - with the failure as a restart_error query
-   param if it failed, which the page shows."
-  [id]
+  "Restarts workflow id from the detail page's restart form - along with
+   its failed nested workflows if recursive? - then redirects (303) back to
+   the page - with the failure as a restart_error query param if it failed,
+   which the page shows."
+  [id recursive?]
   (let [error (try
-                (engine/restart-invocation id)
+                (if recursive?
+                  (engine/restart-invocation-recursively id)
+                  (engine/restart-invocation id))
                 nil
                 (catch Throwable e (or (ex-message e) (str (class e)))))
         current (or (:invocation_id (some-> id engine/get-invocation)) id)]
@@ -57,7 +60,7 @@
       (or (cond
             (and get? (= uri "/")) (html-response (listing-page/html query-params))
             (and get? (= uri "/workflows/pending")) (pending!)
-            (and id restart (= :post request-method)) (restart! id)
+            (and id restart (= :post request-method)) (restart! id (= "true" (get query-params "recursive")))
             (and id get? (not restart)) (some-> (details-page/html nil id (not-empty (get query-params "restart_error")))
                                                 html-response))
           (response/not-found {:error "not found"})))))

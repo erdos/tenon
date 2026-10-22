@@ -348,6 +348,25 @@
              (execute-and-record! engine new-invocation-id (:wf_def wf) impl args))
          (throw (not-restartable (:state (db/get-workflow ds (:invocation_id wf))))))))))
 
+(defn restart-invocation-recursively
+  ([invocation-id]
+   (restart-invocation-recursively *workflow-engine* invocation-id))
+  ([{ds :tenon/db :as engine} invocation-id]
+   ;; A failed workflow stopped at its first failing call, so at most one
+   ;; callee - a reused one included - is failed, and only one path of the
+   ;; hierarchy leads to it.
+   (some->> (db/full-timeline ds invocation-id)
+            (filter (comp #{1} :depth))
+            (map :current_invocation_id)
+            distinct
+            (map (partial db/get-workflow ds))
+            (some (fn [callee-wf]
+                    (when (or (= "ERROR" (:state callee-wf))
+                              (time-out-if-expired! engine callee-wf))
+                      (:invocation_id callee-wf))))
+            (restart-invocation-recursively engine))
+   (restart-invocation engine invocation-id)))
+
 
 (defn workflow
   "Tag reader for #workflow to be placed in front of (defn) forms.

@@ -114,7 +114,7 @@ details.panel-toggle[open]>summary{background:var(--bg-active)}
 .panel-toggle-panel{position:absolute;right:0;top:calc(100% + 6px);z-index:1;width:max-content;max-width:22em;
                     padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;
                     box-shadow:0 4px 12px var(--shadow)}
-form.restart{display:flex;flex-direction:column;gap:8px;margin:0}
+div.restart{display:flex;flex-direction:column;gap:8px}
 
 /* Details: breadcrumb */
 nav.breadcrumb{margin:-.5em 0 1em;font-size:.9em;color:var(--text-dim);display:flex;flex-wrap:wrap;gap:.4em;align-items:center}

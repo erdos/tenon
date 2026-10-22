@@ -480,16 +480,18 @@
   (let [id (flaky-invocation!)]
     (-> (visit (href id))
         (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
-        (has (attr? [:details.panel-toggle :form.restart] :action (str (href id) "/restart")))
-        (has (attr? [:form.restart] :method "post"))
-        (has (texts? [:form.restart [:button (enlive/attr= :type "submit")]] ["Yes, restart"]))
+        (has (attrs? [:details.panel-toggle :form.restart] :action
+                     [(str (href id) "/restart") (str (href id) "/restart?recursive=true")]))
+        (has (attrs? [:form.restart] :method ["post" "post"]))
+        (has (texts? [:form.restart [:button (enlive/attr= :type "submit")]]
+                     ["Restart" "Restart recursively"]))
         (has (missing? [:details.panel-toggle :script]) "the restart popover needs no script"))))
 
 (deftest restart-form-redirects-back-to-the-detail-page-test
   (let [id (flaky-invocation!)
         _ (engine/register! #'http-flaky-fn (fn [] :ok))
         state (-> (visit (href id))
-                  (k/press "Yes, restart")
+                  (k/press "Restart")
                   (has (status? 303)))
         current (:invocation_id (engine/get-invocation id))]
     (is (not= id current) "restarted under a new invocation id")
@@ -529,7 +531,7 @@
                     (has (texts? [:div.wf-summary-head :span.chip] ["Started" "Expired"]))
                     (has (missing? [:span.chip.wf-unregistered]))
                     (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
-                    (k/press "Yes, restart")
+                    (k/press "Restart")
                     (has (status? 303)))
           current (:invocation_id (engine/get-invocation id))]
       (is (not= id current))
@@ -794,3 +796,24 @@
         (within [:ul.tree :li.state-REUSED.tree-meta]
           (has (texts? [:summary :span.tree-verb] ["Invoked"]))
           (has (texts? [:details :> :div.event-error-body :pre] ["\"abc\""]))))))
+
+(defn- http-recursive-inner []
+  (throw (ex-info "inner down" {})))
+(defn- http-recursive-outer []
+  (engine/run-invocation #'http-recursive-inner (engine/raw-fn #'http-recursive-inner) []))
+
+(deftest restart-recursively-form-restarts-failed-nested-workflow-test
+  (engine/register! #'http-recursive-inner http-recursive-inner)
+  (engine/register! #'http-recursive-outer http-recursive-outer)
+  (is (thrown? clojure.lang.ExceptionInfo
+        (engine/run-invocation #'http-recursive-outer http-recursive-outer [])))
+  (engine/register! #'http-recursive-inner (fn [] :ok))
+  (let [id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.http-test/http-recursive-outer")))
+        state (-> (visit (href id))
+                  (k/press "Restart recursively")
+                  (has (status? 303)))
+        current (:invocation_id (engine/get-invocation id))]
+    (is (not= id current))
+    (-> state
+        k/follow-redirect
+        (has (attr? [:section.wf-summary] :class "wf-summary state-DONE")))))

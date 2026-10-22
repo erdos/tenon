@@ -6,6 +6,7 @@
             [next.jdbc :as jdbc]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]
+            [tenon.workflow.fixtures :as fixtures]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
 (def ^:private ^:dynamic *emitted-events* nil)
@@ -548,3 +549,77 @@
     (is (thrown-match? clojure.lang.ExceptionInfo
                        {:type ::engine/cycle-detected}
                        (step-a 2)))))
+
+#workflow
+(defn recursive-inner [n]
+  (throw (ex-info "inner down" {:n n})))
+
+#workflow
+(defn recursive-middle [n]
+  (inc (recursive-inner n)))
+
+#workflow
+(defn recursive-outer [n]
+  (inc (recursive-middle n)))
+
+(deftest restart-invocation-recursively-restarts-failed-nested-workflows-test
+  (is (thrown? Exception (recursive-outer 5)))
+  (let [outer (first (test-util/find-by-wf-def "tenon.workflow-test/recursive-outer"))]
+    (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/previous-failure}
+                       (engine/restart-invocation (:invocation_id outer)))
+        "a plain restart trips over the cached failure")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"inner down"
+                          (engine/restart-invocation-recursively (:invocation_id outer)))
+        "a nested workflow failing again aborts the restart with its own failure")
+    (engine/register! #'recursive-inner (fn [n] (* n 2)))
+    (is (= 12 (engine/restart-invocation-recursively (:invocation_id outer))))
+    (is (every? #(= "DONE" (:state (first (test-util/find-by-wf-def %))))
+                ["tenon.workflow-test/recursive-outer"
+                 "tenon.workflow-test/recursive-middle"
+                 "tenon.workflow-test/recursive-inner"]))))
+
+(deftest restart-invocation-recursively-leaves-done-nested-workflows-test
+  (fixtures/nested-parent 2)
+  (let [parent (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-parent"))
+        child-id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-child")))]
+    (is (= 5 (engine/restart-invocation-recursively (:invocation_id parent))))
+    (is (= child-id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/nested-child"))))
+        "the done child keeps its invocation")))
+
+#workflow
+(defn fan-out-first []
+  (throw (ex-info "first down" {})))
+
+#workflow
+(defn fan-out-second []
+  (throw (ex-info "second down" {})))
+
+#workflow
+(defn fan-out-parent []
+  [(fan-out-first) (fan-out-second)])
+
+(defn- started-count [wf-def]
+  (->> (test-util/find-by-wf-def wf-def)
+       first
+       :invocation_id
+       test-util/timeline
+       (filter (comp #{"STARTED"} :state))
+       count))
+
+(deftest restart-invocation-recursively-restarts-one-failed-callee-at-a-time-test
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"first down" (fan-out-parent)))
+  (let [parent-id (:invocation_id (first (test-util/find-by-wf-def "tenon.workflow-test/fan-out-parent")))]
+    (engine/register! #'fan-out-first (fn [] :first-ok))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"second down"
+                          (engine/restart-invocation-recursively parent-id))
+        "the first callee recovers, the second one - not called before - fails")
+    (engine/register! #'fan-out-second (fn [] :second-ok))
+    (is (= [:first-ok :second-ok] (engine/restart-invocation-recursively parent-id)))
+    (is (= ["DONE" "DONE" "DONE"]
+           (map #(:state (first (test-util/find-by-wf-def %)))
+                ["tenon.workflow-test/fan-out-parent"
+                 "tenon.workflow-test/fan-out-first"
+                 "tenon.workflow-test/fan-out-second"])))
+    (is (= 2 (started-count "tenon.workflow-test/fan-out-first")) "one failed, one succeeded run")
+    (is (= 2 (started-count "tenon.workflow-test/fan-out-second")) "one failed, one succeeded run")
+    (is (= 3 (started-count "tenon.workflow-test/fan-out-parent")))))

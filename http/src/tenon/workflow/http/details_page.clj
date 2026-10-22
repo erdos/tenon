@@ -307,16 +307,21 @@
      {:state (:state wf)
       :head [(when (:expired wf) [:span.chip.wf-expired "Expired"])
              (when duration [:span.wf-summary-duration duration])
-             (if (can-restart? wf)
+             (when (can-restart? wf)
                (ui/panel-toggle-btn
                 [:button "\u21BB Restart"]
-                [:form.restart {:method "post" :action (ui/uri :workflows id :restart)}
-                 [:span "Run it again with the same params, under a new invocation id?"]
-                 [:button.btn.danger {:type "submit"} "Yes, restart"]])
-               ;; When wf_def is not registered in this process, show a warning
-               ;; badge so operators know why the Restart button is missing.
-               (when (unregistered? wf)
-                 [:span.chip.wf-unregistered "Unregistered var \u2014 cannot restart in this process"]))]
+                [:div.restart
+                 [:span "Run it again with the same params, under a new invocation id? Recursively also restarts its failed nested workflows, innermost first."]
+                 [:form.restart {:method "post" :action (ui/uri :workflows id :restart)}
+                  [:button.btn.danger {:type "submit"} "Restart"]]
+                 [:form.restart {:method "post" :action (ui/uri :workflows id :restart {:recursive true})}
+                  [:button.btn.danger {:type "submit"
+                                       :title "Restarts failed nested workflows first, innermost first"}
+                   "Restart recursively"]]]))
+             ;; When wf_def is not registered in this process, show a warning
+             ;; badge so operators know why the Restart buttons are missing.
+             (when (unregistered? wf)
+               [:span.chip.wf-unregistered "Unregistered var \u2014 cannot restart in this process"])]
       :error (when restart-error ["Restart failed: " restart-error])
       :note (when (not= requested-id id)
               ["Invocation " (ui/workflow-id requested-id)
