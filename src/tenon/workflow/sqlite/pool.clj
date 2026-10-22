@@ -7,7 +7,7 @@
            [java.sql Connection DriverManager PreparedStatement ResultSet]
            [java.util HashMap Map]
            [java.util.concurrent CompletableFuture ConcurrentLinkedQueue ExecutionException
-            LinkedBlockingQueue Semaphore]
+            LinkedBlockingDeque Semaphore]
            [java.util.concurrent.locks ReentrantLock]
            [java.util.concurrent.atomic AtomicBoolean]))
 
@@ -64,7 +64,7 @@
          ~sym (borrow pool#)]
      (try ~@body (finally (give-back pool# ~sym)))))
 
-(deftype Pool [^String url ^LinkedBlockingQueue idle ^Semaphore permits ^AtomicBoolean closed
+(deftype Pool [^String url ^LinkedBlockingDeque idle ^Semaphore permits ^AtomicBoolean closed
                ^ReentrantLock write-lock ^ConcurrentLinkedQueue writes]
   p/Executable
   (-execute [_ _ _]
@@ -85,7 +85,7 @@
         (recur)))))
 
 (defn open ^Pool [url size]
-  (Pool. url (LinkedBlockingQueue.) (Semaphore. size) (AtomicBoolean. false) (ReentrantLock.)
+  (Pool. url (LinkedBlockingDeque.) (Semaphore. size) (AtomicBoolean. false) (ReentrantLock.)
          (ConcurrentLinkedQueue.)))
 
 (defn- run-each
@@ -149,7 +149,7 @@
     (throw (IllegalStateException. "pool is closed"))))
 
 (defn- idle-conn ^Conn [^Pool pool]
-  (when-let [^Conn c (.poll ^LinkedBlockingQueue (.-idle pool))]
+  (when-let [^Conn c (.pollFirst ^LinkedBlockingDeque (.-idle pool))]
     (if (.isClosed ^Connection (.-conn c))
       (recur pool)
       c)))
@@ -168,8 +168,8 @@
 (defn- give-back [^Pool pool ^Conn c]
   (if (or (.isClosed ^Connection (.-conn c)) (.get ^AtomicBoolean (.-closed pool)))
     (discard c)
-    (do (.offer ^LinkedBlockingQueue (.-idle pool) c)
+    (do (.offerFirst ^LinkedBlockingDeque (.-idle pool) c)
         ;; closed meanwhile: do not leave it behind
         (when (.get ^AtomicBoolean (.-closed pool))
-          (some-> (.poll ^LinkedBlockingQueue (.-idle pool)) discard))))
+          (some-> (.pollFirst ^LinkedBlockingDeque (.-idle pool)) discard))))
   (.release ^Semaphore (.-permits pool)))
