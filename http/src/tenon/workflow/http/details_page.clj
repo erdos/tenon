@@ -33,9 +33,9 @@
 (defmethod result-panel "DONE" [wf]
   (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:workflow/result wf))))
 
-(defmethod result-panel "ERROR" [wf]
+(defn- failure-panel [title wf]
   (let [error (ui/read-edn (:workflow/result wf))]
-    (ui/panel {:title "Error"}
+    (ui/panel {:title title}
               (if (map? error)
                 (let [{:keys [type message data]} (first (:via error))
                       class (or (:class error) type)
@@ -44,6 +44,10 @@
                   (ui/error-details class msg
                                     (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])))
                 (ui/edn-block (:workflow/result wf))))))
+
+(defmethod result-panel "ERROR" [wf] (failure-panel "Error" wf))
+
+(defmethod result-panel "TIMEOUT" [wf] (failure-panel "Timeout" wf))
 
 (defmethod result-panel :default [_]
   (ui/panel {:title "Result"}
@@ -73,12 +77,15 @@
             {} indexed)))
 
 
-(defn- run-state
-  "The outcome of a node's run - its latest state other than REUSED (a
-   reuse doesn't change it). A node with nothing but REUSED rows is a reuse
-   within the tree: REUSED."
+(defn- run-event-outcome
   [events]
-  (or (->> events (map second) (remove engine/reused?) last :workflow/state) "REUSED"))
+  (->> events (map second) (remove engine/reused?) last))
+
+(defn- run-state
+  "The state of a node's run: that of its run-event-outcome, REUSED for a reuse
+   within the tree."
+  [events]
+  (or (:workflow/state (run-event-outcome events)) "REUSED"))
 
 (defn- run-duration
   "The node's run from its first STARTED (or, with :last-attempt, its
@@ -96,14 +103,14 @@
          (ui/format-duration (- (:workflow/state-changed-at (last run)) start)))))))
 
 (defn- error-title
-  "\"class: message\" of an ERROR event, for a chip's tooltip."
+  "\"class: message\" of an ERROR or TIMEOUT event, for a chip's tooltip."
   [ev]
   (let [error (ui/read-edn (:event/data ev))
         {:keys [type message]} (first (:via error))]
     (str (or (:class error) type) ": " (or (:message error) (:cause error) message))))
 
 (defn- error-class-html
-  "The exception class of an ERROR event, its package muted so the class
+  "The exception class of an ERROR or TIMEOUT event, its package muted so the class
    name stands out - nil if the saved error has none."
   [ev]
   (let [error (ui/read-edn (:event/data ev))
@@ -118,7 +125,8 @@
 (defn- problem?
   "Whether node k's subtree has a workflow that failed or is still running."
   [nodes children k]
-  (or (contains? #{"ERROR" "STARTED"} (run-state (get-in nodes [k :events])))
+  (or (let [ev (run-event-outcome (get-in nodes [k :events]))]
+        (and ev (or (engine/failed? ev) (engine/started? ev))))
       (some #(problem? nodes children %) (children k))))
 
 (defn- tree-columns
@@ -144,7 +152,7 @@
                         (str (:workflow/state ev)))]))
 
 (defn- error-body
-  "The full error of an ERROR event as saved (a Throwable->map): class,
+  "The full error of an ERROR or TIMEOUT event as saved (a Throwable->map): class,
    message, ex-data, the chain of causes (via) and the stack trace. Not a
    map - shown as the raw EDN."
   [data-str]
@@ -174,6 +182,9 @@
 (defmethod event-fold-body "ERROR" [ev]
   (when-some [data (:event/data ev)] (error-body data)))
 
+(defmethod event-fold-body "TIMEOUT" [ev]
+  (when-some [data (:event/data ev)] (error-body data)))
+
 (defmethod event-fold-body "STARTED" [ev]
   (when-some [data (:event/data ev)]
     [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]))
@@ -194,7 +205,7 @@
   [start ev root? restart?]
   (let [row (list
              (tree-offset start ev (when restart? "Restarted"))
-             (when (engine/error? ev) (error-class-html ev))
+             (when (engine/failed? ev) (error-class-html ev))
              (when-let [caller (and (engine/reused? ev) root? (:workflow/parent-invocation-id ev))]
                [:span.tree-reuse
                 "from " (ui/workflow-link (:workflow/invocation-id ev))
@@ -202,9 +213,9 @@
              (tree-columns
               nil
               nil
-              (ui/state-with-tooltip (:workflow/state ev) (when (engine/error? ev) (error-title ev)))))]
+              (ui/state-with-tooltip (:workflow/state ev) (when (engine/failed? ev) (error-title ev)))))]
     (if-let [body (event-fold-body ev)]
-      [:li {:class (str "tree-error" (when-not (engine/error? ev) " tree-meta"))}
+      [:li {:class (str "tree-error" (when-not (engine/failed? ev) " tree-meta"))}
        [:details
         (into [:summary {:class (str "state-" (:workflow/state ev))}] row)
         body]]
@@ -236,10 +247,11 @@
 (defn- timeline-tree-node [nodes children start k]
   (let [events (get-in nodes [k :events])
         {wf-name :workflow/name :workflow/keys [current-invocation-id]} (second (first events))
+        run-ev (run-event-outcome events)
         state (run-state events)
         reuses (count (filter (comp engine/reused? second) events))
         duration (run-duration events)
-        last-error (->> events (map second) (filter engine/error?) last)
+        last-error (->> events (map second) (filter engine/failed?) last)
         items (->> (concat (for [[i ev] events] [i :event ev])
                            (for [ck (children k)] [(ffirst (get-in nodes [ck :events])) :node ck]))
                    (sort-by first))]
@@ -257,7 +269,7 @@
         (when (pos? reuses)
           [:span {:title (str "result reused " (ui/pluralize reuses "time"))}
            (str "\u21BA " reuses)])
-        (ui/state-with-tooltip state (when (= "ERROR" state) (some-> last-error error-title))))]
+        (ui/state-with-tooltip state (when (some-> run-ev engine/failed?) (some-> last-error error-title))))]
       [:ul
        (for [[i kind x] items]
          (case kind
@@ -281,7 +293,7 @@
       [:ul.tree (timeline-tree-node nodes children start [:root])])))
 
 (defn- can-restart? [wf]
-  (and (or (engine/done? wf) (engine/error? wf) (engine/expired? wf))
+  (and (or (engine/finished? wf) (engine/expired? wf))
        (some? (engine/lookup (symbol (:workflow/name wf))))))
 
 (defn- unregistered? [wf]

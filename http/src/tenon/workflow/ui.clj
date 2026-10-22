@@ -124,6 +124,7 @@
 (def state-info
   {"DONE"    {:symbol "\u2713" :verb "Completed"}
    "ERROR"   {:symbol "\u2717" :verb "Failed"}
+   "TIMEOUT" {:symbol "\u23F1" :verb "Timed out"}
    "STARTED" {:symbol "\u25B6" :verb "Called"}
    "REUSED"  {:symbol "\u21BA" :verb "Called"}})
 

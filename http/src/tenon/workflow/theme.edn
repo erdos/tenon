@@ -33,5 +33,6 @@
   :neutral ["#ced4da" "#4a4f57"]
   :done ["#4D9F7C" "#5cbf6e"]
   :started ["#A27549" "#d9a916"]
+  :timeout ["#C4703A" "#d9822b"]
   :reused-tint ["#E4DFEE" "#1f2f4a"]
   :reused-strong ["#5E4691" "#7c93e6"]}}

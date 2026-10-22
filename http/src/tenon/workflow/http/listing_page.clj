@@ -47,7 +47,7 @@
          [:td.state [:a {:href href} (call-state row now)]]])]
      [:tfoot [:tr [:td {:colspan (if show-all? 6 5)} footer]]]]))
 
-(def ^:private states ["STARTED" "DONE" "ERROR"])
+(def ^:private states ["STARTED" "DONE" "ERROR" "TIMEOUT"])
 
 (defn- listing-params
   "The listing's query params for filters f - page_size only when not the

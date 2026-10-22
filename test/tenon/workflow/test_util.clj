@@ -94,13 +94,13 @@
   (let [file (java.io.File/createTempFile "tenon-test" ".db")
         path (.getAbsolutePath file)]
     (try
-      (let [engine (engine/init path)]
+      (let [engine (engine/init path :tenon/sweep-ms nil)] ; tests time out by hand, or build an engine that sweeps
         (try
           (binding [*db-path* path
                     engine/*workflow-engine* engine]
             (f))
           (finally
-            (.close ^java.io.Closeable (:tenon/db engine)))))
+            (engine/close! engine))))
       (finally
         (doseq [suffix ["" "-wal" "-shm"]]
           (.delete (java.io.File. (str path suffix))))))))

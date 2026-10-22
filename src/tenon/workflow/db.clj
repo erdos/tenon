@@ -38,14 +38,14 @@
      restarted meanwhile. Returns true if the row was updated.")
 
   (time-out! [this invocation-id result-edn-str]
-    "Like finish! with state ERROR, but only if the lease of invocation-id
+    "Like finish! with state TIMEOUT, but only if the lease of invocation-id
      has also expired. Returns true if the row was updated.")
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
-    "Moves invocation-id from DONE or ERROR back to STARTED under a new,
+    "Moves invocation-id from DONE, ERROR or TIMEOUT back to STARTED under a new,
      larger invocation_id, clearing its result, replacing its metadata and
      leasing it for timeout-ms (nil: never expires). Returns the new
-     invocation_id, or nil if invocation-id is no longer DONE or ERROR
+     invocation_id, or nil if invocation-id is no longer DONE, ERROR or TIMEOUT
      (e.g. a concurrent restart got there first).")
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
@@ -79,7 +79,8 @@
 
      :state and :wf-def, when given, restrict to calls of workflows
      matching exactly; omitting a key (or the whole map) leaves that
-     dimension unfiltered. :top-level-only? defaults to true (only calls
+     dimension unfiltered. :top-level-only? defaults
+     to true (only calls
      not nested under another invocation); pass false to include every
      call regardless of nesting.
 
@@ -112,3 +113,24 @@
      row is, a level below the reusing invocation. The workflow's own
      REUSED rows are part of its history wherever the reuse came from,
      at depth 0."))
+
+(defprotocol Timeouts
+  "The part of a storage concerned with invocations that stop making
+   progress: the leases that tell a running invocation from one whose
+   process died, and finding the latter. Which they time out with
+   Storage's time-out!."
+
+  (extend-lease! [this invocation-ids timeout-ms]
+    "Heartbeat: moves the lease end of every invocation in invocation-ids (a
+     collection) to timeout-ms from now - but only of those still STARTED under that
+     same invocation_id, i.e. neither finished, timed out nor restarted
+     meanwhile, and only those that have a lease (not the never-expiring
+     ones). An invocation whose lease already ran out but was not timed
+     out yet is extended too - its process is evidently alive. Returns the
+     set of the invocation ids it extended: the others have lost their
+     lease to a timeout or restart.")
+
+  (list-expired [this]
+    "The workflows that are STARTED with their lease run out (by the
+     storage's clock), oldest first, at any nesting depth - the rows
+     time-out! would time out. Each row has the keys of get-workflow."))

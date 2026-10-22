@@ -8,6 +8,7 @@
 .state-DONE{--strong:var(--done)}
 .state-STARTED{--strong:var(--started)}
 .state-ERROR{--strong:var(--danger)}
+.state-TIMEOUT{--strong:var(--timeout)}
 .state-REUSED{--strong:var(--reused-strong);--tint:var(--reused-tint)}
 
 body{font-family:sans-serif;margin:2em;background:var(--bg);color:var(--text-strong)}

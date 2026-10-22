@@ -519,7 +519,7 @@
     (-> state
         k/follow-redirect
         (has (texts? [:p.wf-summary-note.wf-summary-error]
-                     ["Restart failed: Cannot restart: workflow is not DONE or ERROR"])))))
+                     ["Restart failed: Cannot restart: workflow is not DONE, ERROR or TIMEOUT"])))))
 
 (deftest workflow-detail-page-hides-restart-button-when-pending-test
   (engine/register! #'http-flaky-fn (fn [] :ok))
@@ -771,6 +771,23 @@
         (has (count? [:span.wf-expired] 1))
         (has (texts? (conj (row-of id) :span.wf-expired) ["lease expired"]))
         (has (missing? (conj (row-of ok) :span.wf-expired))))))
+
+(deftest dashboard-shows-and-filters-timeout-state-test
+  (let [dead (test-util/insert! "test.ns/dead" :timeout-ms 60000)
+        threw (test-util/insert! "test.ns/threw")
+        done (test-util/insert! "test.ns/finished")]
+    (test-util/expire! (test-util/ds) dead)
+    (engine/sweep!)
+    (test-util/finish! threw "ERROR" (pr-str {:message "boom"}))
+    (test-util/finish! done "DONE" (pr-str :ok))
+    (-> (visit "/")
+        (has (texts? (conj (row-of dead) :td.state :span.chip) ["Timeout"]))
+        (has (texts? (conj (row-of threw) :td.state :span.chip) ["Error"])))
+    (-> (visit "/?state=TIMEOUT")
+        (has (present? (row-of dead)))
+        (has (missing? (row-of threw)))
+        (has (missing? (row-of done)))
+        (has (attr? (selected-option "state") :value "TIMEOUT")))))
 
 (deftest dashboard-auto-refresh-test
   (-> (visit "/?state=STARTED")

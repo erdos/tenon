@@ -65,9 +65,10 @@ stateDiagram-v2
     [*] --> STARTED: run-invocation
     STARTED --> DONE: raw fn returns
     STARTED --> ERROR: raw fn throws
-    STARTED --> ERROR: timed out
+    STARTED --> TIMEOUT: lease ran out
     DONE --> STARTED: restart-invocation
     ERROR --> STARTED: restart-invocation
+    TIMEOUT --> STARTED: restart-invocation
 ```
 
 ## Build tooling

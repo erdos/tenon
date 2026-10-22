@@ -61,10 +61,10 @@
    "CREATE TABLE IF NOT EXISTS event (
       id                   INTEGER PRIMARY KEY,
       workflow_id          INTEGER NOT NULL,
-      state                TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR', 'REUSED')),
+      state                TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR', 'TIMEOUT', 'REUSED')),
       occurred_at          INTEGER NOT NULL,
-      data                 TEXT,     -- metadata (STARTED, REUSED) or result (DONE, ERROR)
-      invocation_id        INTEGER,  -- DONE, ERROR, REUSED: the invocation finished or reused
+      data                 TEXT,     -- metadata (STARTED, REUSED) or result (DONE, ERROR, TIMEOUT)
+      invocation_id        INTEGER,  -- DONE, ERROR, TIMEOUT, REUSED: the invocation finished or reused
       expires_at           INTEGER,  -- STARTED: the lease
       parent_invocation_id INTEGER,  -- calls: the caller's invocation
       wf_def_id            INTEGER,  -- calls: the called wf_def
@@ -82,13 +82,15 @@
    "CREATE TABLE IF NOT EXISTS workflow (
       id            INTEGER PRIMARY KEY,  -- its first invocation id
       invocation_id INTEGER NOT NULL,     -- the current invocation (its STARTED event)
-      state         TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR')), -- a copy of the current state event's, for filters
+      state         TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR', 'TIMEOUT')), -- a copy of the current state event's, for filters
       state_id      INTEGER NOT NULL,     -- the current state's event: invocation_id while STARTED
       last_reuse_id INTEGER,              -- its latest REUSED event, head of their prev_id list
       last_call_id  INTEGER               -- the latest call it made, head of the prev_call_id list
     ) STRICT"
-   ;; The few running workflows.
-   "CREATE INDEX IF NOT EXISTS workflow_started ON workflow(id) WHERE state = 'STARTED'"
+   ;; The few workflows that are not DONE - the running ones and the failed
+   ;; ones - by state, then id. A query using it has to say state <> 'DONE'
+   ;; too, for SQLite to see that the index holds all it needs.
+   "CREATE INDEX IF NOT EXISTS workflow_not_done ON workflow(state, id) WHERE state <> 'DONE'"
    "CREATE TABLE IF NOT EXISTS idempotence (
       key         BLOB    PRIMARY KEY,
       workflow_id INTEGER NOT NULL
@@ -195,8 +197,9 @@
 
 (defn- calls-sql
   "SQL and params for top-level-workflows. Calls are found
-   - STARTED: through the few running workflows - each one's first call,
-     and its reuses from its own event list;
+   - STARTED, ERROR or TIMEOUT: through the few workflows in that state
+     (workflow_not_done) - each one's first call, and its reuses from its
+     own event list;
    - a wf_def: from its range of event_call - one for top-level calls only,
      two merged otherwise;
    - else: walking the log newest first."
@@ -206,24 +209,26 @@
         order (str " ORDER BY c.id DESC" (when limit " LIMIT ?"))
         def-id "(SELECT id FROM wf_def WHERE name = ?)"]
     (cond
-      (= "STARTED" state)
-      ;; A running workflow's first call is in workflow_started's order,
-      ;; so a page of them is a range of it. Its reuses are in its reuse
-      ;; list, newest first - and only those newer than the page's oldest
-      ;; first call can make it onto the page, so each list is cut there.
-      (let [filters (fn [id] (where (when top-level-only? "c.parent_invocation_id IS NULL")
+      (#{"STARTED" "ERROR" "TIMEOUT"} state)
+      ;; A first call of a workflow in the state is in workflow_not_done's
+      ;; order, so a page of them is a range of it. Its reuses are in its
+      ;; reuse list, newest first - and only those newer than the page's
+      ;; oldest first call can make it onto the page, so each list is cut
+      ;; there.
+      (let [in-state (fn [alias] (str alias ".state = '" state "' AND " alias ".state <> 'DONE'"))
+            filters (fn [id] (where (when top-level-only? "c.parent_invocation_id IS NULL")
                                     (when wf-def (str "c.wf_def_id = " def-id))
                                     (when before (str id " < ?"))))
             filter-params (cond-> [] wf-def (conj wf-def) before (conj before))]
         [(str "WITH RECURSIVE
                  first(id) AS (
-                   SELECT r.id FROM workflow r INDEXED BY workflow_started CROSS JOIN event c ON c.id = r.id
-                    WHERE " (where "r.state = 'STARTED'" (filters "r.id")) "
+                   SELECT r.id FROM workflow r INDEXED BY workflow_not_done CROSS JOIN event c ON c.id = r.id
+                    WHERE " (where (in-state "r") (filters "r.id")) "
                     ORDER BY r.id DESC" (when limit " LIMIT ?") "),
                  bound(id) AS (" (if limit "SELECT iif(count(*) < ?, 0, min(id)) FROM first" "SELECT 0") "),
                  reuse(id) AS (
-                   SELECT w.last_reuse_id FROM bound CROSS JOIN workflow w INDEXED BY workflow_started
-                    WHERE w.state = 'STARTED' AND w.last_reuse_id >= bound.id
+                   SELECT w.last_reuse_id FROM bound CROSS JOIN workflow w INDEXED BY workflow_not_done
+                    WHERE " (in-state "w") " AND w.last_reuse_id >= bound.id
                    UNION ALL
                    SELECT e.prev_id FROM reuse r CROSS JOIN event e ON e.id = r.id CROSS JOIN bound
                     WHERE e.prev_id >= bound.id)
@@ -272,12 +277,30 @@
             order)
        (cond-> [] state (conj state) before (conj before) limit (conj limit))])))
 
+(defn- init-schema!
+  "Creates the schema in a single transaction that takes the write lock up
+   front. A deferred one reads first, and cannot then upgrade to a write if
+   another process committed meanwhile (SQLite fails it at once, whatever
+   the busy timeout) - while this way, of several processes starting at
+   once on a new database one does the work and the others, having waited
+   for the lock, find it done."
+  [pool]
+  (pool/write!
+   pool
+   (fn [c]
+     (jdbc/execute! c ["BEGIN IMMEDIATE"])
+     (try
+       (doseq [ddl schema]
+         (jdbc/execute! c [ddl]))
+       (jdbc/execute! c ["COMMIT"])
+       (catch Throwable e
+         (try (jdbc/execute! c ["ROLLBACK"]) (catch Throwable _))
+         (throw e))))))
+
 (extend-protocol db/Storage
   Pool
   (init-db! [this]
-    (jdbc/with-transaction [tx this]
-      (doseq [ddl schema]
-        (jdbc/execute! tx [ddl])))
+    (init-schema! this)
     this)
 
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
@@ -293,7 +316,7 @@
     (finish! this invocation-id state result-edn-str false))
 
   (time-out! [this invocation-id result-edn-str]
-    (finish! this invocation-id "ERROR" result-edn-str true))
+    (finish! this invocation-id "TIMEOUT" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
     (:id (write! this [(str "INSERT INTO event (workflow_id, state, occurred_at, data, expires_at, prev_id)
@@ -421,3 +444,29 @@
   (pool/open (str "jdbc:sqlite:" db-path "?journal_mode=WAL&busy_timeout=5000"
                   "&mmap_size=1073741824&cache_size=-16384&temp_store=MEMORY")
              10))
+
+(extend-protocol db/Timeouts
+  Pool
+  (extend-lease! [this invocation-ids timeout-ms]
+    (if (empty? invocation-ids)
+      #{}
+      ;; The ids go in as one JSON array, so that the statement is the same
+      ;; for any number of them (and cached once, whatever the batch size).
+      (->> (jdbc/execute! this [(str "UPDATE event SET expires_at = " now-ms " + ?
+                                        WHERE id IN (SELECT value FROM json_each(?))
+                                          AND state = 'STARTED' AND expires_at IS NOT NULL
+                                          AND id = (SELECT state_id FROM workflow
+                                                     WHERE id = event.workflow_id)
+                                    RETURNING id")
+                                timeout-ms (str "[" (str/join "," (map long invocation-ids)) "]")]
+                          plain-opts)
+           (into #{} (map :id)))))
+
+  (list-expired [this]
+    (mapv #(assoc % :workflow/expired true)
+          (jdbc/execute! this [(str "SELECT " state-columns "
+                                       FROM workflow w INDEXED BY workflow_not_done
+                                       CROSS JOIN workflow_state s ON s.workflow_id = w.id
+                                      WHERE w.state = 'STARTED' AND w.state <> 'DONE' AND s.expires_at <= " now-ms "
+                                      ORDER BY w.id")]
+                         opts))))

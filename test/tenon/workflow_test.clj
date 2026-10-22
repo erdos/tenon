@@ -6,6 +6,7 @@
             [next.jdbc :as jdbc]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]
+            [tenon.workflow.timeout :as timeout]
             [tenon.workflow.fixtures :as fixtures]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
@@ -386,14 +387,14 @@
     (test-util/expire! (test-util/ds) id)
     (is (thrown-match? clojure.lang.ExceptionInfo
                        {:type ::engine/previous-failure
-                        :failure {:data {:type ::engine/timed-out}}}
+                        :failure {:data {:type ::timeout/timed-out}}}
                        (engine/run-invocation #'dedup-started-fn (fn [n] (swap! calls inc) n) [5])))
     (is (zero? @calls))
-    (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "REUSED"}]
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "TIMEOUT"} {:workflow/state "REUSED"}]
                 (test-util/timeline id))
         "the caller that timed it out reused the timeout failure")
     (is (match? [[:timed-out {:invocation-id id}]
-                 [:reused {:invocation-id id :state "ERROR"}]]
+                 [:reused {:invocation-id id :state "TIMEOUT"}]]
                 @*emitted-events*))))
 
 (deftest run-invocation-timeout-counts-from-start-time-test
@@ -413,7 +414,7 @@
   (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [2]) :timeout-ms 60000)]
     (test-util/expire! (test-util/ds) id)
     (is (= 2 (engine/restart-invocation id)))
-    (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "STARTED"} {:workflow/state "DONE"}]
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "TIMEOUT"} {:workflow/state "STARTED"} {:workflow/state "DONE"}]
                 (test-util/timeline id)))))
 
 (deftest run-invocation-without-timeout-waits-without-limit-test
@@ -464,12 +465,12 @@
       (test-util/expire! (test-util/ds) id)
       (is (thrown-match? clojure.lang.ExceptionInfo
                          {:type ::engine/previous-failure
-                          :failure {:data {:type ::engine/timed-out}}}
+                          :failure {:data {:type ::timeout/timed-out}}}
                          (engine/run-invocation #'echo-fn f [8]))
           "a waiter times it out")
       (deliver release true)
       (is (= 8 @caller))
-      (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"} {:workflow/state "REUSED"}]
+      (is (match? [{:workflow/state "STARTED"} {:workflow/state "TIMEOUT"} {:workflow/state "REUSED"}]
                   (test-util/timeline id))
           "only the waiter's reuse of the timeout is logged - no late DONE"))))
 
@@ -533,7 +534,172 @@
         (is (= 880 @task2))
         (is (= 1 @calls) "raw-fn ran once; second engine polled DB and reused result"))
       (finally
-        (.close ^java.io.Closeable (:tenon/db engine2))))))
+        (engine/close! engine2)))))
+
+(defn- wait-for
+  "Polls pred until it is truthy, for at most timeout-ms. Returns its value."
+  [pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (or (pred)
+          (when (< (System/currentTimeMillis) deadline)
+            (Thread/sleep 10)
+            (recur))))))
+
+(defn- run-slow-workflow-while-polled
+  "Runs echo-fn on engine1, taking run-ms, while a second engine - sharing
+   the database, so it can only poll it - calls the same workflow
+   meanwhile. Returns [result-of-leader outcome-of-waiter], the latter being
+   its result or exception."
+  [engine1 run-ms]
+  (let [engine2 (engine/init test-util/*db-path*)
+        started (promise)
+        f (fn [x] (deliver started true) (Thread/sleep ^long run-ms) x)]
+    (try
+      (let [leader (future (engine/run-invocation engine1 #'echo-fn f [21]))
+            _ @started
+            waiter (try (engine/run-invocation engine2 #'echo-fn f [21])
+                        (catch clojure.lang.ExceptionInfo e e))]
+        [@leader waiter])
+      (finally
+        (engine/close! engine2)))))
+
+(deftest heartbeat-keeps-long-running-invocation-alive-test
+  ;; The lease is far shorter than the run, but the heartbeat renews it, so
+  ;; another process polling the database never times the run out.
+  (let [engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 300)]
+    (try
+      (let [[leader waiter] (run-slow-workflow-while-polled engine1 1200)
+            wf (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn"))]
+        (is (= 21 leader))
+        (is (= 21 waiter) "the waiter got the real result, not a timeout")
+        (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE"} {:workflow/state "REUSED"}]
+                    (test-util/timeline (:workflow/invocation-id wf)))))
+      (finally
+        (engine/close! engine1)))))
+
+(deftest no-heartbeat-lets-lease-run-out-test
+  ;; The same run without the heartbeat is timed out by the waiter - what
+  ;; the heartbeat prevents.
+  (let [engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 300 :tenon/heartbeat-ms nil)]
+    (try
+      (let [[leader waiter] (run-slow-workflow-while-polled engine1 1200)]
+        (is (= 21 leader) "its own caller still gets the result")
+        (is (thrown-match? clojure.lang.ExceptionInfo
+                           {:type ::engine/previous-failure
+                            :failure {:data {:type ::timeout/timed-out}}}
+                           (throw waiter))))
+      (finally
+        (engine/close! engine1)))))
+
+(deftest engine-config-defaults-test
+  (let [e engine/*workflow-engine*]
+    (is (match? {:tenon/timeout-ms 15000 :tenon/lease-batch-size 500
+                 :tenon/backoff-base-ms 5 :tenon/backoff-multiplier 2
+                 :tenon/backoff-max-ms 200 :tenon/backoff-jitter 0.1}
+                e))))
+
+(deftest backoff-waits-grow-exponentially-up-to-the-maximum-test
+  (is (= [10 30 90 100 100 100]
+         (take 6 (@#'engine/backoff-waits {:tenon/backoff-base-ms 10 :tenon/backoff-multiplier 3
+                                           :tenon/backoff-max-ms 100 :tenon/backoff-jitter 0})))))
+
+(deftest backoff-waits-are-lengthened-by-a-random-amount-within-the-jitter-test
+  (let [waits (take 200 (@#'engine/backoff-waits {:tenon/backoff-base-ms 100 :tenon/backoff-multiplier 1
+                                                  :tenon/backoff-max-ms 100 :tenon/backoff-jitter 0.25}))]
+    (is (every? #(<= 100 % 124) waits) "never shorter, and by less than a quarter longer")
+    (is (> (count (distinct waits)) 10) "and not all the same")))
+
+(deftest with-backoff-calls-until-something-but-nil-test
+  (let [calls (atom 0)
+        engine {:tenon/backoff-base-ms 1 :tenon/backoff-multiplier 2 :tenon/backoff-max-ms 4 :tenon/backoff-jitter 0}]
+    (is (= :found (@#'engine/with-backoff engine #(when (= 3 (swap! calls inc)) :found))))
+    (is (= 3 @calls))
+    (is (false? (@#'engine/with-backoff engine (constantly false))) "only nil means try again")))
+
+(deftest with-backoff-waits-in-between-test
+  (let [engine {:tenon/backoff-base-ms 50 :tenon/backoff-multiplier 1 :tenon/backoff-max-ms 50 :tenon/backoff-jitter 0}
+        calls (atom 0)
+        t0 (System/nanoTime)]
+    (@#'engine/with-backoff engine #(when (= 3 (swap! calls inc)) :done))
+    (is (<= 100 (/ (- (System/nanoTime) t0) 1e6)) "two waits of 50 ms")))
+
+(deftest with-backoff-waits-on-the-promise-it-is-given-instead-of-sleeping-test
+  (let [engine {:tenon/backoff-base-ms 10000 :tenon/backoff-multiplier 2 :tenon/backoff-max-ms 20000 :tenon/backoff-jitter 0}
+        calls (atom 0)
+        woken (doto (promise) (deliver true))
+        t0 (System/nanoTime)]
+    (is (= :done (@#'engine/with-backoff engine #(when (= 2 (swap! calls inc)) :done) (constantly woken))))
+    (is (< (/ (- (System/nanoTime) t0) 1e6) 1000) "it did not wait out the 10 s")
+    (reset! calls 0)
+    (is (= :done (@#'engine/with-backoff (assoc engine :tenon/backoff-base-ms 1)
+                                         #(when (= 2 (swap! calls inc)) :done)
+                                         (constantly nil)))
+        "with nothing to wait on it sleeps")))
+
+(deftest engine-on-event-is-never-nil-test
+  (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil)]
+    (try
+      (is (fn? (:tenon/on-event engine1)))
+      (is (nil? ((:tenon/on-event engine1) :anything {})) "does nothing by default")
+      (finally
+        (engine/close! engine1)))))
+
+(deftest heartbeat-renews-in-batches-and-reports-lost-leases-test
+  ;; More invocations than one storage call renews: all of them are, and
+  ;; the one that was timed out meanwhile is reported - once.
+  (let [events (atom [])
+        engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 60000 :tenon/heartbeat-ms nil :tenon/sweep-ms nil
+                             :tenon/lease-batch-size 7
+                             :tenon/on-event #(swap! events conj [%1 %2]))
+        ds (:tenon/db engine1)
+        heartbeat! @#'timeout/heartbeat!]
+    (try
+      (let [running (mapv #(test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [%]) :timeout-ms 60000)
+                          (range 20))
+            timed-out (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [:t]) :timeout-ms 0)]
+        (db/time-out! ds timed-out (pr-str {:message "timed out"}))
+        (reset! (:tenon/in-flight engine1) (zipmap (conj running timed-out) (repeat nil)))
+        (jdbc/execute! ds ["UPDATE event SET expires_at = 1 WHERE state = 'STARTED'"])
+        (is (= 20 (count (db/list-expired ds))))
+        (let [lost (heartbeat! engine1 #{})]
+          (is (empty? (db/list-expired ds)) "all of them were renewed")
+          (is (= #{timed-out} lost))
+          (is (= [[:lease-lost {:invocation-id timed-out}]] @events))
+          (let [lost (heartbeat! engine1 lost)]
+            (is (= #{timed-out} lost))
+            (is (= 1 (count @events)) "reported once")
+            (swap! (:tenon/in-flight engine1) dissoc timed-out)
+            (is (= #{} (heartbeat! engine1 lost)) "forgotten once it no longer runs"))))
+      (finally
+        (engine/close! engine1)))))
+
+(deftest heartbeat-reports-lost-lease-once-test
+  ;; An invocation timed out while its process still runs it learns of it
+  ;; from the heartbeat - once, not on every beat.
+  (let [events (atom [])
+        engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 300 :tenon/sweep-ms nil
+                             :tenon/on-event #(swap! events conj [%1 %2]))
+        started (promise)
+        release (promise)
+        f (fn [x] (deliver started true) @release x)]
+    (try
+      (let [caller (future (engine/run-invocation engine1 #'echo-fn f [22]))
+            _ @started
+            id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn")))]
+        ;; a beat may renew the lease between expiring it and timing it out
+        (is (wait-for (fn [] (test-util/expire! (test-util/ds) id)
+                           (db/time-out! (test-util/ds) id (pr-str {:message "timed out"})))
+                      2000))
+        (is (wait-for #(some (comp #{:lease-lost} first) @events) 2000))
+        (Thread/sleep 400)
+        (is (= [[:lease-lost {:invocation-id id}]]
+               (filterv (comp #{:lease-lost} first) @events))
+            "reported once")
+        (deliver release true)
+        (is (= 22 @caller)))
+      (finally
+        (engine/close! engine1)))))
 
 (deftest cycle-detection-test
   ;; Direct or mutual recursion with the exact same (wf_def, params)
@@ -549,6 +715,101 @@
     (is (thrown-match? clojure.lang.ExceptionInfo
                        {:type ::engine/cycle-detected}
                        (step-a 2)))))
+
+(deftest sweep-times-out-expired-invocations-test
+  ;; Without anybody calling the dead workflows again, and at any nesting.
+  (let [dead (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [31]) :timeout-ms 60000)
+        dead-child (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [32])
+                                      :parent dead :timeout-ms 60000)
+        alive (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [33]) :timeout-ms 60000)
+        never (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [34]) :timeout-ms nil)
+        done (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [35]) :timeout-ms 60000)]
+    (test-util/finish! done "DONE" "35")
+    (doseq [id [dead dead-child]]
+      (test-util/expire! (test-util/ds) id))
+    (is (= [dead dead-child] (engine/sweep!)))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "TIMEOUT" :event/data (m/via edn/read-string {:data {:type ::timeout/timed-out}})}]
+                (test-util/timeline dead)))
+    (is (= ["TIMEOUT" "TIMEOUT" "STARTED" "STARTED" "DONE"]
+           (mapv (comp :workflow/state engine/get-invocation) [dead dead-child alive never done])))
+    (is (match? [[:timed-out {:invocation-id dead :parent-invocation-id nil}]
+                 [:timed-out {:invocation-id dead-child :parent-invocation-id dead}]]
+                @*emitted-events*))
+    (is (= [] (engine/sweep!)) "nothing left to time out")
+    (is (= #{dead dead-child} (set (map :workflow/invocation-id (filter #(= "TIMEOUT" (:workflow/state %))
+                                                               (engine/list-invocations {:top-level-only? false})))))
+        "the sweep only timed out the expired ones")))
+
+(deftest sweep-leaves-timed-out-invocation-restartable-test
+  (engine/register! #'echo-fn echo-fn)
+  (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [36]) :timeout-ms 60000)]
+    (test-util/expire! (test-util/ds) id)
+    (is (= [id] (engine/sweep!)))
+    (is (= 36 (engine/restart-invocation id)) "restarting stays a person's call")))
+
+(deftest concurrent-sweeps-time-out-each-invocation-once-test
+  (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [37]) :timeout-ms 60000)
+        engine2 (engine/init test-util/*db-path* :tenon/sweep-ms nil
+                             :tenon/on-event #(swap! *emitted-events* conj [%1 %2]))]
+    (try
+      (test-util/expire! (test-util/ds) id)
+      (let [sweeps (mapv #(future (engine/sweep! %)) [engine/*workflow-engine* engine2])]
+        (is (= [[id] []] (sort-by count > (mapv deref sweeps))) "one of them timed it out")
+        (is (= 1 (count (filter (comp #{:timed-out} first) @*emitted-events*)))))
+      (finally
+        (engine/close! engine2)))))
+
+(deftest init-sweeps-expired-invocations-left-by-a-previous-run-test
+  (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [38]) :timeout-ms 60000)]
+    (test-util/expire! (test-util/ds) id)
+    (let [engine2 (engine/init test-util/*db-path*)]
+      (try
+        (is (wait-for #(= "TIMEOUT" (:workflow/state (engine/get-invocation engine2 id))) 2000))
+        (finally
+          (engine/close! engine2))))))
+
+(deftest sweeps-periodically-test
+  (let [engine2 (engine/init test-util/*db-path* :tenon/sweep-ms 20)
+        id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [39]) :timeout-ms 60000)]
+    (try
+      (is (= "STARTED" (:workflow/state (engine/get-invocation engine2 id))) "a live lease is left alone")
+      (test-util/expire! (test-util/ds) id)
+      (is (wait-for #(= "TIMEOUT" (:workflow/state (engine/get-invocation engine2 id))) 2000))
+      (finally
+        (engine/close! engine2)))))
+
+(deftest timeout-is-a-state-of-its-own-test
+  ;; A timeout ends in TIMEOUT, a throw in ERROR - told apart by state, at
+  ;; any nesting.
+  (let [dead (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [41]) :timeout-ms 60000)
+        threw (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [42]))
+        running (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [43]))
+        nested (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [44]) :parent running
+                                  :timeout-ms 60000)]
+    (test-util/expire! (test-util/ds) dead)
+    (test-util/expire! (test-util/ds) nested)
+    (engine/sweep!)
+    (test-util/finish! threw "ERROR" (pr-str {:message "boom"}))
+    (is (= {dead "TIMEOUT" threw "ERROR" running "STARTED" nested "TIMEOUT"}
+           (into {} (map (fn [id] [id (:workflow/state (engine/get-invocation id))])) [dead threw running nested])))
+    (is (= #{dead nested}
+           (set (map :workflow/invocation-id (engine/list-invocations {:state "TIMEOUT" :top-level-only? false})))))
+    (is (= #{threw}
+           (set (map :workflow/invocation-id (engine/list-invocations {:state "ERROR" :top-level-only? false}))))
+        "the ERROR filter has the failure only")))
+
+(deftest timeout-is-reused-as-a-failure-but-says-so-test
+  ;; A caller meeting a timed out run gets it as a ::previous-failure, like
+  ;; an ERROR, naming the timeout.
+  (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [45]) :timeout-ms 60000)]
+    (test-util/expire! (test-util/ds) id)
+    (is (thrown-match? clojure.lang.ExceptionInfo
+                       {:type ::engine/previous-failure :state "TIMEOUT"
+                        :failure {:data {:type ::timeout/timed-out}}}
+                       (engine/run-invocation #'echo-fn echo-fn [45])))
+    (try (engine/run-invocation #'echo-fn echo-fn [45])
+         (catch clojure.lang.ExceptionInfo e
+           (is (re-find #"^Workflow previously timed out: " (ex-message e)))))))
 
 #workflow
 (defn recursive-inner [n]
@@ -623,3 +884,26 @@
     (is (= 2 (started-count "tenon.workflow-test/fan-out-first")) "one failed, one succeeded run")
     (is (= 2 (started-count "tenon.workflow-test/fan-out-second")) "one failed, one succeeded run")
     (is (= 3 (started-count "tenon.workflow-test/fan-out-parent")))))
+
+#workflow
+(defn timeout-inner [n]
+  (throw (ex-info "inner down" {:n n})))
+
+#workflow
+(defn timeout-outer [n]
+  (inc (timeout-inner n)))
+
+(deftest restart-invocation-recursively-restarts-timed-out-nested-workflows-test
+  ;; A callee that timed out (its process died, and a sweep found out) is
+  ;; restarted first, like a failed one - else the parent would trip over
+  ;; its cached timeout.
+  (is (thrown? Exception (timeout-outer 7)))
+  (let [outer (first (test-util/find-by-wf-def "tenon.workflow-test/timeout-outer"))
+        inner (first (test-util/find-by-wf-def "tenon.workflow-test/timeout-inner"))
+        running (test-util/restart! (:workflow/invocation-id inner))]
+    (test-util/expire! (test-util/ds) running)
+    (engine/sweep!)
+    (is (= "TIMEOUT" (:workflow/state (engine/get-invocation (:workflow/invocation-id inner)))))
+    (engine/register! #'timeout-inner (fn [n] (* n 2)))
+    (is (= 15 (engine/restart-invocation-recursively (:workflow/invocation-id outer))))
+    (is (= "DONE" (:workflow/state (engine/get-invocation (:workflow/invocation-id inner)))))))

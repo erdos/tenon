@@ -2,7 +2,9 @@
   (:require [clojure.edn :as edn]
             [clojure.walk :as walk]
             [tenon.workflow.db :as db]
-            [tenon.workflow.sqlite :as sqlite]))
+            [tenon.workflow.sqlite :as sqlite]
+            [tenon.workflow.timeout :as timeout])
+  (:import [java.io Closeable]))
 
 (defn register! [v raw-fn]
   (doto v (alter-meta! assoc ::raw-fn raw-fn)))
@@ -21,12 +23,8 @@
     (when (and v (raw-fn v))
       v)))
 
-(def default-timeout-ms
-  "Default :tenon/timeout-ms for init - how long after it started an
-   invocation may stay STARTED. Past that, the next call of the same
-   wf+params (or a restart-invocation) marks it ERROR as timed out -
-   e.g. when the process running it died and it will never finish."
-  30000)
+(defmacro ^:private emit! [engine event data]
+  `((:tenon/on-event ~engine) ~event ~data))
 
 (def ^:private local-host-name
   (delay (.getHostName (java.net.InetAddress/getLocalHost))))
@@ -46,22 +44,52 @@
    opens it (sqlite/datasource) and tenon.workflow.db/init-db! - a
    Storage protocol method - ensures its schema exists, before it's
    stored under :tenon/db. Additional key/value pairs override the
-   defaults - most usefully :tenon/timeout-ms (see default-timeout-ms;
-   nil never times out) and :tenon/on-event (a 2-arg fn (fn [event data])
-   called on :started, :restarted, :done, :error, :reused, and :timed-out)
-   and :tenon/metadata-fn (a 2-arg fn (fn [wf-type args]) returning the
-   metadata to persist - empty-metadata-fn by default; see also host-thread-metadata-fn)."
-  [db-path & {:as opts}]
-  (merge {:tenon/db (db/init-db! (sqlite/datasource db-path))
-          :tenon/timeout-ms default-timeout-ms
-          :tenon/in-flight (atom {})
-          :tenon/on-event nil
-          :tenon/metadata-fn empty-metadata-fn}
-         opts))
+   defaults - most usefully :tenon/timeout-ms (the lease of a running
+   invocation, 15000 ms: how long it may stay STARTED without its process
+   renewing it, before the next call of the same wf+params, a restart or a
+   sweep moves it to TIMEOUT; nil never times out) and
+   :tenon/on-event (a 2-arg fn (fn [event data]), never nil - does nothing by default,
+   called on :started, :restarted, :done, :error, :reused, :timed-out,
+   :lease-lost - a running invocation found timed out or restarted by
+   someone else - and :heartbeat-error and :sweep-error) and
+   :tenon/metadata-fn (a 2-arg fn (fn [wf-type args]) returning the
+   metadata to persist - empty-metadata-fn by default; see also
+   host-thread-metadata-fn).
 
-(defmacro ^:private emit! [engine event data]
-  `(when-let [on-event# (:tenon/on-event ~engine)]
-     (on-event# ~event ~data)))
+   Unless :tenon/timeout-ms is nil, daemon threads renew the leases of the
+   invocations running in this process and time out the expired ones of
+   any process - see tenon.workflow.timeout/start! for :tenon/heartbeat-ms
+   and :tenon/sweep-ms, and :tenon/lease-batch-size (500) for how many
+   invocations one renewal covers.
+
+   A caller waiting for an invocation another one is running polls it
+   with exponential backoff: :tenon/backoff-base-ms (5) for the first wait,
+   times :tenon/backoff-multiplier (2) for each next, up to
+   :tenon/backoff-max-ms (200), each lengthened by a random amount of up
+   to :tenon/backoff-jitter (0.1) of it, so callers polling together
+   drift apart.
+
+   Stop the threads with close!."
+  [db-path & {:as opts}]
+  (-> {:tenon/db (db/init-db! (sqlite/datasource db-path))
+       :tenon/timeout-ms 15000
+       :tenon/lease-batch-size 500
+       :tenon/backoff-base-ms 5
+       :tenon/backoff-multiplier 2
+       :tenon/backoff-max-ms 200
+       :tenon/backoff-jitter 0.1
+       :tenon/in-flight (atom {})
+       :tenon/on-event (fn [_event _data])
+       :tenon/metadata-fn empty-metadata-fn}
+      (merge opts)
+      (timeout/start!)))
+
+(defn close!
+  "Stops the background threads of engine, as built by init, and closes its
+   database."
+  [engine]
+  (timeout/stop! engine)
+  (.close ^Closeable (:tenon/db engine)))
 
 (def ^:dynamic *workflow-engine*
   "The current application-state map (as built by init), read by
@@ -142,41 +170,40 @@
 (defn done? [wf] (= "DONE" (:workflow/state wf)))
 (defn error? [wf] (= "ERROR" (:workflow/state wf)))
 (defn reused? [wf] (= "REUSED" (:workflow/state wf)))
+(defn timeout? [wf] (= "TIMEOUT" (:workflow/state wf)))
 (defn expired? [wf] (boolean (:workflow/expired wf)))
+(def failed? (some-fn error? timeout?))
+(def finished? (some-fn done? failed?))
 
-(defn- time-out-if-expired!
-  "Marks wf ERROR as timed out if it is STARTED past its lease. Returns true
-   if it did."
-  [{ds :tenon/db :as engine} {wf-name :workflow/name :workflow/keys [invocation-id parent-invocation-id state state-changed-at expires-at expired]}]
-  (when (and (= "STARTED" state) expired)
-    (let [timeout-ms (- expires-at state-changed-at)]
-      (when (db/time-out! ds invocation-id
-                          (safe-pr-str {:message (str "Timed out: still running " timeout-ms
-                                                      " ms after it started")
-                                        :class (str `timed-out)
-                                        :data {:type ::timed-out :timeout-ms timeout-ms}}))
-        (emit! engine :timed-out {:invocation-id invocation-id
-                                  :parent-invocation-id parent-invocation-id
-                                  :wf-def wf-name})
-        true))))
+(defn- backoff-waits [{:tenon/keys [backoff-base-ms backoff-multiplier backoff-max-ms backoff-jitter]}]
+  (->> (iterate #(min backoff-max-ms (* backoff-multiplier %)) backoff-base-ms)
+       (map #(+ % (long (rand (* backoff-jitter %)))))))
+
+(defn- with-backoff
+  ([engine f] (with-backoff engine f nil))
+  ([engine f wake]
+   (loop [[wait-ms & waits] (backoff-waits engine)]
+     (if-some [result (f)]
+       result
+       (do (if-let [p (and wake (wake))]
+             (deref p wait-ms nil)
+             (Thread/sleep (long wait-ms)))
+           (recur waits))))))
 
 (defn- await-finished
-  "Polls the workflow invocation-id belongs to until it is DONE or ERROR
-   (timing it out if its lease runs out meanwhile), and returns its row.
+  "Polls the workflow invocation-id belongs to until it is DONE, ERROR or
+   TIMEOUT (timing it out if its lease runs out meanwhile), and returns its row.
    When the invocation is running in this JVM (:tenon/in-flight), waits on
    its completion promise instead of sleeping so same-JVM callers wake as
    soon as it finishes."
   [{ds :tenon/db in-flight :tenon/in-flight :as engine} invocation-id]
-  (loop [wait-ms 5]
-    (let [wf (db/get-workflow ds invocation-id)]
-      (case (:workflow/state wf)
-        ("DONE" "ERROR") wf
-        "STARTED" (if (time-out-if-expired! engine wf)
-                    (recur wait-ms)
-                    (do (if-let [p (some-> in-flight deref (get (:workflow/invocation-id wf)))]
-                          (deref p (long wait-ms) nil)
-                          (Thread/sleep (long wait-ms)))
-                        (recur (min 200 (* 2 wait-ms)))))))))
+  (with-backoff engine
+    (fn []
+      (let [wf (db/get-workflow ds invocation-id)]
+        (cond
+          (finished? wf) wf
+          (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id))))
+    #(some-> in-flight deref (get (:workflow/invocation-id (db/get-workflow ds invocation-id))))))
 
 (defn- reuse-existing-result!
   "Awaits the invocation-id run started by someone else, logs that the
@@ -195,13 +222,15 @@
                            :wf-def (:workflow/name wf)
                            :state (:workflow/state wf)
                            :metadata metadata})
-    (case (:workflow/state wf)
-      "DONE" (edn/read-string (:workflow/result wf))
-      "ERROR" (let [failure (edn/read-string (:workflow/result wf))]
-                (throw (ex-info (str "Workflow previously failed: " (or (:cause failure) (:message failure)))
-                                {:type ::previous-failure
-                                 :invocation-id (:workflow/invocation-id wf)
-                                 :failure failure}))))))
+    (cond
+      (done? wf) (edn/read-string (:workflow/result wf))
+      (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
+                     (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
+                                          (or (:cause failure) (:message failure)))
+                                     {:type ::previous-failure
+                                      :invocation-id (:workflow/invocation-id wf)
+                                      :state (:workflow/state wf)
+                                      :failure failure}))))))
 
 (defn run-invocation
   "Runs raw-fn with args, persisting the invocation.
@@ -213,7 +242,7 @@
      (throw (ex-info "Dynamic var *workflow-engine* is not bound."
                      {:type ::precondition-failed})))
    (let [ds (:tenon/db engine)
-         timeout-ms (:tenon/timeout-ms engine default-timeout-ms)
+         timeout-ms (:tenon/timeout-ms engine)
          wf-def-str (str (symbol v))
          args-vec (vec args)
          params-str (safe-pr-str args-vec)
@@ -235,6 +264,10 @@
                             {:type ::race-condition :wf-def wf-def-str}))))))))
 
 
+(defn sweep!
+  ([] (sweep! *workflow-engine*))
+  ([engine] (timeout/sweep! engine)))
+
 (defn list-pending
   ([] (list-pending *workflow-engine*))
   ([engine] (->> (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})
@@ -252,14 +285,16 @@
      :workflow/parent-invocation-id long - the invocation it ran nested under
                                     (as of when it first started), nil if
                                     top-level
-     :workflow/state                string - \"STARTED\", \"DONE\" or \"ERROR\"
+     :workflow/state                string - \"STARTED\", \"DONE\", \"ERROR\" or
+                                     \"TIMEOUT\"
      :workflow/state-changed-at     long - epoch ms of entering state
      :workflow/expires-at           long - epoch ms its STARTED lease ends, nil
                                     if not STARTED or never expiring
      :workflow/metadata             string - EDN of the :tenon/metadata-fn
                                     result when started, or nil
      :workflow/result               string - EDN of the return value (DONE) or
-                                    of the failure's Throwable->map (ERROR),
+                                    of the failure's Throwable->map (ERROR) or of
+                                     the timeout's description (TIMEOUT),
                                     nil while STARTED
      :workflow/expired              boolean - whether the STARTED lease has
                                     run out"
@@ -300,11 +335,11 @@
                                      REUSED, the reusing caller's), nil at the
                                      top level
      :workflow/name                string - the workflow fn's qualified symbol
-     :workflow/state                 string - \"STARTED\", \"DONE\", \"ERROR\" or
-                                     \"REUSED\" (a caller got its stored outcome)
+     :workflow/state                 string - \"STARTED\", \"DONE\", \"ERROR\",
+                                      \"TIMEOUT\" or \"REUSED\" (a caller got its stored outcome)
      :workflow/state-changed-at      long - epoch ms of entering state
      :event/data                  string - EDN of the metadata (STARTED,
-                                     REUSED) or of the result (DONE, ERROR),
+                                     REUSED) or of the result (DONE, ERROR, TIMEOUT),
                                      or nil
      :workflow/depth                 long - 0 for the workflow itself, 1 for a
                                      direct sub-workflow, and so on"
@@ -315,7 +350,7 @@
 (defn restart-invocation
   "Restarts the workflow invocation-id belongs to (any of its current or
    past invocation ids) under a new invocation id, keeping its history.
-   Requires it to be DONE or ERROR (or STARTED but timed out - see
+   Requires it to be DONE, ERROR or TIMEOUT (or STARTED past its lease - see
    :tenon/timeout-ms in init), and its wf_def to currently be registered
    in this process. engine defaults to *workflow-engine*, same as
    run-invocation."
@@ -326,15 +361,15 @@
          wf (let [wf (or (db/get-workflow ds invocation-id)
                          (throw (ex-info "No such workflow"
                                           {:type ::precondition-failed :invocation-id invocation-id})))]
-              (if (time-out-if-expired! engine wf)
+              (if (timeout/time-out-if-expired! engine wf)
                 (db/get-workflow ds (:workflow/invocation-id wf))
                 wf))
          not-restartable (fn [state]
-                           (ex-info "Cannot restart: workflow is not DONE or ERROR"
+                           (ex-info "Cannot restart: workflow is not DONE, ERROR or TIMEOUT"
                                     {:type ::precondition-failed
                                      :invocation-id invocation-id
                                      :state state}))]
-     (when-not (contains? #{"DONE" "ERROR"} (:workflow/state wf))
+     (when-not (finished? wf)
        (throw (not-restartable (:workflow/state wf))))
      (let [wf-def-sym (symbol (:workflow/name wf))
            v (or (lookup wf-def-sym)
@@ -346,10 +381,10 @@
            metadata (metadata-for engine wf-def-sym args)
            meta-str (some-> metadata safe-pr-str)]
        ;; A concurrent restart may have restarted it since wf was read -
-       ;; restarting only if it is still DONE/ERROR under the same
+       ;; restarting only if it is still DONE/ERROR/TIMEOUT under the same
        ;; invocation id lets only one of them through.
        (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) meta-str
-                                              (:tenon/timeout-ms engine default-timeout-ms))]
+                                              (:tenon/timeout-ms engine))]
          (do (emit! engine :restarted {:invocation-id new-invocation-id
                                        :previous-invocation-id (:workflow/invocation-id wf)
                                        :parent-invocation-id (:workflow/parent-invocation-id wf)
@@ -363,7 +398,7 @@
   ([invocation-id]
    (restart-invocation-recursively *workflow-engine* invocation-id))
   ([{ds :tenon/db :as engine} invocation-id]
-   ;; A failed workflow stopped at its first failing call, so at most one
+   ;; A failed (or timed out) workflow stopped at its first failing call, so at most one
    ;; callee - a reused one included - is failed, and only one path of the
    ;; hierarchy leads to it.
    (some->> (db/full-timeline ds invocation-id)
@@ -372,8 +407,8 @@
             distinct
             (map (partial db/get-workflow ds))
             (some (fn [callee-wf]
-                    (when (or (= "ERROR" (:workflow/state callee-wf))
-                              (time-out-if-expired! engine callee-wf))
+                    (when (or (failed? callee-wf)
+                              (timeout/time-out-if-expired! engine callee-wf))
                       (:workflow/invocation-id callee-wf))))
             (restart-invocation-recursively engine))
    (restart-invocation engine invocation-id)))

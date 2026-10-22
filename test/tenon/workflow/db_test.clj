@@ -60,7 +60,7 @@
         "lease not expired yet")
     (test-util/expire! (test-util/ds) id)
     (is (true? (db/time-out! (test-util/ds) id (pr-str {:message "timed out"}))))
-    (is (= "ERROR" (:workflow/state (db/get-workflow (test-util/ds) id)))))
+    (is (= "TIMEOUT" (:workflow/state (db/get-workflow (test-util/ds) id)))))
   (let [id (test-util/insert! "test.ns/no-lease")]
     (is (false? (db/time-out! (test-util/ds) id (pr-str {})))
         "no lease never expires")))
