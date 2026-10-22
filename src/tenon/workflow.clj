@@ -33,8 +33,6 @@
 (declare close!)
 
 (defrecord Engine []
-  ;; No fields of its own: every key lives in the map part, so dissoc of any
-  ;; of them keeps the record (and with it Closeable).
   Closeable
   (close [this] (close! this)))
 
@@ -111,12 +109,12 @@
    timeout-ms has passed, whichever comes first."
   [{in-flight :tenon/in-flight} timeout-ms]
   (when (and in-flight (pos? timeout-ms))
-    (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (let [deadline (+ (System/nanoTime) (* 1000000 (long timeout-ms)))]
       (loop []
         (when-let [done (first (vals @in-flight))]
-          (let [left (- deadline (System/currentTimeMillis))]
-            (when (pos? left)
-              (deref done left nil)
+          (let [left-ms (quot (- deadline (System/nanoTime)) 1000000)]
+            (when (pos? left-ms)
+              (deref done left-ms nil)
               (recur))))))))
 
 (defn close!
