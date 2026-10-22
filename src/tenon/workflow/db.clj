@@ -71,9 +71,9 @@
      start (restarts are not new calls), plus one for each later call that
      reused its stored result. Each row is the called workflow's row
      (every column but idempotence_key), except that
-     :workflow/parent-invocation-id is the caller's, plus :workflow/call-id
-     (identifies the call), :workflow/created-at (when the call happened)
-     and :workflow/reused (true for a reuse). filters is an
+     :workflow/parent-invocation-id is the caller's, plus :event/call-id
+     (identifies the call), :event/created-at (when the call happened)
+     and :event/reused (true for a reuse). filters is an
      optional map of {:state s :wf-def w :top-level-only? t :limit n
      :before call-id}.
 
@@ -85,7 +85,7 @@
 
      :limit caps the number of rows returned - pagination is seek-based,
      not OFFSET-based (which gets slower, and can skip/repeat rows under
-     concurrent writes, as the offset grows): pass the :workflow/call-id of the
+     concurrent writes, as the offset grows): pass the :event/call-id of the
      last row of the previous page as :before to fetch the rows
      immediately after it. Callers asking for n rows and wanting to know
      whether a further page exists should request :limit (inc n) and check
@@ -105,7 +105,7 @@
      invocation it was recorded under), :workflow/current-invocation-id,
      :workflow/parent-invocation-id (the caller's invocation - for REUSED, the
      reusing one's; nil at the top level), :workflow/name,
-     :workflow/state, :workflow/state-changed-at, :workflow/data (metadata
+     :workflow/state, :workflow/state-changed-at, :event/data (metadata
      for STARTED and REUSED, the result otherwise) and :workflow/depth (0 for the workflow itself, 1 for a direct
      sub-workflow, and so on). A workflow whose result an invocation reused
      didn't run under it, so it isn't part of the tree: only the REUSED

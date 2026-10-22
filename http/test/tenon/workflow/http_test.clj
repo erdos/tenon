@@ -582,7 +582,7 @@
                                       {:builder-fn rs/as-unqualified-lower-maps}))]
       (is (= 4 (count ids)))
       (doseq [[hid at] (map vector ids [0 10000 60000 61500])]
-        (jdbc/execute! (test-util/ds) ["UPDATE event SET at = ? WHERE id = ?" at hid])))
+        (jdbc/execute! (test-util/ds) ["UPDATE event SET occurred_at = ? WHERE id = ?" at hid])))
     (-> (visit (href id))
         (has (texts? [:span.wf-summary-duration] ["1.50s"]))
         (has (texts? [:ul.tree :summary :span.tree-time] ["1m 01s" ""])))))

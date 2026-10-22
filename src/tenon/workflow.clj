@@ -238,7 +238,7 @@
 (defn list-pending
   ([] (list-pending *workflow-engine*))
   ([engine] (->> (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})
-                 (remove :workflow/reused)
+                 (remove :event/reused)
                  (vec))))
 
 (defn get-invocation
@@ -274,9 +274,9 @@
    with the keys of get-invocation except :workflow/expired
    (:workflow/parent-invocation-id being the caller's), plus:
 
-     :workflow/call-id    long - identifies the call, the :before cursor
-     :workflow/created-at long - epoch ms of the call
-     :workflow/reused     boolean - whether the call reused a stored result"
+     :event/call-id    long - identifies the call, the :before cursor
+     :event/created-at long - epoch ms of the call
+     :event/reused     boolean - whether the call reused a stored result"
   ([filters] (list-invocations *workflow-engine* filters))
   ([engine filters] (db/top-level-workflows (:tenon/db engine) filters)))
 
@@ -303,7 +303,7 @@
      :workflow/state                 string - \"STARTED\", \"DONE\", \"ERROR\" or
                                      \"REUSED\" (a caller got its stored outcome)
      :workflow/state-changed-at      long - epoch ms of entering state
-     :workflow/data                  string - EDN of the metadata (STARTED,
+     :event/data                  string - EDN of the metadata (STARTED,
                                      REUSED) or of the result (DONE, ERROR),
                                      or nil
      :workflow/depth                 long - 0 for the workflow itself, 1 for a

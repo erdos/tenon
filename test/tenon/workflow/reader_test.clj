@@ -14,14 +14,14 @@
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow.fixtures/add-numbers"))
         events (test-util/timeline (:workflow/invocation-id wf))]
     (is (= [3 4] (edn/read-string (:workflow/params wf))))
-    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :workflow/data (pr-str 7)}] events))))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :event/data (pr-str 7)}] events))))
 
 (deftest tagged-defn-error-path-test
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"kaboom" (fixtures/boom "kaboom")))
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow.fixtures/boom"))
         events (test-util/timeline (:workflow/invocation-id wf))]
     (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"}] events))
-    (is (match? {:cause "kaboom"} (edn/read-string (:workflow/data (last events)))))))
+    (is (match? {:cause "kaboom"} (edn/read-string (:event/data (last events)))))))
 
 (deftest tagged-defn-with-docstring-test
   (is (match? {:doc "Multiplies two numbers."
@@ -33,7 +33,7 @@
   (let [wf (first (test-util/find-by-wf-def "tenon.workflow.fixtures/with-docstring"))
         events (test-util/timeline (:workflow/invocation-id wf))]
     (is (= [3 4] (edn/read-string (:workflow/params wf))))
-    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :workflow/data (pr-str 12)}] events))))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :event/data (pr-str 12)}] events))))
 
 (deftest tagged-defn-restart-via-reader-path-test
   ;; Exercises the real user-facing path end to end: #workflow tag ->
@@ -70,7 +70,7 @@
   (let [wf (test-util/find-by-wf-def-and-params "tenon.workflow.fixtures/fibonacci" (pr-str [10]))
         events (test-util/timeline (:workflow/invocation-id wf))]
     (is (= [10] (edn/read-string (:workflow/params wf))))
-    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :workflow/data (pr-str 55)}] events))))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :event/data (pr-str 55)}] events))))
 
 (deftest tagged-defn-fibonacci-recursive-calls-are-audited-and-deduped-test
   ;; fibonacci's own recursive calls now go through run-invocation too (not
@@ -97,11 +97,11 @@
   (is (= "Hello Bob" (fixtures/say-hi-twice "Bob")))
   (let [parent (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/say-hi-twice")))
         child (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/say-hi")))]
-    (is (match? [{:workflow/depth 0 :workflow/invocation-id parent :workflow/parent-invocation-id nil? :workflow/name "tenon.workflow.fixtures/say-hi-twice" :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 1 :workflow/invocation-id child :workflow/parent-invocation-id parent :workflow/name "tenon.workflow.fixtures/say-hi" :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 1 :workflow/invocation-id child :workflow/parent-invocation-id parent :workflow/name "tenon.workflow.fixtures/say-hi" :workflow/state "DONE" :workflow/data (pr-str "Hello Bob")}
-                 {:workflow/depth 1 :workflow/invocation-id child :workflow/parent-invocation-id parent :workflow/name "tenon.workflow.fixtures/say-hi" :workflow/state "REUSED" :workflow/data "{}"}
-                 {:workflow/depth 0 :workflow/invocation-id parent :workflow/parent-invocation-id nil? :workflow/name "tenon.workflow.fixtures/say-hi-twice" :workflow/state "DONE" :workflow/data (pr-str "Hello Bob")}]
+    (is (match? [{:workflow/depth 0 :workflow/invocation-id parent :workflow/parent-invocation-id nil? :workflow/name "tenon.workflow.fixtures/say-hi-twice" :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 1 :workflow/invocation-id child :workflow/parent-invocation-id parent :workflow/name "tenon.workflow.fixtures/say-hi" :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 1 :workflow/invocation-id child :workflow/parent-invocation-id parent :workflow/name "tenon.workflow.fixtures/say-hi" :workflow/state "DONE" :event/data (pr-str "Hello Bob")}
+                 {:workflow/depth 1 :workflow/invocation-id child :workflow/parent-invocation-id parent :workflow/name "tenon.workflow.fixtures/say-hi" :workflow/state "REUSED" :event/data "{}"}
+                 {:workflow/depth 0 :workflow/invocation-id parent :workflow/parent-invocation-id nil? :workflow/name "tenon.workflow.fixtures/say-hi-twice" :workflow/state "DONE" :event/data (pr-str "Hello Bob")}]
                 (engine/full-timeline parent)))))
 
 (deftest tagged-defn-fibonacci-full-timeline-test
@@ -113,18 +113,18 @@
                                     "tenon.workflow.fixtures/fibonacci" (pr-str [n]))))
         [f0 f1 f2 f3 f4] (map id (range 5))
         fib "tenon.workflow.fixtures/fibonacci"]
-    (is (match? [{:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 1 :workflow/invocation-id f3 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 2 :workflow/invocation-id f2 :workflow/parent-invocation-id f3   :workflow/name fib :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 3 :workflow/invocation-id f1 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 3 :workflow/invocation-id f1 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "DONE"    :workflow/data (pr-str 1)}
-                 {:workflow/depth 3 :workflow/invocation-id f0 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 3 :workflow/invocation-id f0 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "DONE"    :workflow/data (pr-str 0)}
-                 {:workflow/depth 2 :workflow/invocation-id f2 :workflow/parent-invocation-id f3   :workflow/name fib :workflow/state "DONE"    :workflow/data (pr-str 1)}
-                 {:workflow/depth 2 :workflow/invocation-id f1 :workflow/parent-invocation-id f3   :workflow/name fib :workflow/state "REUSED"  :workflow/data "{}"}
-                 {:workflow/depth 1 :workflow/invocation-id f3 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "DONE"    :workflow/data (pr-str 2)}
-                 {:workflow/depth 1 :workflow/invocation-id f2 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "REUSED"  :workflow/data "{}"}
-                 {:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "DONE"    :workflow/data (pr-str 3)}]
+    (is (match? [{:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 1 :workflow/invocation-id f3 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 2 :workflow/invocation-id f2 :workflow/parent-invocation-id f3   :workflow/name fib :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 3 :workflow/invocation-id f1 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 3 :workflow/invocation-id f1 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "DONE"    :event/data (pr-str 1)}
+                 {:workflow/depth 3 :workflow/invocation-id f0 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 3 :workflow/invocation-id f0 :workflow/parent-invocation-id f2   :workflow/name fib :workflow/state "DONE"    :event/data (pr-str 0)}
+                 {:workflow/depth 2 :workflow/invocation-id f2 :workflow/parent-invocation-id f3   :workflow/name fib :workflow/state "DONE"    :event/data (pr-str 1)}
+                 {:workflow/depth 2 :workflow/invocation-id f1 :workflow/parent-invocation-id f3   :workflow/name fib :workflow/state "REUSED"  :event/data "{}"}
+                 {:workflow/depth 1 :workflow/invocation-id f3 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "DONE"    :event/data (pr-str 2)}
+                 {:workflow/depth 1 :workflow/invocation-id f2 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "REUSED"  :event/data "{}"}
+                 {:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "DONE"    :event/data (pr-str 3)}]
                 (engine/full-timeline f4)))))
 
 (deftest tagged-defn-fibonacci-reuses-earlier-call-full-timeline-test
@@ -139,10 +139,10 @@
                                     "tenon.workflow.fixtures/fibonacci" (pr-str [n]))))
         [f2 f3 f4] (map id [2 3 4])
         fib "tenon.workflow.fixtures/fibonacci"]
-    (is (match? [{:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "STARTED" :workflow/data "{}"}
-                 {:workflow/depth 1 :workflow/invocation-id f3 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "REUSED"  :workflow/data "{}"}
-                 {:workflow/depth 1 :workflow/invocation-id f2 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "REUSED"  :workflow/data "{}"}
-                 {:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "DONE"    :workflow/data (pr-str 3)}]
+    (is (match? [{:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "STARTED" :event/data "{}"}
+                 {:workflow/depth 1 :workflow/invocation-id f3 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "REUSED"  :event/data "{}"}
+                 {:workflow/depth 1 :workflow/invocation-id f2 :workflow/parent-invocation-id f4   :workflow/name fib :workflow/state "REUSED"  :event/data "{}"}
+                 {:workflow/depth 0 :workflow/invocation-id f4 :workflow/parent-invocation-id nil? :workflow/name fib :workflow/state "DONE"    :event/data (pr-str 3)}]
                 (engine/full-timeline f4)))))
 
 (deftest tagged-defn-repeated-call-is-listed-twice-test
@@ -151,8 +151,8 @@
   (is (= 7 (fixtures/add-numbers 3 4)))
   (is (= 7 (fixtures/add-numbers 3 4)))
   (let [id (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow.fixtures/add-numbers")))]
-    (is (match? [{:workflow/invocation-id id :workflow/state "DONE" :workflow/reused true}
-                 {:workflow/invocation-id id :workflow/state "DONE" :workflow/reused false}]
+    (is (match? [{:workflow/invocation-id id :workflow/state "DONE" :event/reused true}
+                 {:workflow/invocation-id id :workflow/state "DONE" :event/reused false}]
                 (engine/list-invocations {:wf-def "tenon.workflow.fixtures/add-numbers"})))))
 
 (deftest tagged-defn-unbound-workflow-engine-throws-test

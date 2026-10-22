@@ -62,7 +62,7 @@
       id                   INTEGER PRIMARY KEY,
       workflow_id          INTEGER NOT NULL,
       state                TEXT    NOT NULL CHECK (state IN ('STARTED', 'DONE', 'ERROR', 'REUSED')),
-      at                   INTEGER NOT NULL,
+      occurred_at          INTEGER NOT NULL,
       data                 TEXT,     -- metadata (STARTED, REUSED) or result (DONE, ERROR)
       invocation_id        INTEGER,  -- DONE, ERROR, REUSED: the invocation finished or reused
       expires_at           INTEGER,  -- STARTED: the lease
@@ -121,7 +121,7 @@
    ;; A workflow's current state, all fields: the pointers resolved.
    "CREATE VIEW IF NOT EXISTS workflow_state AS
     SELECT w.id AS workflow_id, w.invocation_id, d.name, f.params, f.parent_invocation_id,
-           w.state, s.at AS state_changed_at, s.expires_at, i.data AS metadata,
+           w.state, s.occurred_at AS state_changed_at, s.expires_at, i.data AS metadata,
            iif(w.state = 'STARTED', NULL, s.data) AS result
       FROM workflow w
       CROSS JOIN event s ON s.id = w.state_id
@@ -132,16 +132,16 @@
    ;; an INSERT into this view checks and claims the idempotence key and
    ;; logs the first event (whose id the INSERT computes, RETURNING it).
    ;; RAISE(IGNORE) drops the row, so a taken key returns nothing.
-   "CREATE VIEW IF NOT EXISTS new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, at, expires_at)
+   "CREATE VIEW IF NOT EXISTS new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at, expires_at)
       AS SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL WHERE 0"
    "CREATE TRIGGER IF NOT EXISTS new_workflow INSTEAD OF INSERT ON new_workflow
     BEGIN
       SELECT RAISE(IGNORE) FROM idempotence WHERE key = NEW.key;
       INSERT INTO idempotence (key, workflow_id) VALUES (NEW.key, NEW.id);
       INSERT OR IGNORE INTO wf_def (name) VALUES (NEW.wf_def);
-      INSERT INTO event (id, workflow_id, state, at, data, expires_at, parent_invocation_id, wf_def_id,
+      INSERT INTO event (id, workflow_id, state, occurred_at, data, expires_at, parent_invocation_id, wf_def_id,
                          prev_call_id, params)
-      VALUES (NEW.id, NEW.id, 'STARTED', NEW.at, NEW.metadata, NEW.expires_at, NEW.parent_invocation_id,
+      VALUES (NEW.id, NEW.id, 'STARTED', NEW.occurred_at, NEW.metadata, NEW.expires_at, NEW.parent_invocation_id,
               (SELECT id FROM wf_def WHERE name = NEW.wf_def),
               (SELECT w.last_call_id FROM event p JOIN workflow w ON w.id = p.workflow_id
                 WHERE p.id = NEW.parent_invocation_id),
@@ -157,13 +157,18 @@
   "Rows keyed by their lower-case column labels, as in the SQL."
   {:builder-fn rs/as-unqualified-lower-maps})
 
+(def ^:private event-columns #{"call_id" "created_at" "reused" "data"})
+
 (def ^:private opts
   "Rows of Storage methods: column labels become kebab-case keywords
-   qualified with :workflow, e.g. state_changed_at -> :workflow/state-changed-at."
+   qualified with :event for the event columns (call_id, created_at, reused,
+   data) and :workflow for the rest, e.g. state_changed_at ->
+   :workflow/state-changed-at."
   {:builder-fn (fn [rs opts]
-                 (rs/as-modified-maps rs (assoc opts
-                                                :label-fn #(str/replace (str/lower-case %) \_ \-)
-                                                :qualifier-fn (constantly "workflow"))))})
+                 (rs/as-unqualified-modified-maps
+                  rs (assoc opts :label-fn #(let [label (str/lower-case %)]
+                                              (str (if (event-columns label) "event/" "workflow/")
+                                                   (str/replace label \_ \-))))))})
 
 (defn- write!
   "Runs a write statement, returning its first row (RETURNING) if any."
@@ -175,7 +180,7 @@
    current state of its workflow (so STARTED, and neither finished,
    timed out nor restarted) and, when expired-only?, its lease is over."
   [ds invocation-id state result-edn-str expired-only?]
-  (some? (write! ds [(str "INSERT INTO event (workflow_id, state, at, data, invocation_id, prev_id)
+  (some? (write! ds [(str "INSERT INTO event (workflow_id, state, occurred_at, data, invocation_id, prev_id)
                                       SELECT w.id, ?, " now-ms ", ?, w.invocation_id, w.state_id
                                         FROM event i
                                         JOIN workflow w ON w.id = i.workflow_id
@@ -185,7 +190,7 @@
                      state result-edn-str invocation-id])))
 
 (def ^:private call-columns
-  (str "c.id AS call_id, c.at AS created_at, c.parent_invocation_id, c.state = 'REUSED' AS reused, "
+  (str "c.id AS call_id, c.occurred_at AS created_at, c.parent_invocation_id, c.state = 'REUSED' AS reused, "
        "s.invocation_id, s.name, s.params, s.state, s.state_changed_at, s.expires_at, s.metadata, s.result"))
 
 (defn- calls-sql
@@ -277,7 +282,7 @@
 
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
     (:id (write! this [(str "INSERT INTO new_workflow (key, id, wf_def, params, parent_invocation_id,
-                                                                  metadata, at, expires_at)
+                                                                  metadata, occurred_at, expires_at)
                                         SELECT ?, coalesce(max(id), 0) + 1, ?, ?, ?, ?, " now-ms ", " now-ms " + ?
                                           FROM event
                                         RETURNING id")
@@ -291,7 +296,7 @@
     (finish! this invocation-id "ERROR" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
-    (:id (write! this [(str "INSERT INTO event (workflow_id, state, at, data, expires_at, prev_id)
+    (:id (write! this [(str "INSERT INTO event (workflow_id, state, occurred_at, data, expires_at, prev_id)
                                         SELECT w.id, 'STARTED', " now-ms ", ?, " now-ms " + ?, w.state_id
                                           FROM event i
                                           JOIN workflow w ON w.id = i.workflow_id
@@ -300,7 +305,7 @@
                        metadata-edn-str timeout-ms invocation-id])))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
-    (write! this [(str "INSERT INTO event (workflow_id, state, at, data, invocation_id,
+    (write! this [(str "INSERT INTO event (workflow_id, state, occurred_at, data, invocation_id,
                                                       parent_invocation_id, wf_def_id, prev_id, prev_call_id)
                                    SELECT w.id, 'REUSED', " now-ms ", ?, i.id, ?, f.wf_def_id, w.last_reuse_id,
                                           (SELECT pw.last_call_id FROM event p JOIN workflow pw ON pw.id = p.workflow_id
@@ -334,7 +339,7 @@
      (db/top-level-workflows this nil))
     ([this filters]
      (let [[sql params] (calls-sql filters)]
-       (mapv #(update % :workflow/reused pos?) (jdbc/execute! this (into [sql] params) opts)))))
+       (mapv #(update % :event/reused pos?) (jdbc/execute! this (into [sql] params) opts)))))
 
   (top-level-wf-defs [this top-level-only?]
     (mapv :name (jdbc/execute! this ["SELECT name FROM wf_def WHERE top_level OR NOT ? ORDER BY name"
@@ -388,7 +393,7 @@
           )
         SELECT coalesce(e.invocation_id, e.id) AS invocation_id, w.invocation_id AS current_invocation_id,
                iif(e.state = 'REUSED', e.parent_invocation_id, f.parent_invocation_id) AS parent_invocation_id,
-               d.name, e.state, e.at AS state_changed_at, e.data, x.depth
+               d.name, e.state, e.occurred_at AS state_changed_at, e.data, x.depth
           FROM entry x
           CROSS JOIN event e ON e.id = x.id
           CROSS JOIN workflow w ON w.id = e.workflow_id

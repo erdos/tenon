@@ -127,7 +127,7 @@
    "STARTED" {:symbol "\u25B6" :verb "Called"}
    "REUSED"  {:symbol "\u21BA" :verb "Called"}})
 
-(defn effective-state [{:workflow/keys [reused state]}]
+(defn effective-state [{:event/keys [reused] :workflow/keys [state]}]
   (if reused "REUSED" state))
 
 (defn state-symbol

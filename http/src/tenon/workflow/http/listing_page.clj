@@ -9,7 +9,7 @@
 (defn- call-duration
   "How long the call ran - from its first start to its outcome, or while
    still STARTED, for how long it has been running. A reuse didn't run."
-  [{:workflow/keys [created-at state-changed-at] :as row} now]
+  [{:event/keys [created-at] :workflow/keys [state-changed-at] :as row} now]
   (case (ui/effective-state row)
     "REUSED" (ui/muted "—")
     "STARTED" (let [d (ui/format-duration (- now created-at))]
@@ -33,7 +33,7 @@
      [:thead [:tr [:th "Timestamp"] [:th "Id"] [:th "Workflow"] (when show-all? [:th "Parent"])
               [:th "Duration"] [:th.state "State"]]]
      [:tbody
-      (for [{wf-name :workflow/name :workflow/keys [invocation-id created-at parent-invocation-id] :as row} rows
+      (for [{wf-name :workflow/name :workflow/keys [invocation-id parent-invocation-id] :event/keys [created-at] :as row} rows
             :let [href (ui/uri :workflows invocation-id)]]
         [:tr {:class (str "state-" (ui/effective-state row))}
          [:td [:a {:href href} (ui/timestamp created-at)]]
@@ -98,7 +98,7 @@
                                        :limit page-size :before before})
         has-more? (> (count rows) page-size)
         page-rows (vec (take page-size rows))
-        next-cursor (when has-more? (:workflow/call-id (last page-rows)))]
+        next-cursor (when has-more? (:event/call-id (last page-rows)))]
     (ui/layout "Workflows"
                {:refresh (when refresh? refresh-seconds)}
                [:div

@@ -30,9 +30,9 @@
 (def call-shape
   "top-level-workflows rows."
   (assoc workflow-shape
-         :workflow/call-id    int?
-         :workflow/created-at int?
-         :workflow/reused     boolean?))
+         :event/call-id    int?
+         :event/created-at int?
+         :event/reused     boolean?))
 
 (def timeline-shape
   "full-timeline rows."
@@ -42,7 +42,7 @@
    :workflow/name                string?
    :workflow/state                 #{"STARTED" "DONE" "ERROR" "REUSED"}
    :workflow/state-changed-at      int?
-   :workflow/data                  (nilable string?)
+   :event/data                  (nilable string?)
    :workflow/depth                 nat-int?})
 
 (defn- check-shape [shape row]
@@ -108,7 +108,7 @@
       (doseq [filters [nil {} {:state "STARTED"} {:state "ERROR"} {:state "ERROR" :top-level-only? false}
                        {:state "DONE" :top-level-only? false} {:wf-def "contract/child"}
                        {:wf-def "contract/child" :top-level-only? false} {:limit 1}
-                       {:before (:workflow/call-id (first calls)) :top-level-only? false}]]
+                       {:before (:event/call-id (first calls)) :top-level-only? false}]]
         (testing (str "top-level-workflows " filters)
           (let [rows (if (nil? filters) (db/top-level-workflows storage) (db/top-level-workflows storage filters))]
             (is (seq rows))

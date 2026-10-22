@@ -98,7 +98,7 @@
 (defn- error-title
   "\"class: message\" of an ERROR event, for a chip's tooltip."
   [ev]
-  (let [error (ui/read-edn (:workflow/data ev))
+  (let [error (ui/read-edn (:event/data ev))
         {:keys [type message]} (first (:via error))]
     (str (or (:class error) type) ": " (or (:message error) (:cause error) message))))
 
@@ -106,7 +106,7 @@
   "The exception class of an ERROR event, its package muted so the class
    name stands out - nil if the saved error has none."
   [ev]
-  (let [error (ui/read-edn (:workflow/data ev))
+  (let [error (ui/read-edn (:event/data ev))
         cls (when (map? error) (or (:class error) (:type (first (:via error)))))]
     (when cls
       (let [cls (str cls)
@@ -172,14 +172,14 @@
 (defmulti ^:private event-fold-body :workflow/state)
 
 (defmethod event-fold-body "ERROR" [ev]
-  (when-some [data (:workflow/data ev)] (error-body data)))
+  (when-some [data (:event/data ev)] (error-body data)))
 
 (defmethod event-fold-body "STARTED" [ev]
-  (when-some [data (:workflow/data ev)]
+  (when-some [data (:event/data ev)]
     [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]))
 
 (defmethod event-fold-body "REUSED" [ev]
-  (when-some [data (:workflow/data ev)]
+  (when-some [data (:event/data ev)]
     [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]))
 
 (defmethod event-fold-body :default [_] nil)
@@ -215,7 +215,7 @@
    producing invocation only when that isn't the reused workflow's current
    one (it was restarted since). With metadata it folds (closed) to it,
    otherwise there is nothing in it to fold."
-  [start {wf-name :workflow/name :workflow/keys [current-invocation-id invocation-id data] :as ev}]
+  [start {wf-name :workflow/name :workflow/keys [current-invocation-id invocation-id] :event/keys [data] :as ev}]
   (let [row (list
              (tree-offset start ev "Invoked")
              (ui/workflow-name wf-name)

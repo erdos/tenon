@@ -25,7 +25,7 @@
    library reads it only as part of db/full-timeline."
   [ds invocation-id]
   (jdbc/execute! ds ["SELECT e.id, coalesce(e.invocation_id, e.id) AS invocation_id,
-                             e.state, e.at AS state_changed_at, e.data,
+                             e.state, e.occurred_at AS state_changed_at, e.data,
                              iif(e.state = 'REUSED', e.parent_invocation_id, f.parent_invocation_id)
                                AS parent_invocation_id
                         FROM event e NOT INDEXED
@@ -34,9 +34,9 @@
                        ORDER BY e.id"
                      invocation-id]
                  {:builder-fn (fn [rs opts]
-                                (rs/as-modified-maps rs (assoc opts
-                                                               :label-fn #(str/replace (str/lower-case %) \_ \-)
-                                                               :qualifier-fn (constantly "workflow"))))}))
+                                (rs/as-unqualified-modified-maps
+                                 rs (assoc opts :label-fn #(str (if (= "data" (str/lower-case %)) "event/" "workflow/")
+                                                                (str/replace (str/lower-case %) \_ \-)))))}))
 
 (defn timeline
   "The states of the workflow invocation-id belongs to - not those of its
@@ -48,7 +48,7 @@
   "Workflows (of any nesting) whose wf_def is exactly wf-def, newest
    first, via the public tenon.workflow/list-invocations - reuses left out."
   [wf-def]
-  (remove :workflow/reused (engine/list-invocations {:wf-def wf-def :top-level-only? false})))
+  (remove :event/reused (engine/list-invocations {:wf-def wf-def :top-level-only? false})))
 
 (defn find-by-wf-def-and-params
   "The workflow run with exactly this wf-def and params (an edn string), or
@@ -87,7 +87,7 @@
   "Moves the lease end of STARTED invocation-id into the past, so it looks
    like it started long ago and timed out."
   [ds invocation-id]
-  (jdbc/execute! ds ["UPDATE event SET at = 0, expires_at = 1 WHERE id = ? AND state = 'STARTED'"
+  (jdbc/execute! ds ["UPDATE event SET occurred_at = 0, expires_at = 1 WHERE id = ? AND state = 'STARTED'"
                      invocation-id]))
 
 (defn temp-db-fixture [f]
