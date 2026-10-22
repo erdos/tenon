@@ -355,15 +355,14 @@
 (defn html
   "The page of the workflow requested-id belongs to as an HTML string, or
    nil if there is no such workflow. restart-error, if not nil, is a
-   failed restart's message to show. theme is the colour theme map."
-  [theme requested-id restart-error]
+   failed restart's message to show."
+  [requested-id restart-error]
   (when-let [wf (engine/get-invocation requested-id)]
     (let [id (:workflow/invocation-id wf)
           events (engine/full-timeline id)
           ancestors (ancestors-of wf)]
       (ui/layout (:workflow/name wf)
-              {:theme theme
-               :back [(ui/uri) "Workflows"]
+              {:back [(ui/uri) "Workflows"]
                :tab-title (str (ui/state-symbol (:workflow/state wf)) " " (:workflow/name wf) " \u00B7 " id)}
               [:div
                (when (seq ancestors)

@@ -61,7 +61,7 @@
             (and get? (= uri "/")) (html-response (listing-page/html query-params))
             (and get? (= uri "/workflows/pending")) (pending!)
             (and id restart (= :post request-method)) (restart! id (= "true" (get query-params "recursive")))
-            (and id get? (not restart)) (some-> (details-page/html nil id (not-empty (get query-params "restart_error")))
+            (and id get? (not restart)) (some-> (details-page/html id (not-empty (get query-params "restart_error")))
                                                 html-response))
           (response/not-found {:error "not found"})))))
 

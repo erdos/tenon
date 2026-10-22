@@ -12,6 +12,7 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [tenon.workflow.http :as http]
+            [tenon.workflow.ui :as ui]
             [tenon.workflow :as engine]
             [tenon.workflow.kerodon-util :as ku :refer [count? present? texts? attrs? dd-of panel with-text]]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
@@ -463,6 +464,12 @@
         (within [:style]
           (has (some-text? "details[open]>summary::before"))
           (has (regex? "(?s)(?!.*&(?:apos|gt|lt|quot|amp);).*") "no HTML entities")))))
+
+(deftest custom-theme-is-rendered-as-css-variables-test
+  (binding [ui/*theme* {:radius "9px" :colors {:bg ["#123456" "#654321"] :neutral "#abcdef"}}]
+    (-> (visit "/")
+        (within [:style]
+          (has (some-text? ":root{color-scheme:light dark;--bg:light-dark(#123456,#654321);--neutral:#abcdef;--radius:9px;}"))))))
 
 (deftest workflow-detail-page-404-for-unknown-id-test
   (-> (visit "/workflows/does-not-exist")

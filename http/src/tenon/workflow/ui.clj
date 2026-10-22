@@ -264,9 +264,29 @@
    (when note (into [:p.wf-summary-note] note))
    (into [:dl.wf-facts] facts)])
 
-(def page-style
-  "The stylesheet every page inlines."
-  (slurp (io/resource "tenon/workflow/ui.css")))
+(def default-theme
+  (edn/read-string (slurp (io/resource "tenon/workflow/theme.edn"))))
+
+(def ^:dynamic *theme* default-theme)
+
+(defn theme-css
+  "Renders a theme map as CSS custom properties on :root. A [light dark] pair
+   becomes light-dark(light, dark); a string is used as is."
+  [{:keys [colors radius selection]}]
+  (str ":root{color-scheme:light dark;"
+       (str/join (for [[k v] colors]
+                   (str "--" (name k) ":"
+                        (if (vector? v) (str "light-dark(" (first v) "," (second v) ")") v)
+                        ";")))
+       (when radius (str "--radius:" radius ";"))
+       "}\n"
+       (when selection
+         (str "::selection{background:" (:background selection) ";color:" (:color selection) "}\n"))
+       ":root[data-theme=light]{color-scheme:light}\n"
+       ":root[data-theme=dark]{color-scheme:dark}\n"))
+
+(defn page-style [theme]
+  (str (theme-css theme) (slurp (io/resource "tenon/workflow/ui.css"))))
 
 (def page-sizes [100 500 1000 5000])
 (def default-page-size 100)
@@ -302,7 +322,7 @@
          [:head [:title (or tab-title title)]
           (when refresh [:meta {:http-equiv "refresh" :content (str refresh)}])
           [:script (hiccup/raw saved-theme-js)]
-          [:style (hiccup/raw page-style)]]
+          [:style (hiccup/raw (page-style *theme*))]]
          [:body
           [:header.page-head
            [:h1 title]

@@ -89,7 +89,7 @@
       (for [ps ui/page-sizes]
         [:option (cond-> {:value ps} (= ps (:page-size f)) (assoc :selected true)) ps])]]]
    (if next-cursor
-     [:a.btn {:href (ui/uri (assoc (listing-params f) :before_id next-cursor))} "Next page →"]
+     [:a.btn.primary {:href (ui/uri (assoc (listing-params f) :before_id next-cursor))} "Next page →"]
      [:span.btn.disabled "Next page →"])])
 
 (defn- dashboard-html [{:keys [state wf-def show-all? page-size refresh?] :as f} before]

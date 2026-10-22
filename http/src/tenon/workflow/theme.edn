@@ -1,0 +1,37 @@
+{:radius "2px"
+ :selection {:background "#EFD9DD" :color "#151515"}
+ :colors
+ {:text-strong ["#151515" "#f0f0f0"]
+  :text ["#333" "#d8d8d8"]
+  :text-dim "color-mix(in srgb,var(--text) 82%,var(--bg))"
+  :text-muted "color-mix(in srgb,var(--text) 68%,var(--bg))"
+  :text-faint "color-mix(in srgb,var(--text) 50%,var(--bg))"
+  :link ["#663F86" "#7ab7ff"]
+  :accent ["#5E4691" "#8a72cc"]
+  :on-accent "#fff"
+  :chip-text ["#fff" "#1a1a1a"]
+  :bg ["#fff" "#1b1d21"]
+  :bg-subtle ["#F7F7F7" "#22252a"]
+  :bg-code ["#f5f5f5" "#14161a"]
+  :bg-hover ["#EEEBF3" "#2c3036"]
+  :bg-active ["#DBD7E5" "#343941"]
+  :border ["#ccc" "#3d4249"]
+  :border-soft ["#ddd" "#333840"]
+  :border-faint ["#eee" "#2a2e34"]
+  :border-strong ["rgba(0,0,0,.25)" "rgba(255,255,255,.28)"]
+  :connector ["#aaa" "#5a6068"]
+  :shadow ["rgba(0,0,0,.12)" "rgba(0,0,0,.5)"]
+  :danger ["#A14B5C" "#ff8787"]
+  :error-text ["#8A3C4B" "#ff9c9c"]
+  :danger-bg ["#F4E3E6" "#4a2024"]
+  :danger-bg-hover ["#EFD9DD" "#5c2a2f"]
+  :danger-border ["#CE8995" "#a33c3c"]
+  :warn-bg ["#F0E4D6" "#4a4017"]
+  :warn-text ["#7A5532" "#f2d675"]
+  :info-bg ["#DBD7E5" "#16344d"]
+  :info-border ["#5E4691" "#2f7cb8"]
+  :neutral ["#ced4da" "#4a4f57"]
+  :done ["#4D9F7C" "#5cbf6e"]
+  :started ["#A27549" "#d9a916"]
+  :reused-tint ["#E4DFEE" "#1f2f4a"]
+  :reused-strong ["#5E4691" "#7c93e6"]}}
