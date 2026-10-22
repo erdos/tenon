@@ -41,9 +41,10 @@
    wrap-handler/app: {:tenon/db ... :tenon/timeout-ms ... :tenon/in-flight ... :tenon/on-event ... :tenon/metadata-fn ...}.
 
    db-path names a SQLite file (creating it if needed); tenon.workflow.sqlite
-   opens it (sqlite/datasource) and tenon.workflow.db/init-db! - a
-   Storage protocol method - ensures its schema exists, before it's
-   stored under :tenon/db. Additional key/value pairs override the
+   opens it (sqlite/datasource). Any other value is taken for a Storage
+   (and Timeouts) already built, e.g. tenon.workflow.redis/datasource.
+   tenon.workflow.db/init-db! - a Storage protocol method - ensures its
+   schema exists, before it's stored under :tenon/db. Additional key/value pairs override the
    defaults - most usefully :tenon/timeout-ms (the lease of a running
    invocation, 15000 ms: how long it may stay STARTED without its process
    renewing it, before the next call of the same wf+params, a restart or a
@@ -71,7 +72,7 @@
 
    Stop the threads with close!."
   [db-path & {:as opts}]
-  (-> {:tenon/db (db/init-db! (sqlite/datasource db-path))
+  (-> {:tenon/db (db/init-db! (if (string? db-path) (sqlite/datasource db-path) db-path))
        :tenon/timeout-ms 15000
        :tenon/lease-batch-size 500
        :tenon/backoff-base-ms 5
