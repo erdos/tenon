@@ -30,10 +30,14 @@
     (when (:return-keys opts)
       (try (.getGeneratedKeys ps) (catch Exception _)))))
 
-(defn- first-row [^Connection conn ^PreparedStatement ps opts]
+(defn- first-row
+  "The first row of ps's result. Reads the result to its end: SQLite only
+   auto-checkpoints the WAL when a statement steps to its end, so a
+   RETURNING write closed after its first row would let the WAL grow forever."
+  [^Connection conn ^PreparedStatement ps opts]
   (if-let [^ResultSet r (result-set ps opts)]
     (try
-      (reduce (fn [_ row] (reduced (rs/datafiable-row row conn opts)))
+      (reduce (fn [first-row row] (or first-row (rs/datafiable-row row conn opts)))
               nil
               (rs/reducible-result-set r opts))
       (finally (close-quietly r)))
