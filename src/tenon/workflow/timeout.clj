@@ -11,7 +11,8 @@
    Depends on the storage only - tenon.workflow, which this serves, requires
    it."
   (:require [tenon.workflow.db :as db])
-  (:import [java.util.concurrent Executors RejectedExecutionException ScheduledExecutorService ThreadFactory TimeUnit]))
+  (:import [java.util.concurrent RejectedExecutionException ScheduledExecutorService
+            ScheduledThreadPoolExecutor ThreadFactory TimeUnit]))
 
 (defn- emit! [engine event data]
   ((:tenon/on-event engine) event data))
@@ -75,9 +76,13 @@
    (unless nil), the latter first right away - to time out what a previous
    run of this process left behind."
   ^ScheduledExecutorService [engine heartbeat-ms sweep-ms]
-  (let [executor (Executors/newScheduledThreadPool
-                  2 (reify ThreadFactory
-                      (newThread [_ r] (doto (Thread. ^Runnable r "tenon-background") (.setDaemon true)))))
+  (let [executor (doto (ScheduledThreadPoolExecutor.
+                        2 (reify ThreadFactory
+                            (newThread [_ r] (doto (Thread. ^Runnable r "tenon-background") (.setDaemon true)))))
+                   ;; On shutdown, drop the runs still waiting for their time,
+                   ;; but let the one already running finish its write.
+                   (.setExecuteExistingDelayedTasksAfterShutdownPolicy false)
+                   (.setContinueExistingPeriodicTasksAfterShutdownPolicy false))
         ;; Runs (step state) after delay-ms, then again after period-ms with the
         ;; state it returned (or the same, if it threw).
         schedule! (fn schedule! [error-event delay-ms period-ms step state]
@@ -123,8 +128,18 @@
       (or heartbeat-ms sweep-ms)
       (assoc :tenon/background (start-background! engine heartbeat-ms sweep-ms)))))
 
+(def ^:private stop-wait-ms
+  "How long stop! waits for a heartbeat or sweep already running - a single
+   write, bounded by SQLite's 5 s busy timeout - before interrupting it."
+  10000)
+
 (defn stop!
-  "Stops the threads start! started for engine."
+  "Stops the threads start! started for engine: no new heartbeat or sweep
+   runs, and the one running, if any, may finish (for up to 10 s, then it
+   is interrupted). Idempotent."
   [engine]
-  (some-> ^ScheduledExecutorService (:tenon/background engine) .shutdownNow)
+  (when-let [^ScheduledExecutorService executor (:tenon/background engine)]
+    (.shutdown executor)
+    (when-not (.awaitTermination executor stop-wait-ms TimeUnit/MILLISECONDS)
+      (.shutdownNow executor)))
   nil)

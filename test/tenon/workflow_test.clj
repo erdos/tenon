@@ -907,3 +907,80 @@
     (engine/register! #'timeout-inner (fn [n] (* n 2)))
     (is (= 15 (engine/restart-invocation-recursively (:workflow/invocation-id outer))))
     (is (= "DONE" (:workflow/state (engine/get-invocation (:workflow/invocation-id inner)))))))
+
+;; --- Lifecycle ---------------------------------------------------------------
+
+(deftest engine-is-closeable-test
+  (let [e (engine/init test-util/*db-path*)]
+    (is (instance? java.io.Closeable e))
+    (is (instance? java.io.Closeable (assoc e :tenon/metadata-fn (constantly nil)))
+        "assoc keeps the record")
+    (is (instance? java.io.Closeable (dissoc e :tenon/on-event))
+        "dissoc keeps the record")
+    (is (= 3 (engine/run-invocation e #'add-fn add-fn [1 2])) "works as a map")
+    (with-open [_ e])
+    (is (engine/closed? e) "with-open closed it")
+    (is (.isTerminated ^java.util.concurrent.ExecutorService (:tenon/background e))
+        "background threads stopped")
+    (is (thrown? IllegalStateException (engine/get-invocation e 1))
+        "its database is closed")))
+
+(deftest close-is-idempotent-and-shared-by-copies-test
+  (let [e (engine/init test-util/*db-path*)
+        copy (assoc e :tenon/metadata-fn (constantly nil))]
+    (is (not (engine/closed? e)))
+    (is (nil? (engine/close! copy)))
+    (is (engine/closed? e) "closing a copy closes the original")
+    (is (nil? (engine/close! e)) "a second close does nothing")
+    (.close ^java.io.Closeable e)))
+
+(deftest closed-engine-rejects-new-work-test
+  (let [e (engine/init test-util/*db-path*)
+        id (do (engine/run-invocation e #'add-fn add-fn [2 3])
+               (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/add-fn"))))]
+    (engine/close! e)
+    (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/closed}
+                       (engine/run-invocation e #'add-fn add-fn [4 5])))
+    (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/closed}
+                       (engine/restart-invocation e id)))))
+
+(deftest close-waits-for-running-invocations-test
+  ;; With :tenon/close-timeout-ms, close! lets what runs finish - nested
+  ;; calls included - before it closes the database.
+  (let [e (engine/init test-util/*db-path* :tenon/close-timeout-ms 5000)
+        started (promise)
+        release (promise)
+        f (fn [x] (deliver started true) @release
+            (engine/run-invocation #'nested-inner-fn nested-inner-fn [x]))
+        run (future (binding [engine/*workflow-engine* e]
+                      (engine/run-invocation e #'echo-fn f [7])))
+        _ @started
+        closer (future (engine/close! e))]
+    (is (wait-for #(engine/closed? e) 1000))
+    (Thread/sleep 100)
+    (is (not (realized? closer)) "close! waits")
+    (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/closed}
+                       (engine/run-invocation e #'add-fn add-fn [1 1]))
+        "no new work meanwhile")
+    (deliver release true)
+    (is (= 14 @run) "the running invocation and its nested call finished")
+    (is (nil? (deref closer 5000 ::timed-out)))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE"}]
+                (test-util/timeline
+                 (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn")))))
+        "its outcome was recorded")))
+
+(deftest close-without-timeout-does-not-wait-test
+  ;; By default close! does not wait: the running invocation cannot record
+  ;; its outcome and stays STARTED, for a sweep to time out later.
+  (let [e (engine/init test-util/*db-path*)
+        started (promise)
+        release (promise)
+        run (future (engine/run-invocation e #'echo-fn (fn [x] (deliver started true) @release x) [8]))]
+    @started
+    (is (nil? (deref (future (engine/close! e)) 5000 ::timed-out)) "close! returned right away")
+    (deliver release true)
+    (is (thrown? Exception @run) "its caller learns the outcome was not recorded")
+    (is (match? [{:workflow/state "STARTED"}]
+                (test-util/timeline
+                 (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn"))))))))

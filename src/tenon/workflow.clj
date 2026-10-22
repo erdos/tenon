@@ -4,7 +4,8 @@
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
             [tenon.workflow.timeout :as timeout])
-  (:import [java.io Closeable]))
+  (:import [java.io Closeable]
+           [java.util.concurrent.atomic AtomicBoolean]))
 
 (defn register! [v raw-fn]
   (doto v (alter-meta! assoc ::raw-fn raw-fn)))
@@ -28,6 +29,14 @@
 
 (def ^:private local-host-name
   (delay (.getHostName (java.net.InetAddress/getLocalHost))))
+
+(declare close!)
+
+(defrecord Engine []
+  ;; No fields of its own: every key lives in the map part, so dissoc of any
+  ;; of them keeps the record (and with it Closeable).
+  Closeable
+  (close [this] (close! this)))
 
 (defn empty-metadata-fn [_wf-type _args] {})
 
@@ -69,27 +78,81 @@
    to :tenon/backoff-jitter (0.1) of it, so callers polling together
    drift apart.
 
-   Stop the threads with close!."
+   Returns an Engine: a map (assoc, merge and destructuring work as on any
+   map) that is also java.io.Closeable, so it can be opened with with-open.
+   It owns the database and the threads - close it with close! (or .close)
+   once done. A copy made with assoc shares them: closing either closes
+   both, so only the code that called init should close it. See close! for
+   :tenon/close-timeout-ms (0)."
   [db-path & {:as opts}]
-  (-> {:tenon/db (db/init-db! (sqlite/datasource db-path))
-       :tenon/timeout-ms 15000
-       :tenon/lease-batch-size 500
-       :tenon/backoff-base-ms 5
-       :tenon/backoff-multiplier 2
-       :tenon/backoff-max-ms 200
-       :tenon/backoff-jitter 0.1
-       :tenon/in-flight (atom {})
-       :tenon/on-event (fn [_event _data])
-       :tenon/metadata-fn empty-metadata-fn}
+  (-> (map->Engine
+       {:tenon/db (db/init-db! (sqlite/datasource db-path))
+        :tenon/timeout-ms 15000
+        :tenon/lease-batch-size 500
+        :tenon/backoff-base-ms 5
+        :tenon/backoff-multiplier 2
+        :tenon/backoff-max-ms 200
+        :tenon/backoff-jitter 0.1
+        :tenon/close-timeout-ms 0
+        :tenon/in-flight (atom {})
+        :tenon/closed (AtomicBoolean. false)
+        :tenon/on-event (fn [_event _data])
+        :tenon/metadata-fn empty-metadata-fn})
       (merge opts)
       (timeout/start!)))
 
-(defn close!
-  "Stops the background threads of engine, as built by init, and closes its
-   database."
+(defn closed?
+  "Whether close! has been called on engine (or on a copy of it)."
   [engine]
-  (timeout/stop! engine)
-  (.close ^Closeable (:tenon/db engine)))
+  (boolean (some-> ^AtomicBoolean (:tenon/closed engine) .get)))
+
+(defn- await-in-flight
+  "Waits until no invocation runs in this process under engine, or until
+   timeout-ms has passed, whichever comes first."
+  [{in-flight :tenon/in-flight} timeout-ms]
+  (when (and in-flight (pos? timeout-ms))
+    (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+      (loop []
+        (when-let [done (first (vals @in-flight))]
+          (let [left (- deadline (System/currentTimeMillis))]
+            (when (pos? left)
+              (deref done left nil)
+              (recur))))))))
+
+(defn close!
+  "Shuts down engine, as built by init, in this order:
+
+   1. It stops accepting work: run-invocation (unless called from inside a
+      running invocation) and restart-invocation throw ::closed from now on.
+   2. It waits up to :tenon/close-timeout-ms (0 by default: not at all) for
+      the invocations running in this process to finish - the heartbeat
+      still renews their leases meanwhile.
+   3. It stops the heartbeat and the sweep (see tenon.workflow.timeout/stop!).
+   4. It closes the database.
+
+   An invocation still running after that fails to record its outcome, and
+   its caller gets an exception. It stays STARTED in the database until its
+   lease runs out and a sweep (or a call of the same workflow) of any
+   process moves it to TIMEOUT, from where a person can restart it - just
+   like when a process dies.
+
+   Idempotent: only the first call of an engine (or of any copy of it) does
+   anything. Returns nil."
+  [engine]
+  (when-let [^AtomicBoolean closed (:tenon/closed engine)]
+    (when (.compareAndSet closed false true)
+      (try
+        (await-in-flight engine (or (:tenon/close-timeout-ms engine) 0))
+        (timeout/stop! engine)
+        (finally
+          (some-> ^Closeable (:tenon/db engine) .close)))))
+  nil)
+
+(defn- ensure-open!
+  "Throws ::closed if engine was closed - for calls that start work."
+  [engine]
+  (when (closed? engine)
+    (throw (ex-info "Workflow engine is closed" {:type ::closed}))))
 
 (def ^:dynamic *workflow-engine*
   "The current application-state map (as built by init), read by
@@ -241,6 +304,10 @@
    (when-not engine
      (throw (ex-info "Dynamic var *workflow-engine* is not bound."
                      {:type ::precondition-failed})))
+   ;; Calls nested in a running invocation go on, so that close! can let
+   ;; what is running finish.
+   (when (empty? *invocation-stack*)
+     (ensure-open! engine))
    (let [ds (:tenon/db engine)
          timeout-ms (:tenon/timeout-ms engine)
          wf-def-str (str (symbol v))
@@ -357,6 +424,7 @@
   ([invocation-id]
    (restart-invocation *workflow-engine* invocation-id))
   ([engine invocation-id]
+   (ensure-open! engine)
    (let [ds (:tenon/db engine)
          wf (let [wf (or (db/get-workflow ds invocation-id)
                          (throw (ex-info "No such workflow"
