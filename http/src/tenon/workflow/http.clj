@@ -54,8 +54,8 @@
   [engine prefix {:keys [request-method uri query-params]}]
   (binding [ui/*uri-prefix* prefix
             engine/*workflow-engine* engine]
-    (let [[_ id restart] (re-matches #"/workflows/(\d+)(/restart)?" uri)
-          id (some-> id parse-long)
+    (let [[_ id restart] (re-matches #"/workflows/([0-9a-fA-F-]+)(/restart)?" uri)
+          id (some-> id ui/parse-id)
           get? (= :get request-method)]
       (or (cond
             (and get? (= uri "/")) (html-response (listing-page/html query-params))

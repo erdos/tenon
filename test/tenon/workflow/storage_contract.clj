@@ -9,14 +9,20 @@
 
 (defn- nilable [pred] (fn [v] (or (nil? v) (pred v))))
 
+(defn id?
+  "An invocation or call id: an integer (SQLite's) or a string (UUIDs) - opaque,
+   but ordered: newer ids compare greater."
+  [v]
+  (or (int? v) (string? v)))
+
 (def ^:private run-state? #{"STARTED" "DONE" "ERROR" "TIMEOUT"})
 
 (def workflow-shape
   "find-by-wf-def-and-params rows."
-  {:workflow/invocation-id        int?
+  {:workflow/invocation-id        id?
    :workflow/name               string?
    :workflow/params               string?
-   :workflow/parent-invocation-id (nilable int?)
+   :workflow/parent-invocation-id (nilable id?)
    :workflow/state                run-state?
    :workflow/state-changed-at     int?
    :workflow/expires-at           (nilable int?)
@@ -30,15 +36,15 @@
 (def call-shape
   "top-level-workflows rows."
   (assoc workflow-shape
-         :event/call-id    int?
+         :event/call-id    id?
          :event/created-at int?
          :event/reused     boolean?))
 
 (def timeline-shape
   "full-timeline rows."
-  {:workflow/invocation-id         int?
-   :workflow/current-invocation-id int?
-   :workflow/parent-invocation-id  (nilable int?)
+  {:workflow/invocation-id         id?
+   :workflow/current-invocation-id id?
+   :workflow/parent-invocation-id  (nilable id?)
    :workflow/name                string?
    :workflow/state                 #{"STARTED" "DONE" "ERROR" "TIMEOUT" "REUSED"}
    :workflow/state-changed-at      int?
@@ -74,7 +80,7 @@
         failed (db/insert-workflow! storage "contract/failed" "[5]" nil nil nil)
         expiring (db/insert-workflow! storage "contract/expiring" "[4]" nil nil 0)]
     (testing "insert-workflow! returns the invocation id, nil for an existing workflow"
-      (is (every? int? [root child failing failed expiring]))
+      (is (every? id? [root child failing failed expiring]))
       (is (nil? (db/insert-workflow! storage "contract/root" "[1]" nil nil nil))))
     (testing "finish! returns whether it finished the invocation"
       (is (true? (db/finish! storage child "DONE" "42")))
@@ -89,7 +95,7 @@
       (is (false? (db/time-out! storage root "{:message \"timed out\"}")))
       (is (true? (db/time-out! storage expiring "{:message \"timed out\"}"))))
     (testing "restart! returns the new invocation id, nil unless DONE, ERROR or TIMEOUT"
-      (is (int? (db/restart! storage failing "{:actor 2}" nil)))
+      (is (id? (db/restart! storage failing "{:actor 2}" nil)))
       (is (nil? (db/restart! storage failing nil nil))))
     (testing "record-reuse! returns nil"
       (is (nil? (db/record-reuse! storage child root "{:actor 3}")))
@@ -240,7 +246,7 @@
                         wf-def (assoc :wf-def wf-def)
                         limit (assoc :limit limit)
                         before (assoc :before before))
-              expected (cond->> (filter #(or (nil? before) (< (:event/call-id %) before)) matching)
+              expected (cond->> (filter #(or (nil? before) (neg? (compare (:event/call-id %) before))) matching)
                          limit (take (inc limit)))]
           (is (= (call-ids expected) (call-ids (db/top-level-workflows storage filters)))
               (pr-str filters)))))))

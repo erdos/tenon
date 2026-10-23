@@ -118,4 +118,4 @@
                      :show-all? (some? (get query-params "all"))
                      :page-size page-size
                      :refresh? (some? (get query-params "refresh"))}
-                    (some-> page_cursor first parse-long))))
+                    (some-> page_cursor first ui/parse-id))))

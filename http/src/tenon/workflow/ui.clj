@@ -299,6 +299,11 @@
     (for [o options]
       [:option (cond-> {:value o} (= o selected) (assoc :selected true)) o])]])
 
+(defn parse-id
+  "An id from a URL or a form: an integer, or else (UUIDs) the string itself."
+  [s]
+  (or (parse-long s) s))
+
 (defn parse-pagination [query-params cursor-keys]
   (let [page-size (let [n (parse-long (get query-params "page_size" ""))]
                     (if (contains? (set page-sizes) n) n default-page-size))

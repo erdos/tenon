@@ -3,6 +3,7 @@
    Needs a Redis server: TENON_REDIS_URI (default redis://localhost:6379),
    else the tests are skipped."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [taoensso.carmine :as car]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]
@@ -49,70 +50,105 @@
 
 (defn- run-history!
   "Applies n random writes to every storage in storages, one after the
-   other, checking each returns what the first does - the writes include
-   many that must fail: finishing twice, restarting a running workflow,
-   inserting a duplicate, using an invocation that was restarted since.
-   Returns the invocation ids used, in order."
+   other, checking each gives the same outcome - the writes include many
+   that must fail: finishing twice, restarting a running workflow, inserting
+   a duplicate, using an invocation that was restarted since. The storages
+   hand out different ids (integers, UUIDs): an invocation is picked by its
+   position in each storage's own list. Returns those lists."
   [storages seed n]
   (let [rnd (java.util.Random. seed)
         pick (fn [coll] (nth coll (.nextInt rnd (count coll))))
         wf-defs ["h/a" "h/b" "h/c" "h/d"]
-        ids (volatile! [])
+        ids (mapv (fn [_] (volatile! [])) storages)
+        position-of (fn [k] (if (and (pos? (count @(first ids))) (pos? (.nextInt rnd 40)))
+                              (.nextInt rnd (count @(first ids)))
+                              k))
+        id-at (fn [i pos] (if (neg? pos) Long/MAX_VALUE (nth @(nth ids i) pos)))
         each! (fn [f]
-                (let [results (mapv f storages)]
-                  (is (apply = results) (str "storages agree: " (pr-str results)))
-                  (first results)))
-        id-or-none #(if (and (seq @ids) (pos? (.nextInt rnd 40))) (pick @ids) Long/MAX_VALUE)]
+                (let [results (vec (map-indexed f storages))]
+                  (is (apply = (map #(if (or (nil? %) (boolean? %) (set? %)) % :id) results))
+                      (str "storages agree: " (pr-str results)))
+                  results))
+        remember! (fn [results]
+                    (when (every? some? results)
+                      (doseq [[v id] (map vector ids results)] (vswap! v conj id))))]
     (dotimes [i n]
       (case (.nextInt rnd 8)
-        (0 1 2) (let [parent (when (and (seq @ids) (zero? (.nextInt rnd 3))) (pick @ids))
+        (0 1 2) (let [parent (when (and (pos? (count @(first ids))) (zero? (.nextInt rnd 3)))
+                               (.nextInt rnd (count @(first ids))))
                       params (str "[" (.nextInt rnd (quot n 3)) "]")
                       metadata (when (zero? (.nextInt rnd 2)) (str "{:i " i "}"))
                       timeout (pick [nil 60000 0])
                       wf-def (pick wf-defs)]
-                  (when-let [id (each! #(db/insert-workflow! % wf-def params parent metadata timeout))]
-                    (vswap! ids conj id)))
-        3 (let [id (id-or-none) state (pick ["DONE" "ERROR"])
+                  (remember! (each! (fn [k s] (db/insert-workflow! s wf-def params (some->> parent (id-at k)) metadata timeout)))))
+        3 (let [pos (position-of -1) state (pick ["DONE" "ERROR"])
                 result (when (pos? (.nextInt rnd 5)) (str "{:r " i "}"))]
-            (each! #(db/finish! % id state result)))
-        4 (let [id (id-or-none)]
-            (each! #(db/time-out! % id "{:message \"timed out\"}")))
-        5 (let [id (id-or-none)
+            (each! (fn [k s] (db/finish! s (id-at k pos) state result))))
+        4 (let [pos (position-of -1)]
+            (each! (fn [k s] (db/time-out! s (id-at k pos) "{:message \"timed out\"}"))))
+        5 (let [pos (position-of -1)
                 metadata (when (zero? (.nextInt rnd 2)) "{:again true}")
                 timeout (pick [nil 60000 0])]
-            (when-let [new-id (each! #(db/restart! % id metadata timeout))]
-              (vswap! ids conj new-id)))
-        6 (let [id (id-or-none) parent (when (zero? (.nextInt rnd 2)) (id-or-none))
+            (remember! (each! (fn [k s] (db/restart! s (id-at k pos) metadata timeout)))))
+        6 (let [pos (position-of -1) parent (when (zero? (.nextInt rnd 2)) (position-of -1))
                 metadata (when (zero? (.nextInt rnd 2)) "{:reuse 1}")]
-            (each! #(db/record-reuse! % id parent metadata)))
-        7 (let [batch (set (repeatedly (inc (.nextInt rnd 5)) id-or-none))]
-            (each! #(db/extend-lease! % batch 60000)))))
-    @ids))
+            (each! (fn [k s] (db/record-reuse! s (id-at k pos) (some->> parent (id-at k)) metadata))))
+        7 (let [batch (vec (distinct (repeatedly (inc (.nextInt rnd 5)) #(position-of -1))))
+                results (each! (fn [k s]
+                                 (let [extended (db/extend-lease! s (set (map (partial id-at k) batch)) 60000)]
+                                   ;; as positions: the ids differ
+                                   (set (keep (fn [pos] (when (extended (id-at k pos)) pos)) batch)))))]
+            results)))
+    (mapv deref ids)))
 
-(defn- compare-reads! [storages ids]
-  (let [each! (fn [what f]
-                (let [results (mapv f storages)]
-                  (is (apply = results) (str what ": " (pr-str (vec (take 2 results)))))))
-        max-id (+ 5 (apply max 0 ids))]
-    (each! "list-expired" #(mapv without-clock (db/list-expired %)))
-    (each! "top-level-wf-defs" #(db/top-level-wf-defs % true))
-    (each! "all top-level-wf-defs" #(db/top-level-wf-defs % false))
-    (doseq [id (range 0 max-id)]
-      (each! (str "get-workflow " id) #(without-clock (db/get-workflow % id)))
-      (each! (str "full-timeline " id) #(mapv without-clock (db/full-timeline % id))))
-    (each! "find-by-wf-def-and-params"
-           #(vec (for [wf-def ["h/a" "h/b" "h/c" "h/d" "h/none"] i (range 12)]
-                   (without-clock (db/find-by-wf-def-and-params % wf-def (str "[" i "]"))))))
-    (doseq [state [nil "STARTED" "DONE" "ERROR" "TIMEOUT" "REUSED"]
-            wf-def [nil "h/a" "h/none"]
-            top-level-only? [true false]
-            limit [nil 3]
-            before [nil 30 max-id]]
-      (let [filters (cond-> {:top-level-only? top-level-only?}
-                      state (assoc :state state) wf-def (assoc :wf-def wf-def)
-                      limit (assoc :limit limit) before (assoc :before before))]
-        (each! (pr-str filters) #(mapv without-clock (db/top-level-workflows % filters)))))
-    (each! "top-level-workflows" #(mapv without-clock (db/top-level-workflows %)))))
+(def ^:private id-keys
+  #{:workflow/invocation-id :workflow/parent-invocation-id :workflow/current-invocation-id :event/call-id})
+
+(defn- renumbered
+  "data with every id replaced by its rank among the ids in it - ids are
+   ordered, and storages differ in which they hand out."
+  [data]
+  (let [found (volatile! (sorted-set-by compare))]
+    (walk/postwalk (fn [x] (when (map? x) (doseq [k id-keys] (some->> (get x k) (vswap! found conj)))) x) data)
+    (let [rank (zipmap @found (range))]
+      (walk/postwalk (fn [x] (if (map? x)
+                               (reduce (fn [m k] (cond-> m (some? (get m k)) (update k rank))) x id-keys)
+                               x))
+                     data))))
+
+(defn- read-everything
+  "What every read method says about storage, whose invocations are ids."
+  [storage ids]
+  (let [everything (db/top-level-workflows storage {:top-level-only? false})
+        befores (mapv #(when % (some-> (nth everything % nil) :event/call-id)) [nil 15 40 90 1000])]
+    {:list-expired (mapv without-clock (db/list-expired storage))
+     :top-level-wf-defs [(db/top-level-wf-defs storage true) (db/top-level-wf-defs storage false)]
+     :get-workflow (mapv #(without-clock (db/get-workflow storage %)) (conj ids Long/MAX_VALUE))
+     :full-timeline (mapv #(mapv without-clock (db/full-timeline storage %)) (conj ids Long/MAX_VALUE))
+     :find-by-wf-def-and-params
+     (vec (for [wf-def ["h/a" "h/b" "h/c" "h/d" "h/none"] i (range 12)]
+            (without-clock (db/find-by-wf-def-and-params storage wf-def (str "[" i "]")))))
+     :unfiltered (mapv without-clock (db/top-level-workflows storage))
+     :listings (into {}
+                     (for [state [nil "STARTED" "DONE" "ERROR" "TIMEOUT" "REUSED"]
+                           wf-def [nil "h/a" "h/none"]
+                           top-level-only? [true false]
+                           limit [nil 3]
+                           [before-pos before] (map-indexed vector befores)]
+                       [[state wf-def top-level-only? limit before-pos]
+                        (mapv without-clock
+                              (db/top-level-workflows storage
+                                                      (cond-> {:top-level-only? top-level-only?}
+                                                        state (assoc :state state) wf-def (assoc :wf-def wf-def)
+                                                        limit (assoc :limit limit) before (assoc :before before))))]))}))
+
+(defn- compare-reads! [storages id-lists]
+  (let [[expected & others] (mapv (fn [s ids] (renumbered (read-everything s ids))) storages id-lists)]
+    (doseq [other others, k (keys expected)]
+      (if (= :listings k)
+        (doseq [filters (keys (k expected))]
+          (is (= (get-in expected [k filters]) (get-in other [k filters])) (pr-str filters)))
+        (is (= (k expected) (k other)) (name k))))))
 
 (deftest redis-behaves-like-sqlite-test
   (with-redis
@@ -123,13 +159,27 @@
             (with-open [sqlite-ds (sqlite/datasource path)]
               (redis/flush! redis-ds)
               (let [storages [(db/init-db! sqlite-ds) (db/init-db! redis-ds)]
-                    ids (run-history! storages seed 300)]
+                    id-lists (run-history! storages seed 300)]
                 (testing (str "seed " seed)
-                  (is (> (count ids) 80))
-                  (compare-reads! storages ids))))
+                  (is (> (count (first id-lists)) 80))
+                  (compare-reads! storages id-lists))))
             (finally
               (doseq [suffix ["" "-wal" "-shm"]]
                 (.delete (java.io.File. (str path suffix)))))))))))
+
+(deftest redis-ids-are-uuids-in-the-order-they-were-made-test
+  (with-redis
+    (fn [ds]
+      (db/init-db! ds)
+      (let [ids (vec (for [i (range 300)]
+                       (let [id (db/insert-workflow! ds "uuid/w" (str "[" i "]") nil nil nil)]
+                         (when (zero? (mod i 3)) (db/finish! ds id "DONE" "1"))
+                         id)))]
+        (is (every? #(re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}" %) ids))
+        (is (every? #(= % (str (java.util.UUID/fromString %))) ids) "parse as UUIDs")
+        (is (= ids (sort ids)) "later ones sort later, also within the same millisecond")
+        (is (= 300 (count (set ids))))
+        (is (= (reverse ids) (mapv :workflow/invocation-id (db/top-level-workflows ds))) "newest first")))))
 
 ;;; Compare-and-set under concurrency
 

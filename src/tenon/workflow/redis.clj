@@ -3,9 +3,11 @@
    taoensso/carmine. Same contract as the SQLite one; its own data model,
    built for Redis rather than ported from tables:
 
-   - {p}:seq: INCR counter handing out event ids - the global order. Every
-     event (STARTED, DONE, ERROR, TIMEOUT, REUSED) takes one, and a STARTED
-     event's id is the invocation id.
+   - Ids are UUIDv7 strings: the time in ms, a counter and random bits, so
+     that they sort, as strings, in the order they were made (and stay
+     unique, and in order, if the clock goes back). Every event (STARTED,
+     DONE, ERROR, TIMEOUT, REUSED) takes one, and a STARTED event's id is
+     the invocation id. {p}:seq holds the last one's ms and counter.
    - {p}:wf:<id>: string, a workflow (<id> is its first invocation id) with
      everything its row shows, resolved, as one packed blob: the fields
      lease end, state, invocation id, name, params, parent (the first
@@ -21,12 +23,13 @@
      invocation, caller]; {p}:reuses:<id> lists a workflow's, by id, and
      {p}:lr maps a workflow id to its latest.
    - {p}:kids:<id>: sorted set of the call ids a workflow made.
-   - Sorted sets scored by id, newest first by ZREVRANGEBYSCORE, are the
-     indexes: {p}:calls, {p}:calls:top, {p}:calls:def:<wf_def> and
+   - Sorted sets with all scores 0 - so ordered by id - read newest first
+     by ZREVRANGEBYLEX are the indexes: {p}:calls, {p}:calls:top, {p}:calls:def:<wf_def> and
      {p}:calls:deftop:<wf_def> list calls (a workflow's first event, and
      its REUSED events); {p}:state:STARTED/ERROR/TIMEOUT the workflows in a
      state, and {p}:state:<S>:reused those of them that were reused, scored
-     by their latest reuse - so listing a rare state touches only them.
+     by the ms of their latest reuse - so listing a rare state touches only
+     them.
      {p}:leases is scored by lease end. {p}:defs and {p}:defs:top are sets
      of wf_def names - all, and those called at the top level.
 
@@ -62,6 +65,7 @@
 (def ^:private prelude
   "local P = ARGV[1]
    local SEQ = KEYS[1]
+   local RND = ARGV[#ARGV]
    local IDEM, INV, RU, LR = P .. ':idem', P .. ':inv', P .. ':ru', P .. ':lr'
    local function wk(id) return P .. ':wf:' .. id end
    local function hk(id) return P .. ':hist:' .. id end
@@ -78,9 +82,34 @@
      return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
    end
    local function fmt(n) return string.format('%d', n) end
-   local function num(v) if v then return tonumber(v) end return false end
-   local function str(v) if v then return fmt(v) end return false end
-   local function next_id() return fmt(redis.call('INCR', SEQ)) end
+   -- A new id, a UUIDv7: the time in ms, a counter that keeps ids made in one
+   -- ms (or after the clock went back) in order, and random bits from RND.
+   -- Ids sort as strings in the order they were made.
+   local function new_id(t)
+     local last, ms, c = redis.call('GET', SEQ), t, 0
+     if last then
+       local lms, lc = string.match(last, '^(%d+),(%d+)$')
+       lms, lc = tonumber(lms), tonumber(lc)
+       if lms >= t then
+         ms, c = lms, lc + 1
+         if c > 4095 then ms, c = lms + 1, 0 end
+       end
+     end
+     redis.call('SET', SEQ, fmt(ms) .. ',' .. fmt(c))
+     local hex = string.format('%012x', ms)
+     return string.format('%s-%s-7%03x-%x%s-%s', string.sub(hex, 1, 8), string.sub(hex, 9, 12), c,
+                          8 + tonumber(string.sub(RND, 1, 1), 16) % 4, string.sub(RND, 2, 4), string.sub(RND, 5, 16))
+   end
+   -- The time in ms in an id, and whether id a is before b.
+   local function id_ms(id) return tonumber(string.sub(id, 1, 8) .. string.sub(id, 10, 13), 16) end
+   local function id_before(a, b)
+     -- the locale may collate strings otherwise than bytewise
+     for _, r in ipairs({{1, 8}, {10, 13}, {15, 18}, {20, 23}, {25, 36}}) do
+       local x, y = tonumber(string.sub(a, r[1], r[2]), 16), tonumber(string.sub(b, r[1], r[2]), 16)
+       if x ~= y then return x < y end
+     end
+     return false
+   end
    -- A field as <byte length>:<bytes>, - for none; and the first k fields (all) of a packed string.
    local function enc(v) if v then return #v .. ':' .. v end return '-' end
    local function dec(s, k)
@@ -111,14 +140,14 @@
      return redis.call('HGET', INV, id)
    end
    local function hist_add(wid, id, state, at, data, inv)
-     redis.call('RPUSH', hk(wid), cmsgpack.pack({tonumber(id), state, at, data or false, num(inv)}))
+     redis.call('RPUSH', hk(wid), cmsgpack.pack({id, state, at, data or false, inv or false}))
    end
    local function add_call(name, id, top)
-     redis.call('ZADD', P .. ':calls', id, id)
-     redis.call('ZADD', P .. ':calls:def:' .. name, id, id)
+     redis.call('ZADD', P .. ':calls', 0, id)
+     redis.call('ZADD', P .. ':calls:def:' .. name, 0, id)
      if top then
-       redis.call('ZADD', P .. ':calls:top', id, id)
-       redis.call('ZADD', P .. ':calls:deftop:' .. name, id, id)
+       redis.call('ZADD', P .. ':calls:top', 0, id)
+       redis.call('ZADD', P .. ':calls:deftop:' .. name, 0, id)
        redis.call('SADD', P .. ':defs:top', name)
      end
    end
@@ -126,7 +155,7 @@
    local function add_kid(parent, id)
      if parent then
        local pw = resolve(parent)
-       if pw then redis.call('ZADD', kk(pw), id, id) end
+       if pw then redis.call('ZADD', kk(pw), 0, id) end
      end
    end
    local function set_lease(wid, expires)
@@ -140,9 +169,9 @@
        redis.call('ZREM', sk(old) .. ':reused', wid)
      end
      if new ~= 'DONE' then
-       redis.call('ZADD', sk(new), wid, wid)
+       redis.call('ZADD', sk(new), 0, wid)
        local last_reuse = redis.call('HGET', LR, wid)
-       if last_reuse then redis.call('ZADD', sk(new) .. ':reused', last_reuse, wid) end
+       if last_reuse then redis.call('ZADD', sk(new) .. ':reused', id_ms(last_reuse), wid) end
      end
    end
    ")
@@ -152,7 +181,7 @@
    local parent, metadata, timeout = opt(ARGV[5]), opt(ARGV[6]), opt(ARGV[7])
    if redis.call('HEXISTS', IDEM, key) == 1 then return false end
    local t = now()
-   local id = next_id()
+   local id = new_id(t)
    local expires = false
    if timeout then expires = t + tonumber(timeout) end
    redis.call('HSET', IDEM, key, id)
@@ -175,7 +204,7 @@
    if h[3] ~= id or h[2] ~= 'STARTED' then return 0 end
    local t = now()
    if expired_only == '1' and (not h[1] or tonumber(h[1]) > t) then return 0 end
-   local nid = next_id()
+   local nid = new_id(t)
    h[1], h[2], h[7], h[9] = false, state, fmt(t), result or false
    redis.call('SET', wk(wid), mk(h))
    hist_add(wid, nid, state, t, result, id)
@@ -192,7 +221,7 @@
    if h[3] ~= id or h[2] == 'STARTED' then return false end
    local old = h[2]
    local t = now()
-   local nid = next_id()
+   local nid = new_id(t)
    local expires = false
    if timeout then expires = t + tonumber(timeout) end
    h[1], h[2], h[3], h[7], h[8], h[9] = expires and fmt(expires), 'STARTED', nid, fmt(t), metadata or false, false
@@ -209,11 +238,12 @@
    local wid = resolve(id)
    if not wid then return 0 end
    local h = dec(redis.call('GET', wk(wid)), 4)
-   local nid = next_id()
-   redis.call('HSET', RU, nid, cmsgpack.pack({tonumber(wid), now(), metadata or false, tonumber(id), num(parent)}))
-   redis.call('ZADD', rk(wid), nid, nid)
+   local t = now()
+   local nid = new_id(t)
+   redis.call('HSET', RU, nid, cmsgpack.pack({wid, t, metadata or false, id, parent or false}))
+   redis.call('ZADD', rk(wid), 0, nid)
    redis.call('HSET', LR, wid, nid)
-   if h[2] ~= 'DONE' then redis.call('ZADD', sk(h[2]) .. ':reused', nid, wid) end
+   if h[2] ~= 'DONE' then redis.call('ZADD', sk(h[2]) .. ':reused', id_ms(nid), wid) end
    add_kid(parent, nid)
    add_call(h[4], nid, not parent)
    return 1")
@@ -232,13 +262,13 @@
   ;; ARGV: state, wf_def, top-level-only?, limit, before
   "local state, wf_def, top_only, limit, before = opt(ARGV[2]), opt(ARGV[3]), ARGV[4] == '1', opt(ARGV[5]), opt(ARGV[6])
    if limit then limit = tonumber(limit) + 1 end
-   local max = '+inf'
+   local max = '+'
    if before then max = '(' .. before end
-   -- Ids of a sorted set, newest first, from max down, that accept(id): up to limit.
+   -- Ids of a lexicographic set, newest first, from max down, that accept(id): up to limit.
    local function scan(key, accept)
      local out, from = {}, max
      while true do
-       local chunk = redis.call('ZREVRANGEBYSCORE', key, from, '-inf', 'LIMIT', 0, 256)
+       local chunk = redis.call('ZREVRANGEBYLEX', key, from, '-', 'LIMIT', 0, 256)
        if #chunk == 0 then return out end
        for i = 1, #chunk do
          if accept(chunk[i]) then
@@ -254,7 +284,7 @@
      local b = redis.call('GET', wk(cid))
      if b then return b, nil end
      local ru = cmsgpack.unpack(redis.call('HGET', RU, cid))
-     return redis.call('GET', wk(fmt(ru[1]))), ru
+     return redis.call('GET', wk(ru[1])), ru
    end
    local ids
    if state == 'STARTED' or state == 'ERROR' or state == 'TIMEOUT' then
@@ -265,18 +295,19 @@
        local h = dec(redis.call('GET', wk(wid)), 6)
        return not (top_only and h[6]) and not (wf_def and h[4] ~= wf_def)
      end)
-     local bound = '0'
+     local bound = nil
      if limit and #ids >= limit then bound = ids[#ids] end
-     for _, wid in ipairs(redis.call('ZRANGEBYSCORE', sk(state) .. ':reused', bound, '+inf')) do
+     local reused = redis.call('ZRANGEBYSCORE', sk(state) .. ':reused', bound and id_ms(bound) or '-inf', '+inf')
+     for _, wid in ipairs(reused) do
        if not wf_def or dec(redis.call('GET', wk(wid)), 4)[4] == wf_def then
-         for _, r in ipairs(redis.call('ZREVRANGEBYSCORE', rk(wid), max, bound)) do
+         for _, r in ipairs(redis.call('ZREVRANGEBYLEX', rk(wid), max, bound and ('[' .. bound) or '-')) do
            if not top_only or not cmsgpack.unpack(redis.call('HGET', RU, r))[5] then
              ids[#ids + 1] = r
            end
          end
        end
      end
-     table.sort(ids, function(a, b) return tonumber(a) > tonumber(b) end)
+     table.sort(ids, function(a, b) return id_before(b, a) end)
      if limit then
        for i = #ids, limit + 1, -1 do ids[i] = nil end
      end
@@ -298,7 +329,7 @@
    for i = 1, #ids do
      local b, ru = call_blob(ids[i])
      if ru then
-       out[i] = enc(ids[i]) .. '1:1' .. enc(fmt(ru[2])) .. enc(str(ru[5])) .. enc(b)
+       out[i] = enc(ids[i]) .. '1:1' .. enc(fmt(ru[2])) .. enc(ru[5]) .. enc(b)
      else
        out[i] = enc(ids[i]) .. '1:0' .. enc(b)
      end
@@ -318,8 +349,8 @@
    local entries = {}
    local function reuse_entry(cid, depth)
      local ru = cmsgpack.unpack(redis.call('HGET', RU, cid))
-     entries[#entries + 1] = {id = tonumber(cid), state = 'REUSED', at = ru[2], data = ru[3], inv = ru[4],
-                              wid = fmt(ru[1]), parent = ru[5], depth = depth}
+     entries[#entries + 1] = {id = cid, state = 'REUSED', at = ru[2], data = ru[3], inv = ru[4],
+                              wid = ru[1], parent = ru[5], depth = depth}
    end
    local qi = 1
    while qi <= #queue do
@@ -340,10 +371,10 @@
    end
    for _, cid in ipairs(redis.call('ZRANGE', rk(root), 0, -1)) do
      local parent = cmsgpack.unpack(redis.call('HGET', RU, cid))[5]
-     local pw = parent and resolve(fmt(parent))
+     local pw = parent and resolve(parent)
      if not (pw and tree[pw]) then reuse_entry(cid, 0) end
    end
-   table.sort(entries, function(a, b) return a.id < b.id end)
+   table.sort(entries, function(a, b) return id_before(a.id, b.id) end)
    local infos, out = {}, {}
    for i = 1, #entries do
      local e = entries[i]
@@ -353,8 +384,8 @@
        infos[e.wid] = h
      end
      local parent = h[6]
-     if e.state == 'REUSED' then parent = str(e.parent) end
-     out[i] = enc(e.inv and fmt(e.inv) or fmt(e.id)) .. enc(h[3]) .. enc(parent) .. enc(h[4]) .. enc(e.state)
+     if e.state == 'REUSED' then parent = e.parent end
+     out[i] = enc(e.inv or e.id) .. enc(h[3]) .. enc(parent) .. enc(h[4]) .. enc(e.state)
               .. enc(fmt(e.at)) .. enc(e.data) .. enc(fmt(e.depth))
    end
    return table.concat(out)")
@@ -381,7 +412,7 @@
 
 (def ^:private list-expired-lua
   "local wids = redis.call('ZRANGEBYSCORE', P .. ':leases', '-inf', now())
-   table.sort(wids, function(a, b) return tonumber(a) < tonumber(b) end)
+   table.sort(wids, id_before)
    local out = {}
    for i = 1, #wids do out[i] = enc(redis.call('GET', wk(wids[i]))) end
    return table.concat(out)")
@@ -564,9 +595,18 @@
           :else
           (do (wait-for-reply! storage req) (recur)))))))
 
+(def ^:private ^java.security.SecureRandom secure-random (java.security.SecureRandom.))
+
+(defn- random-hex
+  "16 random hex digits: the random bits of an id."
+  []
+  (format "%016x" (.nextLong secure-random)))
+
 (defn- script-cmd [^RedisStorage storage script-name & args]
   (let [p (.-prefix storage)]
-    (into ["EVALSHA" (script-shas script-name) "1" (str p ":seq") p] args)))
+    (-> ["EVALSHA" (script-shas script-name) "1" (str p ":seq") p]
+        (into args)
+        (conj (random-hex)))))
 
 (defn- run1
   "The reply of one script."
@@ -612,10 +652,10 @@
   [^bytes b ^ints pos]
   (let [expires-at (read-long! b pos)
         state (read-str! b pos)
-        invocation-id (read-long! b pos)
+        invocation-id (read-str! b pos)
         wf-def (read-str! b pos)
         params (read-str! b pos)
-        parent (read-long! b pos)
+        parent (read-str! b pos)
         state-changed-at (read-long! b pos)
         metadata (read-str! b pos)
         result (read-str! b pos)
@@ -648,10 +688,10 @@
   (let [pos (int-array 1)]
     (loop [rows (transient [])]
       (if (< (aget pos 0) (alength b))
-        (let [call-id (read-long! b pos)
+        (let [call-id (read-str! b pos)
               reused? (= "1" (read-str! b pos))
               created-at (when reused? (read-long! b pos))
-              caller (when reused? (read-long! b pos))
+              caller (when reused? (read-str! b pos))
               _ (read-len! b pos)
               [row first-created-at] (read-row! b pos)]
           (recur (conj! rows (assoc row
@@ -665,9 +705,9 @@
   (let [pos (int-array 1)]
     (loop [rows (transient [])]
       (if (< (aget pos 0) (alength b))
-        (recur (conj! rows {:workflow/invocation-id (read-long! b pos)
-                            :workflow/current-invocation-id (read-long! b pos)
-                            :workflow/parent-invocation-id (read-long! b pos)
+        (recur (conj! rows {:workflow/invocation-id (read-str! b pos)
+                            :workflow/current-invocation-id (read-str! b pos)
+                            :workflow/parent-invocation-id (read-str! b pos)
                             :workflow/name (read-str! b pos)
                             :workflow/state (read-str! b pos)
                             :workflow/state-changed-at (read-long! b pos)
@@ -704,7 +744,7 @@
   (let [[sec usec] (exec! storage [["TIME"]])]
     (+ (* 1000 (parse-long (->str (first sec)))) (quot (parse-long (->str (second sec))) 1000))))
 
-(defn- reply-long [^bytes b] (some-> b ->str parse-long))
+(defn- reply-id [^bytes b] (->str b))
 
 (extend-type RedisStorage
   db/Storage
@@ -713,7 +753,7 @@
     this)
 
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (reply-long (run1 this :insert (idempotence-key wf-def params-edn-str) wf-def params-edn-str
+    (reply-id (run1 this :insert (idempotence-key wf-def params-edn-str) wf-def params-edn-str
                       (opt-arg parent-invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
 
   (finish! [this invocation-id state result-edn-str]
@@ -723,7 +763,7 @@
     (finish! this invocation-id "TIMEOUT" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
-    (reply-long (run1 this :restart (str invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
+    (reply-id (run1 this :restart (str invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
     (run1 this :reuse (str invocation-id) (opt-arg parent-invocation-id) (opt-arg metadata-edn-str))
@@ -760,8 +800,8 @@
   (extend-lease! [this invocation-ids timeout-ms]
     (if (empty? invocation-ids)
       #{}
-      (let [done (->str (run1 this :extend-lease (str/join "," (map long invocation-ids)) (long timeout-ms)))]
-        (into #{} (map parse-long) (remove str/blank? (str/split done #","))))))
+      (let [done (->str (run1 this :extend-lease (str/join "," (map str invocation-ids)) (long timeout-ms)))]
+        (into #{} (remove str/blank?) (str/split done #",")))))
 
   (list-expired [this]
     (mapv #(assoc % :workflow/expired true) (blobs->rows (run1 this :list-expired)))))
