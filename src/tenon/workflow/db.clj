@@ -20,6 +20,26 @@
    storage's own clock - never the JVM's, so they can be compared without
    mixing in a second clock.")
 
+(defn- hash-chars
+  "h folded with the chars of s, FNV-1a style (64-bit)."
+  ^long [^long h ^String s]
+  (let [n (.length s)]
+    (loop [h h i 0]
+      (if (< i n)
+        (recur (unchecked-multiply (bit-xor h (long (int (.charAt s i)))) 0x100000001b3) (unchecked-inc i))
+        h))))
+
+(defn idempotence-key
+  "A 64-bit hash of (wf-def, params): FNV-1a over the chars of both,
+   finished with MurmurHash3's fmix64 so every bit depends on every char.
+   Storages index workflows by it, and compare wf-def and params too, so a
+   collision costs a row read, never a wrong answer."
+  ^long [^String wf-def ^String params]
+  (let [h (hash-chars (hash-chars -3750763034362895579 wf-def) params)
+        h (unchecked-multiply (bit-xor h (unsigned-bit-shift-right h 33)) -49064778989728563)
+        h (unchecked-multiply (bit-xor h (unsigned-bit-shift-right h 33)) -4265267296055464877)]
+    (bit-xor h (unsigned-bit-shift-right h 33))))
+
 (defprotocol Storage
   (init-db! [this]
     "Ensures the required schema and tables exist in the storage. Returns this.")

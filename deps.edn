@@ -2,7 +2,8 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         com.github.seancorfield/next.jdbc {:mvn/version "1.3.1118"}
         org.xerial/sqlite-jdbc {:mvn/version "3.53.4.0"}
-        com.zaxxer/HikariCP {:mvn/version "7.1.0"}}
+        com.zaxxer/HikariCP {:mvn/version "7.1.0"}
+        org.postgresql/postgresql {:mvn/version "42.7.14"}}
  :aliases
  {:test {:extra-paths ["test" "http/test"]
          :extra-deps {io.github.cognitect-labs/test-runner
@@ -13,7 +14,17 @@
                       ring/ring-jetty-adapter {:mvn/version "1.13.0"}
                       ring/ring-devel {:mvn/version "1.13.0"}
                       nubank/matcher-combinators {:mvn/version "3.11.0"}
-                      tenon/http {:local/root "http"}}}
+                      tenon/http {:local/root "http"}
+                      ;; an embedded PostgreSQL server for the tests: the
+                      ;; binaries of a current release for each platform
+                      io.zonky.test/embedded-postgres
+                      {:mvn/version "2.2.2"
+                       :exclusions [io.zonky.test.postgres/embedded-postgres-binaries-linux-amd64-alpine]}
+                      io.zonky.test.postgres/embedded-postgres-binaries-linux-amd64 {:mvn/version "18.6.0"}
+                      io.zonky.test.postgres/embedded-postgres-binaries-darwin-amd64 {:mvn/version "18.6.0"}
+                      io.zonky.test.postgres/embedded-postgres-binaries-darwin-arm64v8 {:mvn/version "18.6.0"}
+                      io.zonky.test.postgres/embedded-postgres-binaries-windows-amd64 {:mvn/version "18.6.0"}
+                      org.slf4j/slf4j-nop {:mvn/version "2.0.17"}}}
 
   :repl/rebel
   {:extra-deps {com.bhauman/rebel-readline {:mvn/version "0.1.11"}}

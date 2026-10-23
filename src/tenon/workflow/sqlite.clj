@@ -86,23 +86,12 @@
   ^String [^String template]
   (reduce (fn [^String s [^String k ^String v]] (.replace s k v)) template placeholders))
 
-(defn- hash-chars
-  "h folded with the chars of s, FNV-1a style (64-bit)."
-  ^long [^long h ^String s]
-  (let [n (.length s)]
-    (loop [h h i 0]
-      (if (< i n)
-        (recur (unchecked-multiply (bit-xor h (long (int (.charAt s i)))) 0x100000001b3) (unchecked-inc i))
-        h))))
-
 (defn- idempotence-key
-  "A 64-bit hash of (wf-def, params): FNV-1a over the chars of both,
-   finished with MurmurHash3's fmix64 so every bit depends on every char."
+  "The 64-bit idempotence key of (wf-def, params) - see
+   tenon.workflow.db/idempotence-key. A var of its own, so tests can make
+   keys collide."
   ^long [^String wf-def ^String params]
-  (let [h (hash-chars (hash-chars -3750763034362895579 wf-def) params)
-        h (unchecked-multiply (bit-xor h (unsigned-bit-shift-right h 33)) -49064778989728563)
-        h (unchecked-multiply (bit-xor h (unsigned-bit-shift-right h 33)) -4265267296055464877)]
-    (bit-xor h (unsigned-bit-shift-right h 33))))
+  (db/idempotence-key wf-def params))
 
 (def ^:private schema
   (mapv

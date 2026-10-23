@@ -1,5 +1,6 @@
 (ns tenon.workflow
   (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.walk :as walk]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
@@ -35,15 +36,27 @@
   {:host @local-host-name
    :thread (.getName (Thread/currentThread))})
 
+(defn- open-storage [db]
+  (cond
+    (not (string? db)) db
+    (str/starts-with? db "jdbc:postgresql:") ((requiring-resolve 'tenon.workflow.postgres/storage) db)
+    :else (sqlite/datasource db)))
+
 (defn init
   "Builds the application-state map threaded through run-invocation,
    restart-invocation, list-pending, and tenon.workflow.http's
    wrap-handler/app: {:tenon/db ... :tenon/timeout-ms ... :tenon/in-flight ... :tenon/on-event ... :tenon/metadata-fn ...}.
 
-   db-path names a SQLite file (creating it if needed); tenon.workflow.sqlite
-   opens it (sqlite/datasource) and tenon.workflow.db/init-db! - a
-   Storage protocol method - ensures its schema exists, before it's
-   stored under :tenon/db. Additional key/value pairs override the
+   db names the database:
+   - a SQLite file (creating it if needed), opened by tenon.workflow.sqlite
+     (sqlite/datasource);
+   - a PostgreSQL JDBC URL (jdbc:postgresql://...), opened by
+     tenon.workflow.postgres (postgres/storage) - its tables live in the
+     schema the URL's currentSchema parameter names, else in tenon;
+   - or a storage already opened - anything implementing
+     tenon.workflow.db/Storage and db/Timeouts, and Closeable.
+   tenon.workflow.db/init-db! - a Storage protocol method - ensures its
+   schema exists, before it's stored under :tenon/db. Additional key/value pairs override the
    defaults - most usefully :tenon/timeout-ms (the lease of a running
    invocation, 15000 ms: how long it may stay STARTED without its process
    renewing it, before the next call of the same wf+params, a restart or a
@@ -70,8 +83,8 @@
    drift apart.
 
    Stop the threads with close!."
-  [db-path & {:as opts}]
-  (-> {:tenon/db (db/init-db! (sqlite/datasource db-path))
+  [db & {:as opts}]
+  (-> {:tenon/db (db/init-db! (open-storage db))
        :tenon/timeout-ms 15000
        :tenon/lease-batch-size 500
        :tenon/backoff-base-ms 5

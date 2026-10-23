@@ -225,7 +225,7 @@
         "only DONE was attempted - the DONE-recording failure was not misclassified as an ERROR of the function")))
 
 (deftest run-invocation-persists-despite-enclosing-transaction-rollback-test
-  ;; Application code may wrap a #workflow invocation in its own SQLite
+  ;; Application code may wrap a #workflow invocation in its own database
   ;; transaction (e.g. as part of a larger unit of work) and later roll
   ;; that transaction back because something else in it failed. tenon's
   ;; audit rows must not be swept into that rollback: db.clj writes each
@@ -233,7 +233,7 @@
   ;; caller's transaction-bound connection), so they're durable the
   ;; instant they're written, regardless of what the surrounding
   ;; transaction later does.
-  (let [outer-ds (jdbc/get-datasource (str "jdbc:sqlite:" test-util/*db-path*))]
+  (let [outer-ds (jdbc/get-datasource test-util/*jdbc-url*)]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"caller failure after the workflow call"
           (jdbc/with-transaction [_tx outer-ds]
             (engine/run-invocation #'transactional-fn transactional-fn [10 20])
@@ -519,7 +519,7 @@
   ;; :tenon/in-flight, so the second engine falls back to DB polling until
   ;; the first engine's run finishes.
   (let [engine1 engine/*workflow-engine*
-        engine2 (engine/init test-util/*db-path*)]
+        engine2 (engine/init test-util/*db*)]
     (try
       (let [calls (atom 0)
             started (promise)
@@ -552,7 +552,7 @@
    meanwhile. Returns [result-of-leader outcome-of-waiter], the latter being
    its result or exception."
   [engine1 run-ms]
-  (let [engine2 (engine/init test-util/*db-path*)
+  (let [engine2 (engine/init test-util/*db*)
         started (promise)
         f (fn [x] (deliver started true) (Thread/sleep ^long run-ms) x)]
     (try
@@ -567,7 +567,7 @@
 (deftest heartbeat-keeps-long-running-invocation-alive-test
   ;; The lease is far shorter than the run, but the heartbeat renews it, so
   ;; another process polling the database never times the run out.
-  (let [engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 300)]
+  (let [engine1 (engine/init test-util/*db* :tenon/timeout-ms 300)]
     (try
       (let [[leader waiter] (run-slow-workflow-while-polled engine1 1200)
             wf (first (test-util/find-by-wf-def "tenon.workflow-test/echo-fn"))]
@@ -581,7 +581,7 @@
 (deftest no-heartbeat-lets-lease-run-out-test
   ;; The same run without the heartbeat is timed out by the waiter - what
   ;; the heartbeat prevents.
-  (let [engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 300 :tenon/heartbeat-ms nil)]
+  (let [engine1 (engine/init test-util/*db* :tenon/timeout-ms 300 :tenon/heartbeat-ms nil)]
     (try
       (let [[leader waiter] (run-slow-workflow-while-polled engine1 1200)]
         (is (= 21 leader) "its own caller still gets the result")
@@ -638,7 +638,7 @@
         "with nothing to wait on it sleeps")))
 
 (deftest engine-on-event-is-never-nil-test
-  (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil)]
+  (let [engine1 (engine/init test-util/*db* :tenon/sweep-ms nil)]
     (try
       (is (fn? (:tenon/on-event engine1)))
       (is (nil? ((:tenon/on-event engine1) :anything {})) "does nothing by default")
@@ -649,7 +649,7 @@
   ;; More invocations than one storage call renews: all of them are, and
   ;; the one that was timed out meanwhile is reported - once.
   (let [events (atom [])
-        engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 60000 :tenon/heartbeat-ms nil :tenon/sweep-ms nil
+        engine1 (engine/init test-util/*db* :tenon/timeout-ms 60000 :tenon/heartbeat-ms nil :tenon/sweep-ms nil
                              :tenon/lease-batch-size 7
                              :tenon/on-event #(swap! events conj [%1 %2]))
         ds (:tenon/db engine1)
@@ -678,7 +678,7 @@
   ;; An invocation timed out while its process still runs it learns of it
   ;; from the heartbeat - once, not on every beat.
   (let [events (atom [])
-        engine1 (engine/init test-util/*db-path* :tenon/timeout-ms 300 :tenon/sweep-ms nil
+        engine1 (engine/init test-util/*db* :tenon/timeout-ms 300 :tenon/sweep-ms nil
                              :tenon/on-event #(swap! events conj [%1 %2]))
         started (promise)
         release (promise)
@@ -749,7 +749,7 @@
 
 (deftest concurrent-sweeps-time-out-each-invocation-once-test
   (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [37]) :timeout-ms 60000)
-        engine2 (engine/init test-util/*db-path* :tenon/sweep-ms nil
+        engine2 (engine/init test-util/*db* :tenon/sweep-ms nil
                              :tenon/on-event #(swap! *emitted-events* conj [%1 %2]))]
     (try
       (test-util/expire! (test-util/ds) id)
@@ -762,14 +762,14 @@
 (deftest init-sweeps-expired-invocations-left-by-a-previous-run-test
   (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [38]) :timeout-ms 60000)]
     (test-util/expire! (test-util/ds) id)
-    (let [engine2 (engine/init test-util/*db-path*)]
+    (let [engine2 (engine/init test-util/*db*)]
       (try
         (is (wait-for #(= "TIMEOUT" (:workflow/state (engine/get-invocation engine2 id))) 2000))
         (finally
           (engine/close! engine2))))))
 
 (deftest sweeps-periodically-test
-  (let [engine2 (engine/init test-util/*db-path* :tenon/sweep-ms 20)
+  (let [engine2 (engine/init test-util/*db* :tenon/sweep-ms 20)
         id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [39]) :timeout-ms 60000)]
     (try
       (is (= "STARTED" (:workflow/state (engine/get-invocation engine2 id))) "a live lease is left alone")

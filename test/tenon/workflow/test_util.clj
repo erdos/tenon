@@ -1,15 +1,85 @@
 (ns tenon.workflow.test-util
   (:require [clojure.string :as str]
+            [clojure.test :refer [testing]]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]))
 
-(def ^:dynamic *db-path*
-  "Absolute path of the current test's temp SQLite file, bound by
-   temp-db-fixture. Lets a test open its own raw next.jdbc connection
-   against the exact same database tenon.workflow.db is using."
+(def ^:dynamic *backend*
+  "The storage the current test runs on - :sqlite or :postgres - bound by
+   temp-db-fixture."
   nil)
+
+(def ^:dynamic *db*
+  "The current test's database, as tenon.workflow/init takes it - the path
+   of a temp SQLite file, or the JDBC URL of a fresh PostgreSQL schema -
+   bound by temp-db-fixture. Lets a test start more engines on the exact
+   same database."
+  nil)
+
+(def ^:dynamic *jdbc-url*
+  "The JDBC URL of the current test's database, bound by temp-db-fixture.
+   Lets a test open its own raw next.jdbc connection against the exact
+   same database tenon.workflow.db is using - for PostgreSQL, with the
+   test's schema as its search_path, so unqualified table names work."
+  nil)
+
+(def backends
+  "The storages fixture-based tests run on: every one, unless the
+   TENON_TEST_BACKENDS environment variable lists some (e.g. sqlite or
+   sqlite,postgres)."
+  (if-let [names (System/getenv "TENON_TEST_BACKENDS")]
+    (mapv keyword (str/split names #","))
+    [:sqlite :postgres]))
+
+(def ^:private postgres-server
+  "An embedded PostgreSQL server (io.zonky.test/embedded-postgres), started
+   on first use and stopped when the JVM exits. Tests each get a schema of
+   their own on it."
+  (delay
+    (let [pg (.start (io.zonky.test.db.postgres.embedded.EmbeddedPostgres/builder))]
+      (.addShutdownHook (Runtime/getRuntime) (Thread. #(.close ^java.io.Closeable pg)))
+      pg)))
+
+(def ^:private schema-counter (atom 0))
+
+(defn postgres-url
+  "The JDBC URL of the embedded PostgreSQL server (see postgres-server),
+   whose connections' search_path is schema, if given."
+  ([] (.getJdbcUrl ^io.zonky.test.db.postgres.embedded.EmbeddedPostgres @postgres-server "postgres" "postgres"))
+  ([schema] (str (postgres-url) "&currentSchema=" schema)))
+
+(defn with-postgres-schema
+  "Calls (f url) with the JDBC URL of a new, empty schema of the embedded
+   PostgreSQL server - tenon creates it - and drops the schema afterwards.
+   Returns what f returns."
+  [f]
+  (let [schema (str "test_" (swap! schema-counter inc))]
+    (try
+      (f (postgres-url schema))
+      (finally
+        (jdbc/execute! (jdbc/get-datasource (postgres-url)) [(str "DROP SCHEMA IF EXISTS " schema " CASCADE")])))))
+
+(defn with-sqlite-file
+  "Calls (f path) with the path of a new, empty SQLite file, and deletes
+   it afterwards. Returns what f returns."
+  [f]
+  (let [path (.getAbsolutePath (java.io.File/createTempFile "tenon-test" ".db"))]
+    (try
+      (f path)
+      (finally
+        (doseq [suffix ["" "-wal" "-shm"]]
+          (.delete (java.io.File. (str path suffix))))))))
+
+(defn with-db
+  "Calls (f db jdbc-url) with a new, empty database of backend (:sqlite or
+   :postgres) - db is what tenon.workflow/init takes - and removes it
+   afterwards."
+  [backend f]
+  (case backend
+    :sqlite (with-sqlite-file #(f % (str "jdbc:sqlite:" %)))
+    :postgres (with-postgres-schema #(f % %))))
 
 (defn ds
   "The datasource of the current test's engine map - a shorthand for
@@ -28,10 +98,10 @@
                              CASE e.state WHEN 0 THEN 'STARTED' WHEN 1 THEN 'DONE' WHEN 2 THEN 'ERROR'
                                           WHEN 3 THEN 'TIMEOUT' WHEN 4 THEN 'REUSED' END AS state,
                              e.occurred_at AS state_changed_at, e.data,
-                             iif(e.state = 4, e.parent_invocation_id, w.parent_invocation_id)
+                             CASE WHEN e.state = 4 THEN e.parent_invocation_id ELSE f.parent_invocation_id END
                                AS parent_invocation_id
-                        FROM event e NOT INDEXED
-                        JOIN workflow w ON w.id = e.workflow_id
+                        FROM event e
+                        JOIN event f ON f.id = e.workflow_id
                        WHERE e.workflow_id = (SELECT workflow_id FROM event WHERE id = ?)
                        ORDER BY e.id"
                      invocation-id]
@@ -92,17 +162,36 @@
   (jdbc/execute! ds ["UPDATE event SET occurred_at = 0 WHERE id = ? AND state = 0" invocation-id])
   (jdbc/execute! ds ["UPDATE workflow SET expires_at = 1 WHERE invocation_id = ? AND state = 0" invocation-id]))
 
-(defn temp-db-fixture [f]
-  (let [file (java.io.File/createTempFile "tenon-test" ".db")
-        path (.getAbsolutePath file)]
-    (try
-      (let [engine (engine/init path :tenon/sweep-ms nil)] ; tests time out by hand, or build an engine that sweeps
-        (try
-          (binding [*db-path* path
-                    engine/*workflow-engine* engine]
-            (f))
-          (finally
-            (engine/close! engine))))
-      (finally
-        (doseq [suffix ["" "-wal" "-shm"]]
-          (.delete (java.io.File. (str path suffix))))))))
+(defn- registrations
+  "The raw fns of every registered workflow var, by var."
+  []
+  (into {} (for [ns (all-ns) [_ v] (ns-interns ns) :let [f (engine/raw-fn v)] :when f] [v f])))
+
+(defn- restore-registrations!
+  "Registers every var of registrations (see registrations) again with its
+   raw fn there - undoing what a test registered meanwhile."
+  [registrations]
+  (doseq [[v f] registrations]
+    (when-not (identical? f (engine/raw-fn v))
+      (engine/register! v f))))
+
+(defn temp-db-fixture
+  "Runs the test f once on each of backends, every time on a new, empty
+   database, with an engine on it bound - and the workflow fns registered
+   as before, should an earlier run have registered others."
+  [f]
+  (doseq [backend backends
+          :let [registered (registrations)]]
+    (testing (name backend)
+      (with-db backend
+        (fn [db jdbc-url]
+          (let [engine (engine/init db :tenon/sweep-ms nil)] ; tests time out by hand, or build an engine that sweeps
+            (try
+              (binding [*backend* backend
+                        *db* db
+                        *jdbc-url* jdbc-url
+                        engine/*workflow-engine* engine]
+                (f))
+              (finally
+                (engine/close! engine)
+                (restore-registrations! registered)))))))))
