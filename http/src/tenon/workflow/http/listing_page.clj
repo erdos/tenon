@@ -13,9 +13,9 @@
   [{:event/keys [created-at] :workflow/keys [state-changed-at] :as row} now]
   (case (ui/effective-state row)
     "REUSED" (ui/muted "—")
-    "STARTED" (let [d (ui/format-duration (- now created-at))]
+    "STARTED" (let [d (ui/format-duration created-at now)]
                 [:span {:title (str "running for " d)} "running " d])
-    (ui/format-duration (- state-changed-at created-at))))
+    (ui/format-duration created-at state-changed-at)))
 
 (defn- call-state
   "The state chip - Reused for a call that got a stored result instead of
@@ -24,7 +24,7 @@
   (let [state (ui/effective-state row)]
     (list (ui/state state)
           (when (and (= "STARTED" state) expires-at (< expires-at now))
-            [:span.wf-expired {:title (str "lease expired " (ui/format-duration (- now expires-at)) " ago")}
+            [:span.wf-expired {:title (str "lease expired " (ui/format-duration expires-at now) " ago")}
              " lease expired"]))))
 
 (defn- workflows-table [rows show-all? now footer]

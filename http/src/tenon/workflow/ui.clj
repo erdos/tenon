@@ -32,13 +32,15 @@
   (str n " " word (when (not= 1 n) "s")))
 
 (defn format-duration
-  "Renders a millisecond duration compactly, e.g. 153ms, 1.24s, 2m 03s, 1h 02m."
-  [ms]
-  (cond
-    (< ms 1000) (str ms "ms")
-    (< ms 60000) (format "%.2fs" (/ ms 1000.0))
-    (< ms 3600000) (format "%dm %02ds" (quot ms 60000) (quot (rem ms 60000) 1000))
-    :else (format "%dh %02dm" (quot ms 3600000) (quot (rem ms 3600000) 60000))))
+  "Renders a millisecond duration compactly, e.g. 153ms, 1.24s, 2m 03s, 1h 02m.
+   With two epoch-ms times, the duration from the first to the second."
+  ([from to] (format-duration (- to from)))
+  ([ms]
+   (cond
+     (< ms 1000) (str ms "ms")
+     (< ms 60000) (format "%.2fs" (/ ms 1000.0))
+     (< ms 3600000) (format "%dm %02ds" (quot ms 60000) (quot (rem ms 60000) 1000))
+     :else (format "%dh %02dm" (quot ms 3600000) (quot (rem ms 3600000) 60000)))))
 
 (defn format-offset
   "Renders milliseconds since some start as a clock-style offset:

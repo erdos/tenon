@@ -154,7 +154,8 @@
   (is (= "153ms" (ui/format-duration 153)))
   (is (= "1.24s" (ui/format-duration 1240)))
   (is (= "2m 03s" (ui/format-duration 123000)))
-  (is (= "1h 02m" (ui/format-duration 3720000))))
+  (is (= "1h 02m" (ui/format-duration 3720000)))
+  (is (= "153ms" (ui/format-duration 1000 1153)) "two times: from, to"))
 
 (deftest format-offset-test
   (is (= "+00:00.000" (ui/format-offset 0)))

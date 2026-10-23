@@ -99,9 +99,9 @@
          starts (filter engine/started? run)]
      (when-let [start (:workflow/state-changed-at (if (= :last-attempt from) (last starts) (first starts)))]
        (if (engine/started? (last run))
-         (let [d (ui/format-duration (- (System/currentTimeMillis) start))]
+         (let [d (ui/format-duration start (System/currentTimeMillis))]
            [:span {:title (str "running for " d)} d])
-         (ui/format-duration (- (:workflow/state-changed-at (last run)) start)))))))
+         (ui/format-duration start (:workflow/state-changed-at (last run))))))))
 
 (defn- error-title
   "\"class: message\" of an ERROR or TIMEOUT event, for a chip's tooltip."
@@ -201,9 +201,11 @@
    ones within the tree are leaves of their own) names the invocation
    whose result was reused and the caller that reused it - nothing for a
    top-level call, which had no caller. A STARTED one other than the
-   node's first event (its run always opens with one) is a restart. One
-   with something to show folds (closed) to it, see event-fold-body."
-  [start ev root? restart?]
+   node's first event (its run always opens with one) is a restart. A DONE
+   one shows how long the attempt took, from its started event (the latest
+   before it). One with something to show folds (closed) to it, see
+   event-fold-body."
+  [start ev root? restart? started]
   (let [row (list
              (tree-offset start ev (when restart? "Restarted"))
              (when (engine/failed? ev) (error-class-html ev))
@@ -212,7 +214,8 @@
                 "from " (ui/workflow-link (:workflow/invocation-id ev))
                 " for " (ui/workflow-link caller)])
              (tree-columns
-              nil
+              (when (and started (engine/done? ev))
+                (ui/format-duration (:workflow/state-changed-at started) (:workflow/state-changed-at ev)))
               nil
               (ui/state-with-tooltip (:workflow/state ev) (when (engine/failed? ev) (error-title ev)))))]
     (if-let [body (event-fold-body ev)]
@@ -275,7 +278,8 @@
        (for [[i kind x] items]
          (case kind
            :event (timeline-tree-event start x (= [:root] k)
-                                       (and (engine/started? x) (not= i (ffirst events))))
+                                       (and (engine/started? x) (not= i (ffirst events)))
+                                       (->> events (filter (fn [[j e]] (and (< j i) (engine/started? e)))) last second))
            :node (timeline-tree-node nodes children start x)))]]])))
 
 (defn- full-timeline-tree
@@ -344,8 +348,8 @@
        (let [left (- (:workflow/expires-at wf) now)]
          (ui/fact "Lease"
                   (if (pos? left)
-                    (str "expires in " (ui/format-duration left))
-                    [:span.wf-expired (str "expired " (ui/format-duration (- left)) " ago")]))))
+                    (str "expires in " (ui/format-duration now (:workflow/expires-at wf)))
+                    [:span.wf-expired (str "expired " (ui/format-duration (:workflow/expires-at wf) now) " ago")]))))
      (ui/fact "Attempts" (str attempts))
      (ui/fact "Reused" (if (pos? reuses) (ui/pluralize reuses "time") "never")))))
 

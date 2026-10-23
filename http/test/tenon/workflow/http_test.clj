@@ -441,7 +441,11 @@
           (within [[:li.tree-event enlive/last-of-type] :code.tree-offset]
             (has (regex? "\\+\\d\\d:\\d\\d\\.\\d{3}")))
           (within [:summary :span.tree-time]
-            (has (regex? "\\d+ms")))))))
+            (has (regex? "\\d+ms")))
+          (within [[:li.tree-event enlive/last-of-type] :span.tree-time]
+            (has (regex? "\\d+ms") "Completed shows the time since its Called"))
+          (within [[:li.tree-event enlive/first-of-type] :span.tree-time]
+            (has (texts? [:span.tree-time] [""]) "Called shows no duration"))))))
 
 (deftest page-style-is-not-html-escaped-test
   ;; Browsers don't decode entities inside <style>, so escaped quotes or >
