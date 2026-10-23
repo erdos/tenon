@@ -429,6 +429,21 @@
              (run-invocation (var ~fname) raw-fn# args#)))
          (register! (var ~fname) raw-fn#)))))
 
+(defn task-name
+  "The name of the var a #task of expr is registered under - stable across
+   processes, so stored invocations can be restarted."
+  [expr]
+  (symbol (format "task-%08x" (hash (pr-str expr)))))
+
+(defn register-task!
+  "Interns raw-fn as the workflow task-name in ns-sym, as a #workflow defn
+   would be, and registers it. Returns the var."
+  [ns-sym task-name raw-fn]
+  (let [v (intern ns-sym task-name)]
+    (alter-var-root v (constantly (fn [& args]
+                                    (run-invocation v raw-fn args))))
+    (register! v raw-fn)))
+
 (defmacro run-task
   "Runs expr as a workflow invocation, capturing the locals of the
    surrounding code that expr uses and passing them as the invocation's
@@ -436,22 +451,28 @@
    a var named after the hash of expr in the current namespace, so the
    invocation is audited, deduplicated by the captured values, and
    restartable (restart-invocation) just like a #workflow defn call - as
-   long as the form has been evaluated in the restarting process, and the
-   captured values print and read back as EDN. Returns expr's value."
+   long as the captured values print and read back as EDN. Returns expr's
+   value.
+
+   The task is registered when the surrounding code is loaded, not only when
+   it first runs, so a fresh process can restart it without having called
+   it. That needs expr to compile at load time; if it does not (it uses a
+   var defined further down, say) the task is registered by its first call
+   instead."
   [expr]
   (let [captured (->> (tree-seq coll? seq expr)
                       (filter symbol?)
                       (filter #(contains? &env %))
                       distinct
                       vec)
-        task-name (symbol (format "task-%08x" (hash (pr-str expr))))]
+        task-name (task-name expr)
+        ns-sym (ns-name *ns*)]
+    (try
+      (register-task! ns-sym task-name (eval `(fn ~captured ~expr)))
+      (catch Throwable _))
     `(do
        (declare ~task-name)
-       (let [raw-fn# (fn ~captured ~expr)]
-         (def ~task-name
-           (fn [& args#]
-             (run-invocation (var ~task-name) raw-fn# args#)))
-         (register! (var ~task-name) raw-fn#))
+       (register-task! '~ns-sym '~task-name (fn ~captured ~expr))
        (~task-name ~@captured))))
 
 (defn task

@@ -77,3 +77,7 @@
 (defn task-parent [n]
   (let [doubled (* 2 n)]
     #task (inc doubled)))
+
+;; Never called: its #task must still be registered by loading this ns.
+(defn never-called [x]
+  #task (str "hi " x))

@@ -212,3 +212,8 @@
     (is (thrown-match? clojure.lang.ExceptionInfo
                        {:type ::engine/precondition-failed}
                        (fixtures/multiply-in-task 1 2 3)))))
+
+(deftest task-registered-at-load-time-test
+  (let [sym (symbol "tenon.workflow.fixtures" (str (engine/task-name '(str "hi " x))))]
+    (is (some? (engine/lookup sym)) "registered without ever being called")
+    (is (empty? (engine/list-invocations {:wf-def (str sym)})))))

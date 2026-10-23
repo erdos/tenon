@@ -32,7 +32,7 @@ Put `#task` in front of any expression to run it as a workflow invocation. The l
   #task (payments/charge! order-id amount))
 ```
 
-The expression is wrapped in a function of the captured values and registered under a name derived from the expression, so the invocation is logged, deduplicated by the captured values and restartable like a `#workflow` function. Captured values must print and read back as EDN, and the form must have been evaluated in a process before its invocations can be restarted there.
+The expression is wrapped in a function of the captured values and registered under a name derived from the expression, so the invocation is logged, deduplicated by the captured values and restartable like a `#workflow` function. Captured values must print and read back as EDN. The task is registered when the surrounding code is loaded, so a fresh process can restart its invocations without having run it.
 
 ## Try it in the REPL
 
