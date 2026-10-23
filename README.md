@@ -32,7 +32,7 @@ Put `#task` in front of any expression to run it as a workflow invocation. The l
   #task (payments/charge! order-id amount))
 ```
 
-The expression is wrapped in a function of the captured values and registered under a name derived from the expression, so the invocation is logged, deduplicated by the captured values and restartable like a `#workflow` function. Captured values must print and read back as EDN. The task is registered when the surrounding code is loaded, so a fresh process can restart its invocations without having run it. For AOT-compiled code, the source of each task is also written next to the classes (`<namespace>__tasks.edn`, so keep it on the classpath) and loaded when a restart needs it, wherever in the function the `#task` is.
+The expression is wrapped in a function of the captured values and registered under a name derived from the expression, so the invocation is logged, deduplicated by the captured values and restartable like a `#workflow` function. Captured values must print and read back as EDN. The task is registered when the surrounding code is loaded, so a fresh process can restart its invocations without having run it. For AOT-compiled code, each task also gets a small compiled companion (`<namespace>__<task name>__init.class` next to the namespace's classes, so ship the whole classes directory), which is loaded when a restart needs it, wherever in the function the `#task` is.
 
 ## Try it in the REPL
 

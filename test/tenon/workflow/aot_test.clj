@@ -5,9 +5,11 @@
             [clojure.string :as str]))
 
 (def ^:private app-ns
-  "(ns aotapp.core (:require tenon.workflow))
+  "(ns aotapp.core (:require [clojure.string :as cs] tenon.workflow))
+(defn- helper [x] (* x 10))
 (defn never-called [a b c] #task (* a b))
-(defn in-closure [xs] (mapv (fn [x] #task (inc x)) xs))")
+(defn in-closure [xs] (mapv (fn [x] #task (inc x)) xs))
+(defn private-and-alias [^String s n] #task (cs/upper-case (str s (helper n))))")
 
 (defn- java [classpath & clojure-main-args]
   (apply sh "java" "-cp" classpath "clojure.main" clojure-main-args))
@@ -30,18 +32,18 @@
                                       "(binding [*compile-path* " (pr-str (str classes)) "] (compile 'aotapp.core))"
                                       "(def e (tenon.workflow/init " (pr-str db) " :tenon/sweep-ms nil))"
                                       "(alter-var-root #'tenon.workflow/*workflow-engine* (constantly e))"
-                                      "(println :result (aotapp.core/never-called 3 4 5) (aotapp.core/in-closure [1]))"
+                                      "(println :result (aotapp.core/never-called 3 4 5) (aotapp.core/in-closure [1]) (aotapp.core/private-and-alias \"a\" 2))"
                                       "(tenon.workflow/close! e) (shutdown-agents)"))]
         (is (= 0 (:exit first-run)) (:err first-run))
-        (is (str/includes? (:out first-run) ":result 12 [2]")))
+        (is (str/includes? (:out first-run) ":result 12 [2] A20")))
       (let [second-run (java (str/join ":" [classes cp])
                              "-e" (str "(require 'tenon.workflow 'aotapp.core)"
                                        "(def e (tenon.workflow/init " (pr-str db) " :tenon/sweep-ms nil))"
                                        "(alter-var-root #'tenon.workflow/*workflow-engine* (constantly e))"
-                                       "(println :restarted (sort (map #(tenon.workflow/restart-invocation (:workflow/invocation-id %))"
+                                       "(println :restarted (sort-by str (map #(tenon.workflow/restart-invocation (:workflow/invocation-id %))"
                                        "                              (tenon.workflow/list-invocations {}))))"
                                        "(tenon.workflow/close! e) (shutdown-agents)"))]
         (is (= 0 (:exit second-run)) (:err second-run))
-        (is (str/includes? (:out second-run) ":restarted (2 12)")))
+        (is (str/includes? (:out second-run) ":restarted (12 2 A20)")))
       (finally
         (doseq [f (reverse (file-seq dir))] (.delete f))))))

@@ -13,7 +13,7 @@
 
 (defn raw-fn [v] (::raw-fn (meta v)))
 
-(declare load-recorded-tasks!)
+(declare load-task-companion!)
 
 (defn lookup
   "The var named by the namespace-qualified symbol sym, if it exists (its
@@ -21,8 +21,8 @@
    i.e. it carries raw-fn metadata. Returns nil otherwise - including when
    sym's namespace was never loaded (find-var itself throws in that case,
    which lookup must not do for an ordinary miss). A task of an
-   AOT-compiled namespace not registered yet is registered from the
-   source recorded at compile time first."
+   AOT-compiled namespace not registered yet is registered by loading its
+   compiled companion first."
   [sym]
   (let [ns-sym (symbol (namespace sym))
         registered (fn []
@@ -31,7 +31,7 @@
                          v)))]
     (or (registered)
         (when (find-ns ns-sym)
-          (load-recorded-tasks! ns-sym)
+          (load-task-companion! ns-sym (symbol (name sym)))
           (registered)))))
 
 (defmacro ^:private emit! [engine event data]
@@ -455,38 +455,44 @@
                                     (run-invocation v raw-fn args))))
     (register! v raw-fn)))
 
-(defn register-task-source!
-  "Registers the task task-name in ns-sym whose raw fn is compiled lazily
-   from src, a (fn [captured...] expr) form, on its first call."
-  [ns-sym task-name src]
-  (let [compiled (delay (binding [*ns* (the-ns ns-sym)] (eval src)))]
-    (register-task! ns-sym task-name (fn [& args] (apply @compiled args)))))
+;; The companion of a task is a compiled "file" of its own next to the classes
+;; of an AOT-compiled namespace, holding the forms that register the task. It
+;; is compiled in the namespace of the task (so its expression resolves
+;; symbols as in the source), and loading it - which lookup does for an
+;; unregistered task - registers the task with its compiled fn.
 
-(defn- tasks-resource-path [ns-sym]
-  (str (-> (munge (str ns-sym)) (str/replace \. \/)) "__tasks.edn"))
+(defn- companion-path [ns-sym task-name]
+  (str (-> (munge (str ns-sym)) (str/replace \. \/)) "__" (munge (str task-name))))
 
-(def ^:private recorded-tasks (atom {}))
+(defn- printable-form
+  "form without the source position metadata the reader adds, to print
+   (keeping type hints and other metadata) and read back."
+  [form]
+  (walk/postwalk (fn [f]
+                   (if (instance? clojure.lang.IObj f)
+                     (vary-meta f dissoc :line :column :end-line :end-column)
+                     f))
+                 form))
 
-(defn record-task-source!
-  "While compiling ahead of time, writes the source of every task of ns-sym
-   seen so far, task-name to its (fn [captured...] expr) form, to the
-   ns's __tasks.edn file under *compile-path*. Compiled code carries no
-   source of closures, so this is how a later process finds the tasks of an
-   AOT-compiled namespace; see load-recorded-tasks!."
-  [ns-sym task-name src]
-  (let [tasks (get (swap! recorded-tasks assoc-in [ns-sym task-name] src) ns-sym)
-        f (io/file *compile-path* (tasks-resource-path ns-sym))]
-    (io/make-parents f)
-    (spit f (binding [*print-dup* false] (pr-str tasks)))))
+(defn compile-task-companion!
+  "Compiles form, which registers the task, as the companion of task-name of
+   ns-sym, writing its classes under *compile-path*. Call it while
+   compiling ahead of time, with *ns* being ns-sym."
+  [ns-sym task-name form]
+  (let [path (companion-path ns-sym task-name)
+        text (binding [*print-meta* true] (pr-str (printable-form form)))]
+    (clojure.lang.Compiler/compile (java.io.StringReader. text)
+                                   (str path ".clj")
+                                   (str (last (str/split path #"/")) ".clj"))))
 
-(defn- load-recorded-tasks!
-  "Registers (register-task-source!) every task that AOT compilation of
-   ns-sym recorded in a __tasks.edn resource, if there is one."
-  [ns-sym]
-  (when-let [r (io/resource (tasks-resource-path ns-sym))]
-    (let [tasks (binding [*read-eval* false] (read-string (slurp r)))]
-      (doseq [[task-name src] tasks]
-        (register-task-source! ns-sym task-name src)))))
+(defn- load-task-companion!
+  "Loads the compiled companion of task-name of ns-sym, if AOT compilation
+   made one - registering the task."
+  [ns-sym task-name]
+  (let [path (companion-path ns-sym task-name)]
+    (when (io/resource (str path clojure.lang.RT/LOADER_SUFFIX ".class"))
+      (binding [*ns* (the-ns ns-sym)]
+        (load (str "/" path))))))
 
 (defmacro run-task
   "Runs expr as a workflow invocation, capturing the locals of the
@@ -502,9 +508,8 @@
    it first runs, so a fresh process can restart it without having called
    it. That needs expr to compile at load time; if it does not, the task is
    registered by its first call instead. When compiling ahead of time the
-   task's source is also written to a <namespace>__tasks.edn resource next
-   to the classes, which lookup loads when it finds the task unregistered
-   (see load-recorded-tasks!), compiling expr on the task's first run."
+   task also gets a compiled companion, which lookup loads when it finds the
+   task unregistered (see compile-task-companion!)."
   [expr]
   (let [captured (->> (tree-seq coll? seq expr)
                       (filter symbol?)
@@ -516,12 +521,13 @@
     (try
       (register-task! ns-sym task-name (eval `(fn ~captured ~expr)))
       (catch Throwable _))
-    (when *compile-files*
-      (record-task-source! ns-sym task-name `(fn ~captured ~expr)))
-    `(do
-       (declare ~task-name)
-       (register-task! '~ns-sym '~task-name (fn ~captured ~expr))
-       (~task-name ~@captured))))
+    (let [register `(do
+                      (declare ~task-name)
+                      (register-task! '~ns-sym '~task-name (fn ~captured ~expr)))]
+      (when *compile-files*
+        (compile-task-companion! ns-sym task-name register))
+      `(do ~register
+           (~task-name ~@captured)))))
 
 (defn task
   "Tag reader for #task to be placed in front of an expression. Expands
