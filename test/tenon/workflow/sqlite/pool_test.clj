@@ -19,7 +19,7 @@
   (with-pool
     (fn [ds]
       (jdbc/execute! ds ["CREATE TABLE t (x INTEGER PRIMARY KEY)"])
-      (let [insert (fn [x] (try (pool/write! ds #(jdbc/execute-one! % ["INSERT INTO t VALUES (?)" x]))
+      (let [insert (fn [x] (try (pool/write! ds #(pool/execute! % "INSERT INTO t VALUES (?)" x))
                                 :ok
                                 (catch Exception _ :failed)))
             xs (for [i (range 400)] (if (zero? (mod i 4)) (dec i) i))
@@ -38,6 +38,32 @@
       (jdbc/execute! ds ["INSERT INTO c VALUES (0)"])
       (->> (range 16)
            (mapv (fn [_] (future (dotimes [_ 50]
-                                   (pool/write! ds #(jdbc/execute-one! % ["UPDATE c SET n = n + 1"]))))))
+                                   (pool/write! ds #(pool/execute! % "UPDATE c SET n = n + 1"))))))
            (run! deref))
       (is (= 800 (:c/n (jdbc/execute-one! ds ["SELECT n FROM c"])))))))
+
+(deftest a-failed-batch-fails-its-writes-test
+  ;; A leader that cannot run its batch - here, it cannot have a
+  ;; connection - fails the writes it took from the queue, rather than
+  ;; leaving their writers waiting forever: nobody else would run them.
+  (with-pool
+    (fn [ds]
+      (jdbc/execute! ds ["CREATE TABLE t (x INTEGER PRIMARY KEY)"])
+      (let [borrow @#'pool/borrow
+            borrows (atom 0)
+            insert! (fn [x] (try (pool/write! ds #(pool/execute! % "INSERT INTO t VALUES (?)" x))
+                                 :written
+                                 (catch IllegalStateException _ :failed)))]
+        (with-redefs [pool/borrow (fn [p]
+                                    (if (= 2 (swap! borrows inc))
+                                      (throw (IllegalStateException. "no connection"))
+                                      (borrow p)))]
+          ;; a slow first write, so that the others queue up behind it -
+          ;; for the next leader to take them all, and fail
+          (let [first-write (future (pool/write! ds (fn [c] (Thread/sleep 300) (pool/execute! c "INSERT INTO t VALUES (-1)"))))
+                _ (Thread/sleep 100)
+                writes (doall (for [x (range 15)] (future (insert! x))))
+                outcomes (mapv #(deref % 10000 :hung) writes)]
+            @first-write
+            (is (not-any? #{:hung} outcomes))
+            (is (every? #{:failed} outcomes) "they were all in the failed batch")))))))

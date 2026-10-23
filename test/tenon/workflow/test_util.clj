@@ -25,11 +25,13 @@
    library reads it only as part of db/full-timeline."
   [ds invocation-id]
   (jdbc/execute! ds ["SELECT e.id, coalesce(e.invocation_id, e.id) AS invocation_id,
-                             e.state, e.occurred_at AS state_changed_at, e.data,
-                             iif(e.state = 'REUSED', e.parent_invocation_id, f.parent_invocation_id)
+                             CASE e.state WHEN 0 THEN 'STARTED' WHEN 1 THEN 'DONE' WHEN 2 THEN 'ERROR'
+                                          WHEN 3 THEN 'TIMEOUT' WHEN 4 THEN 'REUSED' END AS state,
+                             e.occurred_at AS state_changed_at, e.data,
+                             iif(e.state = 4, e.parent_invocation_id, w.parent_invocation_id)
                                AS parent_invocation_id
                         FROM event e NOT INDEXED
-                        JOIN event f ON f.id = e.workflow_id
+                        JOIN workflow w ON w.id = e.workflow_id
                        WHERE e.workflow_id = (SELECT workflow_id FROM event WHERE id = ?)
                        ORDER BY e.id"
                      invocation-id]
@@ -87,8 +89,8 @@
   "Moves the lease end of STARTED invocation-id into the past, so it looks
    like it started long ago and timed out."
   [ds invocation-id]
-  (jdbc/execute! ds ["UPDATE event SET occurred_at = 0, expires_at = 1 WHERE id = ? AND state = 'STARTED'"
-                     invocation-id]))
+  (jdbc/execute! ds ["UPDATE event SET occurred_at = 0 WHERE id = ? AND state = 0" invocation-id])
+  (jdbc/execute! ds ["UPDATE workflow SET expires_at = 1 WHERE invocation_id = ? AND state = 0" invocation-id]))
 
 (defn temp-db-fixture [f]
   (let [file (java.io.File/createTempFile "tenon-test" ".db")

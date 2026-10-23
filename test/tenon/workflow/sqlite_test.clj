@@ -63,3 +63,21 @@
         (let [page-size (:page_size (jdbc/execute-one! ds ["PRAGMA page_size"]))
               wal-pages (quot (.length (java.io.File. (str path "-wal"))) (+ 24 page-size))]
           (is (< wal-pages 1100) (str "the WAL has " wal-pages " pages")))))))
+
+(deftest idempotence-key-collisions-test
+  ;; The idempotence key is a 64-bit hash: workflows whose keys collide
+  ;; are still told apart by their wf_def and params.
+  (with-temp-db
+    (fn [path]
+      (with-open [ds (sqlite/datasource path)]
+        (db/init-db! ds)
+        (with-redefs [sqlite/idempotence-key (fn ^long [^String _ ^String _] 42)]
+          (let [a (db/insert-workflow! ds "test.ns/a" "[1]" nil nil nil)
+                b (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)
+                c (db/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)]
+            (is (every? int? [a b c]) "colliding keys don't make them the same workflow")
+            (is (= 3 (count (distinct [a b c]))))
+            (is (nil? (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)) "but the same one is still found")
+            (is (= [a b c] (mapv #(:workflow/invocation-id (db/find-by-wf-def-and-params ds %1 %2))
+                                 ["test.ns/a" "test.ns/a" "test.ns/c"] ["[1]" "[2]" "[1]"])))
+            (is (nil? (db/find-by-wf-def-and-params ds "test.ns/c" "[2]")))))))))

@@ -660,7 +660,7 @@
             timed-out (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [:t]) :timeout-ms 0)]
         (db/time-out! ds timed-out (pr-str {:message "timed out"}))
         (reset! (:tenon/in-flight engine1) (zipmap (conj running timed-out) (repeat nil)))
-        (jdbc/execute! ds ["UPDATE event SET expires_at = 1 WHERE state = 'STARTED'"])
+        (jdbc/execute! ds ["UPDATE workflow SET expires_at = 1 WHERE state = 0"])
         (is (= 20 (count (db/list-expired ds))))
         (let [lost (heartbeat! engine1 #{})]
           (is (empty? (db/list-expired ds)) "all of them were renewed")

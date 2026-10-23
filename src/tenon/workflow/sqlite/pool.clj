@@ -1,62 +1,30 @@
 (ns tenon.workflow.sqlite.pool
   "A small SQLite connection pool whose connections keep their prepared statements."
   (:require [next.jdbc.prepare :as prepare]
-            [next.jdbc.protocols :as p]
-            [next.jdbc.result-set :as rs])
+            [next.jdbc.protocols :as p])
   (:import [java.io Closeable]
-           [java.sql Connection DriverManager PreparedStatement ResultSet]
+           [java.sql Connection DriverManager PreparedStatement]
            [java.util HashMap Map]
            [java.util.concurrent CompletableFuture ConcurrentLinkedQueue ExecutionException
             LinkedBlockingDeque Semaphore]
-           [java.util.concurrent.locks ReentrantLock]
+           [java.util.concurrent.locks Condition ReentrantLock]
            [java.util.concurrent.atomic AtomicBoolean]))
 
 (defn- close-quietly [^java.lang.AutoCloseable c]
   (try (.close c) (catch Throwable _)))
 
-(defn- with-statement [^Connection conn ^Map stmts ^String sql params f]
-  (let [^PreparedStatement ps (or (.get stmts sql)
-                                  (let [ps (.prepareStatement conn sql)] (.put stmts sql ps) ps))]
+(deftype Conn [^Connection conn ^Map stmts]) ; a connection and its prepared statements, by SQL
+
+(defn- with-statement [^Conn c ^String sql params f]
+  (let [^Map stmts (.-stmts c)
+        ^PreparedStatement ps (or (.get stmts sql)
+                                  (let [ps (.prepareStatement ^Connection (.-conn c) sql)] (.put stmts sql ps) ps))]
     (try
       (f (prepare/set-parameters ps params))
       (catch Throwable e
         (.remove stmts sql)
         (close-quietly ps)
         (throw e)))))
-
-(defn- result-set ^ResultSet [^PreparedStatement ps opts]
-  (if (.execute ps)
-    (.getResultSet ps)
-    (when (:return-keys opts)
-      (try (.getGeneratedKeys ps) (catch Exception _)))))
-
-(defn- first-row
-  "The first row of ps's result. Reads the result to its end: SQLite only
-   auto-checkpoints the WAL when a statement steps to its end, so a
-   RETURNING write closed after its first row would let the WAL grow forever."
-  [^Connection conn ^PreparedStatement ps opts]
-  (if-let [^ResultSet r (result-set ps opts)]
-    (try
-      (reduce (fn [first-row row] (or first-row (rs/datafiable-row row conn opts)))
-              nil
-              (rs/reducible-result-set r opts))
-      (finally (close-quietly r)))
-    {:next.jdbc/update-count (.getUpdateCount ps)}))
-
-(deftype Conn [^Connection conn ^Map stmts]
-  p/Executable
-  (-execute [_ sql-params opts]
-    ;; a reducible outlives this call: no caching
-    (p/-execute conn sql-params opts))
-  (-execute-one [_ [sql & params] opts]
-    (with-statement conn stmts sql params
-      #(first-row conn % (merge {:return-keys false} opts))))
-  (-execute-all [_ [sql & params] opts]
-    (with-statement conn stmts sql params
-      #(p/-execute-all % nil (merge {:return-keys false} opts))))
-  p/Transactable
-  (-transact [this body-fn opts]
-    (p/-transact conn (fn [_] (body-fn this)) opts)))
 
 (defn- discard [^Conn c]
   (close-quietly (.-conn c)))
@@ -69,17 +37,17 @@
      (try ~@body (finally (give-back pool# ~sym)))))
 
 (deftype Pool [^String url ^LinkedBlockingDeque idle ^Semaphore permits ^AtomicBoolean closed
-               ^ReentrantLock write-lock ^ConcurrentLinkedQueue writes]
+               ^ReentrantLock write-lock ^Condition batch-done ^AtomicBoolean leading
+               ^ConcurrentLinkedQueue writes]
+  ;; next.jdbc can run statements on the pool, each on a connection of it
+  ;; (the storage itself uses query and execute!)
   p/Executable
   (-execute [_ _ _]
-    (throw (UnsupportedOperationException. "plan needs a connection: borrow one with with-connection")))
+    (throw (UnsupportedOperationException. "plan needs a connection")))
   (-execute-one [this sql-params opts]
-    (with-borrowed [c this] (p/-execute-one c sql-params opts)))
+    (with-borrowed [^Conn c this] (p/-execute-one (.-conn c) sql-params opts)))
   (-execute-all [this sql-params opts]
-    (with-borrowed [c this] (p/-execute-all c sql-params opts)))
-  p/Transactable
-  (-transact [this body-fn opts]
-    (with-borrowed [c this] (p/-transact c body-fn opts)))
+    (with-borrowed [^Conn c this] (p/-execute-all (.-conn c) sql-params opts)))
   Closeable
   (close [_this]
     (.set closed true)
@@ -89,8 +57,16 @@
         (recur)))))
 
 (defn open ^Pool [url size]
-  (Pool. url (LinkedBlockingDeque.) (Semaphore. size) (AtomicBoolean. false) (ReentrantLock.)
-         (ConcurrentLinkedQueue.)))
+  (let [lock (ReentrantLock.)]
+    (Pool. url (LinkedBlockingDeque.) (Semaphore. size) (AtomicBoolean. false) lock (.newCondition lock)
+           (AtomicBoolean. false) (ConcurrentLinkedQueue.))))
+
+(defn execute!
+  "Runs sql - a statement without a result - with params on c, a
+   connection of the pool as write! passes to its fn, through its cached
+   prepared statement. Returns the update count."
+  [c sql & params]
+  (with-statement c sql params (fn [^PreparedStatement ps] (.executeUpdate ps))))
 
 (defn- run-each
   "Runs each write of batch on c in a transaction of its own."
@@ -105,15 +81,15 @@
    they are retried one by one so each fails or succeeds on its own."
   [c batch]
   (let [results (try
-                  (p/-execute-one c ["BEGIN IMMEDIATE"] {})
+                  (execute! c "BEGIN IMMEDIATE")
                   (mapv (fn [[f]] (f c)) batch)
                   (catch Throwable _
-                    (try (p/-execute-one c ["ROLLBACK"] {}) (catch Throwable _))
+                    (try (execute! c "ROLLBACK") (catch Throwable _))
                     nil))]
     (if results
-      (let [committed (try (p/-execute-one c ["COMMIT"] {}) nil
+      (let [committed (try (execute! c "COMMIT") nil
                            (catch Throwable e
-                             (try (p/-execute-one c ["ROLLBACK"] {}) (catch Throwable _))
+                             (try (execute! c "ROLLBACK") (catch Throwable _))
                              e))]
         (doseq [[[_ ^CompletableFuture result] v] (map vector batch results)]
           (if committed
@@ -121,32 +97,75 @@
             (.complete result v))))
       (run-each c batch))))
 
+(defmacro ^:private locking-with [lock & body]
+  `(let [^ReentrantLock lock# ~lock]
+     (.lock lock#)
+     (try ~@body (finally (.unlock lock#)))))
+
 (defn write!
   "Calls (f conn) with a connection of the pool, as part of a group commit:
    SQLite runs one writer at a time, and each commit waits for an fsync. So
-   writes queue up here, and whoever holds the write lock runs every write
-   queued so far in a single transaction - the ones that arrived while the
-   previous batch was committing - and hands each its result once they are
-   durable. A write must be a single statement (atomic on its own), and
-   sees the effects of the writes before it in its batch. Writers of other
-   processes still meet at SQLite's own lock."
+   writes queue up here, and one writer at a time - the leader - runs
+   every write queued so far in a single transaction, and hands each its
+   result once they are durable. The others wait meanwhile: those whose
+   write it ran return with their result, and one of the rest leads the
+   next batch - every write that arrived during this one's commit. A write
+   must be a single statement (atomic on its own), and sees the effects of
+   the writes before it in its batch. Writers of other processes still meet
+   at SQLite's own lock."
   [^Pool pool f]
   (let [result (CompletableFuture.)
         ^ReentrantLock lock (.-write-lock pool)
+        ^Condition batch-done (.-batch-done pool)
+        ^AtomicBoolean leading (.-leading pool)
         ^ConcurrentLinkedQueue writes (.-writes pool)]
     (.add writes [f result])
-    (.lock lock)
-    (try
-      (when-not (.isDone result)
+    (when (locking-with lock
+            (while (and (.get leading) (not (.isDone result)))
+              (.await batch-done))
+            (when-not (.isDone result)
+              (.set leading true)
+              true))
+      (try
         (let [batch (loop [batch []]
                       (if-let [w (.poll writes)] (recur (conj batch w)) batch))]
-          (with-borrowed [c pool]
-            (if (next batch)
-              (run-together c batch)
-              (run-each c batch)))))
-      (finally (.unlock lock)))
+          (try
+            (with-borrowed [c pool]
+              (if (next batch)
+                (run-together c batch)
+                (run-each c batch)))
+            (catch Throwable e
+              ;; e.g. no connection: fail the batch - its writes are no
+              ;; longer queued, so nobody else would run them
+              (doseq [[_ ^CompletableFuture r] batch]
+                (.completeExceptionally r e)))))
+        (finally
+          (locking-with lock
+            (.set leading false)
+            (.signalAll batch-done)))))
     (try (.get result)
          (catch ExecutionException e (throw (.getCause e))))))
+
+(defn query
+  "Runs sql - a statement with a result, e.g. a SELECT or a write with
+   RETURNING - with params on c - a connection of the pool, as write!
+   passes to its fn, or the pool itself - through its cached prepared
+   statement, and returns the vector of (row-fn result-set) for every row
+   of the result. Reads the result to its end: SQLite only auto-checkpoints
+   the WAL when a statement steps to its end, so a RETURNING write closed
+   after its first row would let the WAL grow forever. Uses executeQuery:
+   the driver's execute steps a statement more than once."
+  [c ^String sql params row-fn]
+  (if (instance? Pool c)
+    (with-borrowed [c c] (query c sql params row-fn))
+    (let [^Conn c c]
+      (with-statement c sql params
+        (fn [^PreparedStatement ps]
+          (with-open [r (.executeQuery ps)]
+            (loop [rows (transient [])]
+              (if (.next r)
+                (recur (conj! rows (row-fn r)))
+                (persistent! rows)))))))))
 
 (defn- check-open [^Pool pool]
   (when (.get ^AtomicBoolean (.-closed pool))

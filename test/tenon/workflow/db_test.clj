@@ -99,14 +99,14 @@
 
 (deftest lease-only-update-is-not-logged-test
   (let [id (test-util/insert! "test.ns/renew" :timeout-ms 1000)]
-    (jdbc/execute! (test-util/ds) ["UPDATE event SET expires_at = expires_at + 1000 WHERE id = ?" id])
+    (jdbc/execute! (test-util/ds) ["UPDATE workflow SET expires_at = expires_at + 1000 WHERE invocation_id = ?" id])
     (is (match? [{:workflow/state "STARTED"}] (test-util/history (test-util/ds) id)))))
 
 (deftest expires-at-must-be-cleared-outside-started-test
   (let [id (test-util/insert! "test.ns/check")]
     (test-util/finish! id "DONE" "1")
     (is (thrown? Exception
-          (jdbc/execute! (test-util/ds) ["UPDATE event SET expires_at = 1 WHERE state = 'DONE'"])))))
+          (jdbc/execute! (test-util/ds) ["UPDATE event SET expires_at = 1 WHERE state = 1"])))))
 
 (deftest top-level-workflows-seek-pagination-test
   ;; 10 rows, paged 4 at a time via :limit/:before - every page after the
