@@ -26,6 +26,10 @@
                       io.zonky.test.postgres/embedded-postgres-binaries-windows-amd64 {:mvn/version "18.6.0"}
                       org.slf4j/slf4j-nop {:mvn/version "2.0.17"}}}
 
+  ;; with :test: clojure -M:test:bench [roots]
+  :bench {:extra-paths ["bench"]
+          :main-opts ["-m" "tenon.workflow.bench"]}
+
   :repl/rebel
   {:extra-deps {com.bhauman/rebel-readline {:mvn/version "0.1.11"}}
    :main-opts ["--eval" "(require 'tenon.workflow 'tenon.workflow.server 'tenon.workflow.fixtures)"

@@ -180,7 +180,7 @@
                            ["finish" (:finish sqls) [1 started true "42"]]
                            ["time-out" (:finish sqls) [3 started false "42"]]
                            ["restart" (:restart sqls) [some-root nil 15000]]
-                           ["reuse" (:reuse sqls) [some-root started nil]]
+                           ["reuse" (:reuse sqls) [nil started started some-root]]
                            ["get-workflow" (:get-workflow sqls) [some-root]]
                            ["find" (:find sqls) [(db/idempotence-key "app.ns/wf-0" "[0]")]]
                            ["list-expired" (:list-expired sqls) []]
@@ -205,10 +205,12 @@
 
 ;; Write amplification
 
-(deftest updates-besides-state-changes-are-hot-test
-  ;; A workflow's row is updated by much besides its state changes - lease
-  ;; renewals, reuses, calls it makes - and those updates touch no indexed
-  ;; column: they are HOT, writing no index entry.
+(deftest workflow-rows-change-only-with-their-state-and-lease-test
+  ;; Calls - a workflow's calls of others, its reuses - only append events:
+  ;; no other workflow's row is updated, so none is locked either. A
+  ;; workflow's own row changes with its state, and its lease, whose
+  ;; renewals - the most frequent update - are HOT: they write no index
+  ;; entry.
   (test-util/with-postgres-schema
     (fn [url]
       ;; one connection, so that it can flush the statistics of its own
@@ -226,13 +228,16 @@
                                   (db/finish! s c "DONE" "1")
                                   c)))
                 before (updates)]
-            (dotimes [_ 50] (db/extend-lease! s #{parent} 60000))
-            (doseq [c children] (db/record-reuse! s c parent nil)) ; the child's reuses and the parent's calls
-            (dotimes [i 20] (db/insert-workflow! s "test.ns/child" (str "[more " i "]") parent nil nil))
-            (let [after (updates)]
-              (is (= (+ 50 (* 2 20) 20) (- (:updated after) (:updated before))))
-              (is (= (- (:updated after) (:updated before)) (- (:hot after) (:hot before))) "all of them HOT"))
-            (testing "a state change is not HOT: it moves the row in and out of the indexes of the running and failed ones"
+            (testing "calls update no workflow row"
+              (doseq [c children] (db/record-reuse! s c parent nil))
+              (dotimes [i 20] (db/insert-workflow! s "test.ns/child" (str "[more " i "]") parent nil nil))
+              (is (= before (updates))))
+            (testing "lease renewals are HOT"
+              (dotimes [_ 50] (db/extend-lease! s #{parent} 60000))
+              (let [after (updates)]
+                (is (= 50 (- (:updated after) (:updated before))))
+                (is (= 50 (- (:hot after) (:hot before))))))
+            (testing "a state change is not: it moves the row in and out of the indexes of the running and failed ones"
               (let [before (updates)]
                 (db/finish! s parent "DONE" "1")
                 (let [after (updates)]

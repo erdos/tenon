@@ -17,6 +17,11 @@ case "$1" in
     clojure -M:test -m cognitect.test-runner -d test -d http/test "$@"
     ;;
 
+  b|bench)
+    shift
+    clojure -M:test:bench "$@"
+    ;;
+
   deps|download)
     echo "Downloading main deps..."
     clojure -P
@@ -39,11 +44,12 @@ case "$1" in
     ;;
 
   *)
-    echo "Usage: $0 {r|repl|t|test|tests|deps|download|setup|c|clean}"
+    echo "Usage: $0 {r|repl|t|test|tests|b|bench|deps|download|setup|c|clean}"
     echo ""
     echo "Commands:"
     echo "  r, repl          Start the interactive REPL"
     echo "  t, test, tests   Run tests (passes extra args to test runner)"
+    echo "  b, bench         Benchmark SQLite against PostgreSQL (optional arg: top-level workflows to read among)"
     echo "  deps, download   Download project + test dependencies"
     echo "  setup            Install the Clojure CLI tools"
     echo "  c, clean         Clean build/cache artifacts"

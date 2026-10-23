@@ -73,21 +73,25 @@
       acc)))
 
 (defn- check-tables
-  "The invariants of the tables both storages share the shape of: every
-   list a workflow row heads holds exactly the events a scan finds for it,
-   newest first, and the row's current state is its newest state event."
-  [ds]
-  (let [events (into {} (map (juxt :id identity))
-                     (jdbc/execute! ds ["SELECT id, workflow_id, state, invocation_id, parent_invocation_id, wf_def_id,
-                                                prev_id, prev_call_id
-                                           FROM event"]
+  "The invariants of a storage's tables: its workflow rows' state lists
+   hold exactly the events a scan finds for them, newest first, a row's
+   current state is its newest state event, and the states follow each
+   other as they may. Then those of backend: SQLite's lists of the calls a
+   workflow made and of its reuses hold exactly theirs; PostgreSQL's calls
+   name their caller's workflow."
+  [backend ds]
+  (let [sqlite? (= :sqlite backend)
+        events (into {} (map (juxt :id identity))
+                     (jdbc/execute! ds [(str "SELECT id, workflow_id, state, invocation_id, parent_invocation_id, wf_def_id,
+                                                     prev_id, " (if sqlite? "prev_call_id" "caller_id") "
+                                                FROM event")]
                                     unqualified))
-        workflows (jdbc/execute! ds ["SELECT id, invocation_id, state, state_id, expires_at, last_reuse_id, last_call_id
-                                        FROM workflow"]
+        workflows (jdbc/execute! ds [(str "SELECT id, invocation_id, state, state_id, expires_at"
+                                          (when sqlite? ", last_reuse_id, last_call_id") " FROM workflow")]
                                  unqualified)
         of-workflow (group-by :workflow_id (vals events))
-        calls-by (group-by #(get-in events [(:parent_invocation_id %) :workflow_id])
-                           (filter #(and (:wf_def_id %) (:parent_invocation_id %)) (vals events)))
+        caller-of #(get-in events [(:parent_invocation_id %) :workflow_id])
+        calls-by (group-by caller-of (filter #(and (:wf_def_id %) (:parent_invocation_id %)) (vals events)))
         newest-first #(sort > (map :id %))
         problems (for [w workflows
                        :let [own (of-workflow (:id w))
@@ -95,12 +99,6 @@
                              state-seq (map :state (sort-by :id states))]
                        problem [(when-not (= (newest-first states) (walk events (:state_id w) :prev_id))
                                   :state-list)
-                                (when-not (= (newest-first (filter #(= 4 (:state %)) own))
-                                             (walk events (:last_reuse_id w) :prev_id))
-                                  :reuse-list)
-                                (when-not (= (newest-first (calls-by (:id w)))
-                                             (walk events (:last_call_id w) :prev_call_id))
-                                  :call-list)
                                 (when-not (= (:state w) (get-in events [(:state_id w) :state]))
                                   :current-state)
                                 (when-not (= (:invocation_id w) (apply max (map :id (filter #(zero? (:state %)) own))))
@@ -116,7 +114,16 @@
                                 ;; an end names the invocation it ended
                                 (when-not (every? (fn [[a b]] (or (zero? (:state b)) (= (:id a) (:invocation_id b))))
                                                   (partition 2 1 (sort-by :id states)))
-                                  :ended-invocation)]
+                                  :ended-invocation)
+                                (when (and sqlite? (not= (newest-first (filter #(= 4 (:state %)) own))
+                                                         (walk events (:last_reuse_id w) :prev_id)))
+                                  :reuse-list)
+                                (when (and sqlite? (not= (newest-first (calls-by (:id w)))
+                                                         (walk events (:last_call_id w) :prev_call_id)))
+                                  :call-list)
+                                (when-not (or sqlite? (every? #(= (caller-of %) (:caller_id %))
+                                                              (filter :wf_def_id own)))
+                                  :caller)]
                        :when problem]
                    [(:id w) problem])]
     (is (= [] (vec (take 10 problems))) "workflows whose tables disagree")
@@ -134,7 +141,7 @@
               (testing "each (wf_def, params) was inserted once"
                 (is (every? #(= 1 (count %)) (vals inserted))))
               (testing "the tables agree with themselves"
-                (is (< 100 (check-tables storage))))
+                (is (< 100 (check-tables backend storage))))
               (testing "each workflow's timeline is its history"
                 (doseq [id (take 100 (mapcat val inserted))]
                   (is (= (map (juxt :workflow/invocation-id :workflow/state)
@@ -147,3 +154,47 @@
                 (let [calls (db/top-level-workflows storage {:top-level-only? false})]
                   (is (= (count (mapcat val inserted)) (count (remove :event/reused calls))))
                   (is (= (sort > (map :event/call-id calls)) (map :event/call-id calls))))))))))))
+
+(defn- race
+  "Calls f from n threads released at once, returning their results."
+  [n f]
+  (let [ready (java.util.concurrent.CountDownLatch. n)
+        go (promise)
+        racers (mapv (fn [_] (future (.countDown ready) @go (f))) (range n))]
+    (.await ready)
+    (deliver go true)
+    (mapv deref racers)))
+
+(deftest races-test
+  ;; The same write, from 8 threads at the very same time - for 30 rounds:
+  ;; one of them succeeds, every time.
+  (doseq [backend test-util/backends]
+    (testing (name backend)
+      (test-util/with-db backend
+        (fn [db _]
+          (with-open [s (open-storage backend db)]
+            (db/init-db! s)
+            (dotimes [round 30]
+              (let [params (str "[" round "]")]
+                (testing "inserts of one workflow: one inserts it"
+                  (is (= 1 (count (remove nil? (race 8 #(db/insert-workflow! s "race/insert" params nil nil 60000)))))))
+                (let [id (:workflow/invocation-id (db/find-by-wf-def-and-params s "race/insert" params))]
+                  (testing "finishes of one invocation: one finishes it"
+                    (is (= 1 (count (filter true? (race 8 #(db/finish! s id (rand-nth ["DONE" "ERROR"]) "1")))))))
+                  (testing "restarts of one invocation: one restarts it"
+                    (let [restarted (remove nil? (race 8 #(db/restart! s id nil 0)))]
+                      (is (= 1 (count restarted)))
+                      (testing "and a time-out racing finishes of it: one ends it"
+                        (is (= 1 (count (filter true? (race 8 (let [n (atom 0)]
+                                                                #(if (odd? (swap! n inc))
+                                                                   (db/time-out! s (first restarted) "{}")
+                                                                   (db/finish! s (first restarted) "DONE" "2"))))))))))
+                    (is (= ["STARTED" "DONE" "STARTED" "DONE"]
+                           (map #(if (= "ERROR" %) "DONE" %) ; either way it ended
+                                (map #(if (= "TIMEOUT" %) "DONE" %)
+                                     (map :workflow/state (test-util/history s id)))))
+                        "its history: one start, one end, one restart, one end"))
+                  (testing "reuses of it: each is logged"
+                    (race 8 #(db/record-reuse! s id nil nil))
+                    (is (= 8 (count (filter #(= "REUSED" (:workflow/state %)) (db/full-timeline s id)))))))))
+            (check-tables backend s)))))))

@@ -12,51 +12,48 @@
      Payloads (metadata, results) are stored here, once - and so is a
      workflow's identity, on its first event: its wf_def, params, caller
      and the 64-bit idempotence key of wf_def and params.
-   - workflow: one row per workflow, keyed by its first invocation id: what
-     changes - its current invocation, state and lease, and the heads of
-     its event lists. Nothing else: Postgres writes a whole new row version
-     on every update, and this row is updated on every state change, lease
-     renewal, reuse and call made. It leaves room in its pages
-     (fillfactor) so that updates not touching an indexed column - all but
-     the state changes - are HOT: the new version goes on the same page,
-     and no index is written. A state change writes an entry in the
-     primary key, and in workflow_started or workflow_failed if it is to
-     one of their states - the identity's index entries are on the event,
+   - workflow: one row per workflow, keyed by its first invocation id: its
+     current invocation, state and lease. Nothing else: Postgres writes a
+     whole new row version on every update. The row leaves room in its
+     pages (fillfactor), so that a lease renewal - the most frequent
+     update - is HOT: the new version goes on the same page, and no index
+     is written. A state change writes an entry in the primary key, and
+     in workflow_started or workflow_failed if it is to one of their
+     states - the identity's index entries are on the first event,
      written once.
    - wf_def: the distinct wf_def names, so rows carry a small integer
      instead of the name, and the dropdown lists a handful of rows.
 
-   As in SQLite, events are not indexed by workflow or by caller: they
-   form linked lists, threaded through ids the writer already has at hand
-   - prev_id links a workflow's states (newest first, from
-   workflow.state_id) and, separately, its reuses (from
-   workflow.last_reuse_id); prev_call_id links the calls a workflow made
-   (from workflow.last_call_id). The only indexes are the primary keys,
-   the idempotence keys, the running and the failed workflows, and the
-   calls (first starts and reuses) the listing pages through.
+   A workflow's states form a linked list, as in SQLite: prev_id links
+   them, newest first, from workflow.state_id - written by the state
+   changes, which lock the workflow's row anyway. But where SQLite also
+   links the calls a workflow made and its reuses, here they are indexed
+   (event_caller, event_reuse): a list head would be a row every call of a
+   popular workflow - or every call made by a workflow fanning out - had
+   to lock and hold until its commit was flushed, queueing them all up.
+   So no write touches another workflow's row, and a reuse touches no row
+   at all, only appends.
 
    Writers run concurrently, so where SQLite relies on running one writer
-   at a time, these rely on row locks. A write that moves a list head
-   locks the row holding it, so it reads the head it links to and moves it
-   atomically. Compare-and-set writes (finish!, time-out!, restart!) lock
-   the workflow row, and Postgres re-checks their condition on its latest
-   version. Rows are locked in id order, so writers can't deadlock.
-   Inserts of one idempotence key are serialized by a transaction-scoped
-   advisory lock on the key - in the database's advisory lock space,
-   shared with the application's - so the second one sees the first's row
-   (the check compares wf_def and params too, so a key collision costs a
-   row read, never a wrong answer). Every write is a single statement - a
-   plain one, or a call of one of the schema's functions - in a
-   transaction of its own: one round trip, one commit, and concurrent
-   commits share their WAL flushes.
+   at a time, these rely on locks. Compare-and-set writes (finish!,
+   time-out!, restart!) lock the workflow row, and Postgres re-checks
+   their condition on its latest version; extend-lease! locks its rows in
+   id order, so writers can't deadlock. Inserts of one idempotence key are
+   serialized by a transaction-scoped advisory lock on the key - in the
+   database's advisory lock space, shared with the application's - so the
+   second one sees the first's row (the check compares wf_def and params
+   too, so a key collision costs a row read, never a wrong answer). Every
+   write is a single statement - a plain one, or a call of one of the
+   schema's functions - in a transaction of its own: one round trip, one
+   commit, and concurrent commits share their WAL flushes.
 
-   Reads follow those lists - and every other pointer, e.g. from a page
-   of calls to their workflows - by primary key lookups the planner has
-   no choice about (see by-id): what SQLite's CROSS JOINs and INDEXED BY
-   pin down. Listings are built from a page of ids, found from a range of
-   an index, and only then is each row looked up; the values the right
-   index depends on - the state, wf_def and page size - are part of the
-   SQL, so even a generic plan is made for them.
+   Reads follow pointers - and every list, e.g. from a page of calls to
+   their workflows - by index lookups the planner has no choice about (see
+   by-id): what SQLite's CROSS JOINs and INDEXED BY pin down. Listings are
+   built from a page of ids, found from a range of an index, and only then
+   is each row looked up; the values the right index depends on - the
+   state, wf_def and page size - are part of the SQL, so even a generic
+   plan is made for them.
 
    Everything lives in one schema - `tenon` unless the JDBC URL names one
    with currentSchema, or the :schema option does - created by init-db!.
@@ -145,8 +142,8 @@
       invocation_id        bigint,   -- DONE, ERROR, TIMEOUT, REUSED: the invocation finished or reused
       expires_at           bigint,   -- STARTED: the lease it was started with
       parent_invocation_id bigint,   -- calls: the caller's invocation
-      prev_id              bigint,   -- the workflow's previous state event, or for REUSED its previous reuse
-      prev_call_id         bigint,   -- calls: the previous call made by the caller's workflow
+      caller_id            bigint,   -- calls: the caller's workflow
+      prev_id              bigint,   -- the workflow's previous state event (not for REUSED)
       wf_def_id            integer,  -- calls: the called wf_def
       state                smallint NOT NULL CHECK (state BETWEEN {{STARTED}} AND {{REUSED}}), -- see states
       data                 text,     -- metadata (STARTED, REUSED) or result (DONE, ERROR, TIMEOUT)
@@ -155,29 +152,31 @@
       CHECK (expires_at IS NULL OR state = {{STARTED}}),
       CHECK ((wf_def_id IS NULL) = (state <> {{REUSED}} AND id <> workflow_id)),
       CHECK ((key IS NULL) = (id <> workflow_id)),
-      CHECK ((params IS NULL) = (id <> workflow_id))
+      CHECK ((params IS NULL) = (id <> workflow_id)),
+      CHECK (caller_id IS NULL OR parent_invocation_id IS NOT NULL)
     )"
    "CREATE INDEX IF NOT EXISTS event_key ON {{s}}.event (key) WHERE key IS NOT NULL"
    ;; The calls, in call order: top-level ones (the default listing) ...
    "CREATE INDEX IF NOT EXISTS event_top_call ON {{s}}.event (id)
       WHERE wf_def_id IS NOT NULL AND parent_invocation_id IS NULL"
-   ;; ... and by wf_def, top-level and nested ones apart: the listing's
-   ;; wf_def filter is one range, or two merged.
+   ;; ... by wf_def, top-level and nested ones apart: the listing's wf_def
+   ;; filter is one range, or two merged ...
    "CREATE INDEX IF NOT EXISTS event_def_top_call ON {{s}}.event (wf_def_id, id)
       WHERE wf_def_id IS NOT NULL AND parent_invocation_id IS NULL"
    "CREATE INDEX IF NOT EXISTS event_def_nested_call ON {{s}}.event (wf_def_id, id)
       WHERE wf_def_id IS NOT NULL AND parent_invocation_id IS NOT NULL"
+   ;; ... and by caller: the calls a workflow made, under any of its
+   ;; invocations.
+   "CREATE INDEX IF NOT EXISTS event_caller ON {{s}}.event (caller_id, id) WHERE caller_id IS NOT NULL"
+   ;; A workflow's reuses.
+   "CREATE INDEX IF NOT EXISTS event_reuse ON {{s}}.event (workflow_id, id) WHERE state = {{REUSED}}"
    "CREATE TABLE IF NOT EXISTS {{s}}.workflow (
       id            bigint   PRIMARY KEY,  -- its first invocation id (and event)
       invocation_id bigint   NOT NULL,     -- the current invocation (its STARTED event)
       state_id      bigint   NOT NULL,     -- the current state's event: invocation_id while STARTED
       expires_at    bigint,                -- while STARTED: the lease
-      last_reuse_id bigint,                -- its latest REUSED event, head of their prev_id list
-      last_call_id  bigint,                -- the latest call it made, head of the prev_call_id list
       state         smallint NOT NULL      -- the current state's code
     ) WITH (fillfactor = 75)"
-   ;; The few workflows that are not DONE - the running ones and the failed
-   ;; ones - by state, then id.
    ;; The few workflows not DONE: the running ones ...
    "CREATE INDEX IF NOT EXISTS workflow_started ON {{s}}.workflow (id) WHERE state = {{STARTED}}"
    ;; ... and the failed ones, by state. Apart, as every workflow passes
@@ -194,12 +193,11 @@
                                                      p_metadata text, p_timeout bigint)
     RETURNS bigint LANGUAGE plpgsql AS $$
     DECLARE
-      v_now       bigint := {{now}};
-      v_def       integer;
-      v_top       boolean;
-      v_parent_wf bigint;
-      v_prev_call bigint;
-      v_id        bigint;
+      v_now    bigint := {{now}};
+      v_def    integer;
+      v_top    boolean;
+      v_caller bigint;
+      v_id     bigint;
     BEGIN
       PERFORM pg_advisory_xact_lock(p_key);
       PERFORM FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
@@ -219,22 +217,14 @@
       IF p_parent IS NULL AND NOT v_top THEN
         UPDATE {{s}}.wf_def SET top_level = true WHERE id = v_def AND NOT top_level;
       END IF;
-      IF p_parent IS NOT NULL THEN
-        SELECT w.id, w.last_call_id INTO v_parent_wf, v_prev_call
-          FROM {{s}}.event p JOIN {{s}}.workflow w ON w.id = p.workflow_id
-         WHERE p.id = p_parent
-           FOR UPDATE OF w;
-      END IF;
+      SELECT workflow_id INTO v_caller FROM {{s}}.event WHERE id = p_parent;
       v_id := nextval('{{s}}.event_id_seq');
       INSERT INTO {{s}}.event (id, workflow_id, state, occurred_at, data, key, params, expires_at,
-                               parent_invocation_id, wf_def_id, prev_call_id)
+                               parent_invocation_id, caller_id, wf_def_id)
       VALUES (v_id, v_id, {{STARTED}}, v_now, p_metadata, p_key, p_params, v_now + p_timeout,
-              p_parent, v_def, v_prev_call);
+              p_parent, v_caller, v_def);
       INSERT INTO {{s}}.workflow (id, invocation_id, state, state_id, expires_at)
       VALUES (v_id, v_id, {{STARTED}}, v_id, v_now + p_timeout);
-      IF v_parent_wf IS NOT NULL THEN
-        UPDATE {{s}}.workflow SET last_call_id = v_id WHERE id = v_parent_wf;
-      END IF;
       RETURN v_id;
     END
     $$"
@@ -261,50 +251,6 @@
       UPDATE {{s}}.workflow
          SET invocation_id = v_id, state = {{STARTED}}, state_id = v_id, expires_at = v_now + p_timeout
        WHERE id = v_wf;
-      RETURN v_id;
-    END
-    $$"
-   ;; record-reuse!: moves the heads of two lists - the reused workflow's
-   ;; reuses and the caller's calls - so it locks both rows, in id order.
-   "CREATE OR REPLACE FUNCTION {{s}}.record_reuse(p_invocation bigint, p_parent bigint, p_metadata text)
-    RETURNS bigint LANGUAGE plpgsql AS $$
-    DECLARE
-      v_wf        bigint;
-      v_def       integer;
-      v_parent_wf bigint;
-      v_prev      bigint;
-      v_prev_call bigint;
-      v_id        bigint;
-      r           record;
-    BEGIN
-      SELECT f.id, f.wf_def_id INTO v_wf, v_def
-        FROM {{s}}.event i JOIN {{s}}.event f ON f.id = i.workflow_id
-       WHERE i.id = p_invocation AND i.state = {{STARTED}};
-      IF NOT FOUND THEN
-        RETURN NULL;
-      END IF;
-      SELECT p.workflow_id INTO v_parent_wf FROM {{s}}.event p WHERE p.id = p_parent;
-      FOR r IN SELECT id, last_reuse_id, last_call_id FROM {{s}}.workflow
-                WHERE id IN (v_wf, v_parent_wf) ORDER BY id FOR UPDATE
-      LOOP
-        IF r.id = v_wf THEN
-          v_prev := r.last_reuse_id;
-        END IF;
-        IF r.id = v_parent_wf THEN
-          v_prev_call := r.last_call_id;
-        END IF;
-      END LOOP;
-      v_id := nextval('{{s}}.event_id_seq');
-      INSERT INTO {{s}}.event (id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id,
-                               wf_def_id, prev_id, prev_call_id)
-      VALUES (v_id, v_wf, {{REUSED}}, {{now}}, p_metadata, p_invocation, p_parent, v_def, v_prev, v_prev_call);
-      UPDATE {{s}}.workflow SET last_reuse_id = v_id WHERE id = v_wf;
-      IF v_parent_wf IS NOT NULL THEN
-        UPDATE {{s}}.workflow SET last_call_id = v_id WHERE id = v_parent_wf;
-      END IF;
-      IF p_parent IS NULL THEN
-        UPDATE {{s}}.wf_def SET top_level = true WHERE id = v_def AND NOT top_level;
-      END IF;
       RETURN v_id;
     END
     $$"])
@@ -416,6 +362,13 @@
   [table alias expr]
   (str "CROSS JOIN LATERAL (SELECT * FROM {{s}}." table " WHERE id = " expr " LIMIT 1) " alias))
 
+(defn- rows-where
+  "SQL joining the rows of table matching condition (which refers to
+   earlier tables), as alias: an index range scan per row, which the
+   planner can't turn into a join either (see by-id)."
+  [table alias condition]
+  (str "CROSS JOIN LATERAL (SELECT * FROM {{s}}." table " WHERE " condition " OFFSET 0) " alias))
+
 (def ^:private call-details
   "SQL joining the call whose event id is x.id, and the called workflow's
    current state, as the call-columns of d."
@@ -464,38 +417,31 @@
     (cond
       (#{"STARTED" "ERROR" "TIMEOUT"} state)
       ;; A first call of a workflow in the state is in its index's order,
-      ;; so a page of them is a range of it. Its reuses are in its
-      ;; reuse list, newest first - and only those newer than the page's
-      ;; oldest first call can make it onto the page, so each list is cut
-      ;; there.
+      ;; so a page of them is a range of it. Of its reuses - a range of
+      ;; event_reuse - only those newer than the page's oldest first call
+      ;; can make it onto the page, so each range is cut there.
       (let [filters (fn ^String [^String id]
                       ^String (and-all (when top-level-only? "c.parent_invocation_id IS NULL")
                                        (when wf-def-id def-filter)
                                        (when before (.replace "{{id}} < ?::bigint" "{{id}}" id))))
             filter-params (cond-> [] before (conj before))]
-        [#(sql s (-> (page "WITH RECURSIVE
+        [#(sql s (-> (page "WITH
                               firsts(id) AS (
                                 SELECT r.id FROM {{s}}.workflow r{{first-join}}
                                  WHERE r.state = {{state}}{{first-filters}}
                                  ORDER BY r.id DESC{{limit}}),
-                              bound(id) AS ({{bound}}),
-                              reuses(id) AS (
-                                SELECT w.last_reuse_id FROM {{s}}.workflow w
-                                 WHERE w.state = {{state}} AND w.last_reuse_id >= (SELECT id FROM bound)
-                                UNION ALL
-                                SELECT e.prev_id FROM reuses r {{event-e}}
-                                 WHERE e.prev_id >= (SELECT id FROM bound))
+                              bound(id) AS ({{bound}})
                             SELECT id FROM firsts
                             UNION ALL
-                            SELECT r.id FROM reuses r {{event-c}}
-                             WHERE c.state = {{REUSED}}{{reuse-filters}}
+                            SELECT c.id FROM {{s}}.workflow w {{reuses}}
+                             WHERE w.state = {{state}}{{reuse-filters}}
                             ORDER BY id DESC{{limit}}")
                      (.replace "{{first-join}}" ^String (if (or top-level-only? wf-def-id) (str " " (by-id "event" "c" "r.id")) ""))
-                     (.replace "{{event-e}}" ^String (by-id "event" "e" "r.id"))
-                     (.replace "{{event-c}}" ^String (by-id "event" "c" "r.id"))
+                     (.replace "{{reuses}}" ^String (rows-where "event" "c" (str "workflow_id = w.id AND state = {{REUSED}}"
+                                                                                 " AND id >= (SELECT id FROM bound)")))
                      (.replace "{{state}}" ^String (str code))
                      (.replace "{{first-filters}}" ^String (filters "r.id"))
-                     (.replace "{{reuse-filters}}" ^String (filters "r.id"))
+                     (.replace "{{reuse-filters}}" ^String (filters "c.id"))
                      (.replace "{{bound}}" ^String (if limit
                                                      (str "SELECT CASE WHEN count(*) < " limit " THEN 0 ELSE min(id) END FROM firsts")
                                                      "SELECT 0::bigint"))
@@ -576,7 +522,23 @@
 
    :restart "SELECT {{s}}.restart_workflow(?::bigint, ?::text, ?::bigint)"
 
-   :reuse "SELECT {{s}}.record_reuse(?::bigint, ?::bigint, ?::text)"
+   :reuse
+   ;; Only appends - and marks the wf_def as called at the top level, the
+   ;; first time it is.
+   "WITH r AS (
+      INSERT INTO {{s}}.event (id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id,
+                               caller_id, wf_def_id)
+      SELECT nextval('{{s}}.event_id_seq'), f.id, {{REUSED}}, {{now}}, ?::text, i.id, ?::bigint, p.workflow_id,
+             f.wf_def_id
+        FROM {{s}}.event i
+        JOIN {{s}}.event f ON f.id = i.workflow_id
+        LEFT JOIN {{s}}.event p ON p.id = ?::bigint
+       WHERE i.id = ?::bigint AND i.state = {{STARTED}}
+      RETURNING wf_def_id, parent_invocation_id)
+    UPDATE {{s}}.wf_def d SET top_level = true
+      FROM r
+     WHERE d.id = r.wf_def_id AND r.parent_invocation_id IS NULL AND NOT d.top_level
+    RETURNING d.id"
 
    :get-workflow
    "SELECT {{state-columns}}, coalesce(w.expires_at <= {{now}}, false)
@@ -595,26 +557,18 @@
    :wf-def-id "SELECT id FROM {{s}}.wf_def WHERE name = ?::text"
 
    :timeline
-   ;; As in SQLite, but a recursive term may refer to its CTE only once:
-   ;; a call's two successors - the caller's previous call, and for a
-   ;; first start the first call the started workflow made - come from one
-   ;; lateral subquery.
+   ;; As in SQLite, but the calls a workflow made, and its reuses, are
+   ;; ranges of indexes rather than lists.
    (str
     "WITH RECURSIVE
      root(id) AS (SELECT workflow_id FROM {{s}}.event WHERE id = ?::bigint AND state = {{STARTED}}),
-     calls(id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id, depth, prev) AS (
-       SELECT {{event-carried}}, 1, e.prev_call_id
-         FROM root " (by-id "workflow" "w" "root.id") " " (by-id "event" "e" "w.last_call_id") "
+     calls(id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id, depth) AS (
+       SELECT {{event-carried}}, 1
+         FROM root " (rows-where "event" "e" "caller_id = root.id") "
        UNION ALL
-       SELECT n.*
-         FROM calls c
-         CROSS JOIN LATERAL (
-           SELECT {{event-carried}}, c.depth, e.prev_call_id
-             FROM {{s}}.event e WHERE e.id = c.prev
-           UNION ALL
-           SELECT {{event-carried}}, c.depth + 1, e.prev_call_id
-             FROM {{s}}.workflow w JOIN {{s}}.event e ON e.id = w.last_call_id
-            WHERE w.id = c.workflow_id AND c.state = {{STARTED}}) n
+       SELECT {{event-carried}}, c.depth + 1
+         FROM calls c " (rows-where "event" "e" "caller_id = c.workflow_id") "
+        WHERE c.state = {{STARTED}}
      ),
      tree(id, depth) AS (
        SELECT id, 0 FROM root
@@ -625,17 +579,16 @@
        SELECT {{event-carried}}, t.depth, e.prev_id
          FROM tree t " (by-id "workflow" "w" "t.id") " " (by-id "event" "e" "w.state_id") "
        UNION ALL
-       SELECT {{event-carried}}, 0, e.prev_id
-         FROM root " (by-id "workflow" "w" "root.id") " " (by-id "event" "e" "w.last_reuse_id") "
-       UNION ALL
        SELECT {{event-carried}}, o.depth, e.prev_id
          FROM own o " (by-id "event" "e" "o.prev") "
      ),
-     entry AS (
-       SELECT * FROM own
-        WHERE state <> {{REUSED}}
-           OR coalesce((SELECT workflow_id FROM {{s}}.event WHERE id = own.parent_invocation_id), -1)
-              NOT IN (SELECT id FROM tree)
+     entry(id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id, depth) AS (
+       SELECT id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id, depth FROM own
+       UNION ALL
+       -- the root's reuses from outside its tree: those from inside are calls
+       SELECT {{event-carried}}, 0
+         FROM root " (rows-where "event" "e" "workflow_id = root.id AND state = {{REUSED}}") "
+        WHERE e.caller_id IS NULL OR e.caller_id NOT IN (SELECT id FROM tree)
        UNION ALL
        SELECT * FROM calls WHERE state = {{REUSED}}
      )
@@ -760,8 +713,8 @@
                   read-nilable-id)))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
-    (query (ds-of this) (:reuse (sqls-of this)) [invocation-id parent-invocation-id metadata-edn-str] #{3}
-           read-nilable-id)
+    (query (ds-of this) (:reuse (sqls-of this)) [metadata-edn-str parent-invocation-id parent-invocation-id invocation-id]
+           #{1} read-nilable-id)
     nil)
 
   (get-workflow [this invocation-id]
