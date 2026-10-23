@@ -3,7 +3,8 @@
    same writes and reads against each, on the same machine and disk, and
    both durable: SQLite as tenon.workflow.sqlite configures it (WAL,
    synchronous=FULL, group commit), and an embedded PostgreSQL with fsync
-   and synchronous_commit on - and for the writes, also off, for reference.
+   and synchronous_commit on - and for the writes, also with
+   synchronous_commit off, for reference.
 
    Run with ./run bench [roots], roots (default 100000) being the number of
    top-level workflows the reads are measured among. Prints a Markdown
@@ -75,6 +76,12 @@
                                                                  FROM pg_class c
                                                                  JOIN pg_namespace n ON n.oid = c.relnamespace
                                                                 WHERE n.nspname = current_schema() AND c.relkind = 'r'"])))
+                    :free (fn [s]
+                            (jdbc/execute! s ["CREATE EXTENSION IF NOT EXISTS pgstattuple"])
+                            (:free (jdbc/execute-one! s ["SELECT sum((pgstattuple(c.oid)).free_space)::bigint AS free
+                                                           FROM pg_class c
+                                                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                                                          WHERE n.nspname = current_schema() AND c.relkind = 'r'"])))
                     :wal (fn [s] (:lsn (jdbc/execute-one! s ["SELECT pg_current_wal_lsn() - '0/0'::pg_lsn AS lsn"])))})]
     [{:name "SQLite"
       :open (fn [] (db/init-db! (sqlite/datasource (temp-sqlite-path))))
@@ -200,7 +207,8 @@
       (println (str "- " (.availableProcessors (Runtime/getRuntime)) " CPUs, JVM " (System/getProperty "java.version")
                     ", PostgreSQL " version " (embedded, same machine, over TCP), SQLite "
                     (:v (jdbc/execute-one! (jdbc/get-datasource "jdbc:sqlite::memory:") ["SELECT sqlite_version() AS v"]))))
-      (println "- durable commits on both: SQLite WAL + synchronous=FULL, PostgreSQL fsync + synchronous_commit=on\n")
+      (println "- durable commits on both: SQLite WAL + synchronous=FULL, PostgreSQL fsync + synchronous_commit=on;")
+      (println "  PostgreSQL with async commit (not durable) for reference\n")
 
       ;; writes, on fresh stores - each warmed up first
       (let [write-stores [sqlite-store pg-store pg-async-store]
@@ -216,7 +224,8 @@
         (println))
 
       ;; the engine end to end
-      (let [results (vec (for [{:keys [open]} [sqlite-store pg-store]]
+      (let [engine-stores [sqlite-store pg-store]
+            results (vec (for [{:keys [open]} engine-stores]
                            (let [e (engine/init (open) :tenon/sweep-ms nil)]
                              (try
                                (binding [engine/*workflow-engine* e]
@@ -226,13 +235,13 @@
                                        (engine-scenarios)))
                                (finally (engine/close! e))))))]
         (println "## The engine, end to end (calls per second)\n")
-        (println (table ["SQLite" "PostgreSQL"]
+        (println (table (map :name engine-stores)
                         (map-indexed (fn [k [label]] (into [label] (map #(result-cell (nth % k)) results)))
                                      (engine-scenarios))))
         (println))
 
       ;; reads, among roots top-level workflows
-      (let [results (vec (for [{:keys [open size wal]} [sqlite-store pg-store]]
+      (let [results (vec (for [{:keys [open size free wal]} [sqlite-store pg-store]]
                            (with-open [s (open)]
                              (let [wal-before (when wal (wal s))
                                    data (populate! s roots)
@@ -243,6 +252,7 @@
                                {:populate data
                                 :workflows workflows
                                 :bytes (size s)
+                                :free (when free (free s))
                                 :wal-per-workflow (when wal (/ (double (- wal-after wal-before)) workflows))
                                 :reads (mapv (fn [[_ threads n f]] (measure threads n (fn [t i] (f s t i))))
                                              (read-scenarios data))}))))]
@@ -256,8 +266,11 @@
                          (map-indexed (fn [k [label]] (into [label] (map #(result-cell (get-in % [:reads k])) results)))
                                       (read-scenarios (:populate (first results))))
                          [(into ["size on disk (tables and indexes)"]
-                                (map #(format "%,.0f MB, %,.0f B per workflow"
-                                              (/ (:bytes %) 1048576.0) (/ (double (:bytes %)) (:workflows %)))
+                                (map #(str (format "%,.0f MB, %,.0f B per workflow"
+                                                   (/ (:bytes %) 1048576.0) (/ (double (:bytes %)) (:workflows %)))
+                                           (when (:free %)
+                                             (format " (%,.0f MB of it free, left by updates for later writes)"
+                                                     (/ (:free %) 1048576.0))))
                                      results))
                           ["WAL written per workflow" "-"
                            (format "%,.0f B" (:wal-per-workflow (second results)))]])))

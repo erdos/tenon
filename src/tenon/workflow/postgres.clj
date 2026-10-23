@@ -17,7 +17,10 @@
      whole new row version on every update. The row leaves room in its
      pages (fillfactor), so that a lease renewal - the most frequent
      update - is HOT: the new version goes on the same page, and no index
-     is written. A state change writes an entry in the primary key, and
+     is written. (A heartbeat renews many leases at once, of workflows
+     started about the same time, so on the same pages: those whose new
+     versions don't fit move to pages with room, once, and are HOT from
+     then on.) A state change writes an entry in the primary key, and
      in workflow_started or workflow_failed if it is to one of their
      states - the identity's index entries are on the first event,
      written once.

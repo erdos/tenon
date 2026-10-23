@@ -1,6 +1,6 @@
 # tenon
 
-A durable execution engine for Clojure functions on SQLite.
+A durable execution engine for Clojure functions on SQLite or PostgreSQL.
 
 Every function invocation (and its result) is logged to a database table. The database is used for:
 
@@ -46,6 +46,28 @@ Start the REPL with `./run repl`.
 
 You can find the invocations in the web UI started at http://localhost:3000.
 
+## Storage
+
+`tenon.workflow/init` takes the database as its first argument:
+
+- a path: a SQLite file, created if needed (`tenon.workflow.sqlite`);
+- a PostgreSQL JDBC URL (`tenon.workflow.postgres`), e.g.
+  `"jdbc:postgresql://db.example.com/app?user=app&password=secret"`. The tables live in the schema
+  the URL's `currentSchema` parameter names, else in `tenon`; `init` creates the schema, its tables
+  and functions if they don't exist yet (several processes may do so at once). Connections come from a
+  HikariCP pool of 10;
+- or a storage you opened yourself, e.g. `(tenon.workflow.postgres/storage my-datasource {:schema "jobs"})`
+  over a `javax.sql.DataSource` you manage, or a pool of another size.
+
+```clojure
+(def my-engine (tenon.workflow/init "jdbc:postgresql://localhost/app?user=app&currentSchema=workflows"))
+```
+
+Both keep the same data model: an append-only log of every state each workflow entered, plus a row
+per workflow holding its current state. The PostgreSQL storage is tested with PostgreSQL 14 and 18.
+Several processes - or hosts - can share a PostgreSQL database, as they can a SQLite file: the running
+invocations of each are kept alive, and timed out, across all of them.
+
 ## Metadata
 
 Every invocation is stored with metadata, which shows up in the web UI and as `:metadata` in the `:started`, `:restarted` and `:reused` events. By default it is an empty map (`empty-metadata-fn`). `host-thread-metadata-fn` provides the host name and the Java thread name the invocation was started from, e.g. `{:host "app-1" :thread "http-nio-8080-exec-3"}`.
@@ -74,7 +96,10 @@ stateDiagram-v2
 ## Build tooling
 
 - `./run repl` - REPL with some helpers.
-- `./run test` - run the test suite.
+- `./run test` - run the test suite: every engine, storage and web test runs against both SQLite and an
+  embedded PostgreSQL (downloaded as a dependency - no installation needed). Set `TENON_TEST_BACKENDS=sqlite`
+  (or `postgres`) to run against one of them only.
+- `./run bench [roots]` - benchmark the two storages side by side (see `bench/`).
 - `./run deps` - pre-download all dependencies.
 - `./run clean` - remove build/cache artifacts.
 
