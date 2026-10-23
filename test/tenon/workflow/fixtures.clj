@@ -62,3 +62,18 @@
 ;; Captures a and b (but not the unused c) from the surrounding locals.
 (defn multiply-in-task [a b c]
   #task (* a b))
+
+(defonce task-should-fail? (atom true))
+
+;; Fails until task-should-fail? is reset; the #task is restarted from the
+;; stored captured values only.
+(defn flaky-in-task [n]
+  #task (if @task-should-fail?
+          (throw (ex-info "not yet" {:n n}))
+          [:recovered n]))
+
+;; A #task running inside a #workflow, to show up as its child.
+#workflow
+(defn task-parent [n]
+  (let [doubled (* 2 n)]
+    #task (inc doubled)))

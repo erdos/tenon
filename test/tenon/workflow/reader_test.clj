@@ -174,3 +174,41 @@
     (is (= [3 4] (edn/read-string (:workflow/params wf))))
     (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :event/data (pr-str 12)}]
                 (test-util/timeline (:workflow/invocation-id wf))))))
+
+(deftest task-error-and-restart-test
+  (reset! fixtures/task-should-fail? true)
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not yet" (fixtures/flaky-in-task 5)))
+  (let [wf-def (->> (keys (ns-interns 'tenon.workflow.fixtures))
+                    (map #(str "tenon.workflow.fixtures/" (name %)))
+                    (mapcat test-util/find-by-wf-def)
+                    (filter #(= "[5]" (:workflow/params %)))
+                    first)
+        id (:workflow/invocation-id wf-def)]
+    (is (= "ERROR" (:workflow/state (engine/get-invocation id))))
+    (reset! fixtures/task-should-fail? false)
+    (is (= [:recovered 5] (engine/restart-invocation id)))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"}
+                 {:workflow/state "STARTED"} {:workflow/state "DONE"}]
+                (test-util/timeline id)))))
+
+(deftest task-inside-workflow-records-parent-test
+  (is (= 7 (fixtures/task-parent 3)))
+  (let [parent (first (test-util/find-by-wf-def "tenon.workflow.fixtures/task-parent"))
+        child (first (filter #(= "[6]" (:workflow/params %))
+                             (mapcat test-util/find-by-wf-def
+                                     (map #(str "tenon.workflow.fixtures/" (name %))
+                                          (keys (ns-interns 'tenon.workflow.fixtures))))))]
+    (is (match? {:workflow/parent-invocation-id (:workflow/invocation-id parent)} child))))
+
+(deftest task-same-captured-values-are-deduplicated-test
+  (is (= 12 (fixtures/multiply-in-task 3 4 :x)))
+  (is (= 12 (fixtures/multiply-in-task 3 4 :y)))
+  (is (= 2 (count (engine/list-invocations {:wf-def (task-wf-def)})))
+      "second call is a reuse of the first")
+  (is (= 1 (count (test-util/find-by-wf-def (task-wf-def))))))
+
+(deftest task-unbound-workflow-engine-throws-test
+  (binding [engine/*workflow-engine* nil]
+    (is (thrown-match? clojure.lang.ExceptionInfo
+                       {:type ::engine/precondition-failed}
+                       (fixtures/multiply-in-task 1 2 3)))))

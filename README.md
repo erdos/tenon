@@ -23,6 +23,17 @@ Mark `defn` forms with `#workflow` to have their invocations tracked.
 
 Every call to `charge-card` writes a database logs into the database. Marked functions can call other such functions and the whole call chain is tracked.
 
+### Tasks
+
+Put `#task` in front of any expression to run it as a workflow invocation. The locals it uses are captured and become the invocation's arguments:
+
+```clojure
+(defn process-order [order-id amount]
+  #task (payments/charge! order-id amount))
+```
+
+The expression is wrapped in a function of the captured values and registered under a name derived from the expression, so the invocation is logged, deduplicated by the captured values and restartable like a `#workflow` function. Captured values must print and read back as EDN, and the form must have been evaluated in a process before its invocations can be restarted there.
+
 ## Try it in the REPL
 
 Start the REPL with `./run repl`.
