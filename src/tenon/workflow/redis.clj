@@ -6,17 +6,20 @@
    - {p}:seq: INCR counter handing out event ids - the global order. Every
      event (STARTED, DONE, ERROR, TIMEOUT, REUSED) takes one, and a STARTED
      event's id is the invocation id.
-   - {p}:wf:<id>: hash, a workflow (<id> is its first invocation id) with
-     everything its row shows, resolved: invocation_id, name, params,
-     parent (the first call's), created_at, state, state_at, expires_at,
-     metadata, result, last_reuse. A point read or a list row is one HMGET.
+   - {p}:wf:<id>: string, a workflow (<id> is its first invocation id) with
+     everything its row shows, resolved, as one packed blob: the fields
+     lease end, state, invocation id, name, params, parent (the first
+     call's), state_at, metadata, result and created_at, each as <byte
+     length>:<bytes>, or - for none. A point read is a GET, a list row is
+     the blob itself, and neither is taken apart on the server.
    - {p}:hist:<id>: list of the workflow's events in order (MessagePack
      [id, state, at, data, invocation_id]) - read by full-timeline only.
    - {p}:inv: hash, restarted invocation id -> workflow id. (A first
-     invocation id is the workflow's own, found by its hash existing.)
+     invocation id is the workflow's own, found by its blob existing.)
    - {p}:idem: hash, SHA-256 hex of (wf_def, params) -> workflow id.
    - {p}:ru: hash, REUSED event id -> MessagePack [workflow, at, data,
-     invocation, caller]; {p}:reuses:<id> lists a workflow's, by id.
+     invocation, caller]; {p}:reuses:<id> lists a workflow's, by id, and
+     {p}:lr maps a workflow id to its latest.
    - {p}:kids:<id>: sorted set of the call ids a workflow made.
    - Sorted sets scored by id, newest first by ZREVRANGEBYSCORE, are the
      indexes: {p}:calls, {p}:calls:top, {p}:calls:def:<wf_def> and
@@ -27,11 +30,16 @@
      {p}:leases is scored by lease end. {p}:defs and {p}:defs:top are sets
      of wf_def names - all, and those called at the top level.
 
-   Every operation is one Lua script, which Redis runs without interleaving
-   anything else: the compare-and-set checks of a write and its writes are
-   atomic, as is a read's snapshot. The clock is Redis' (TIME), so that
-   timestamps never mix in a second one. {p} is the prefix in braces, a
-   Redis Cluster hash tag: all keys share a slot.
+   Writes and the multi-key reads are Lua scripts, which Redis runs without
+   interleaving anything else: the compare-and-set checks of a write and its
+   writes are atomic, as is a read's snapshot. The clock is Redis' (TIME),
+   so that timestamps never mix in a second one. {p} is the prefix in
+   braces, a Redis Cluster hash tag: all keys share a slot.
+
+   The round trip dominates a Redis call, so concurrent callers share
+   them: a caller queues its commands, and whichever caller finds no one
+   sending sends everyone's queued commands in one pipeline (flat
+   combining) - a lone caller sends its own at once, as without it.
 
    What SQLite adds, and Redis only has if told to: durability. A commit
    there is fsynced (synchronous FULL). Run Redis with appendonly yes and
@@ -42,15 +50,19 @@
             [taoensso.carmine :as car]
             [taoensso.carmine.connections :as conn]
             [tenon.workflow.db :as db])
-  (:import [java.io Closeable]
-           [java.security MessageDigest]))
+  (:import [java.io Closeable InputStream OutputStream]
+           [java.nio.charset StandardCharsets]
+           [java.security MessageDigest]
+           [java.util.concurrent ConcurrentLinkedQueue]
+           [java.util.concurrent.atomic AtomicInteger AtomicReference]
+           [java.util.concurrent.locks LockSupport]))
 
 ;;; Lua
 
 (def ^:private prelude
   "local P = ARGV[1]
    local SEQ = KEYS[1]
-   local IDEM, INV, RU = P .. ':idem', P .. ':inv', P .. ':ru'
+   local IDEM, INV, RU, LR = P .. ':idem', P .. ':inv', P .. ':ru', P .. ':lr'
    local function wk(id) return P .. ':wf:' .. id end
    local function hk(id) return P .. ':hist:' .. id end
    local function kk(id) return P .. ':kids:' .. id end
@@ -69,17 +81,35 @@
    local function num(v) if v then return tonumber(v) end return false end
    local function str(v) if v then return fmt(v) end return false end
    local function next_id() return fmt(redis.call('INCR', SEQ)) end
-   local function put(f, k, v)
-     if v then f[#f + 1] = k; f[#f + 1] = v end
+   -- A field as <byte length>:<bytes>, - for none; and the first k fields (all) of a packed string.
+   local function enc(v) if v then return #v .. ':' .. v end return '-' end
+   local function dec(s, k)
+     local out, i, n = {}, 1, #s
+     while i <= n and (not k or #out < k) do
+       if string.byte(s, i) == 45 then
+         out[#out + 1] = false
+         i = i + 1
+       else
+         local j = string.find(s, ':', i, true)
+         local len = tonumber(string.sub(s, i, j - 1))
+         out[#out + 1] = string.sub(s, j + 1, j + len)
+         i = j + len + 1
+       end
+     end
+     return out
+   end
+   -- A workflow blob's fields: 1 lease end, 2 state, 3 invocation id, 4 name, 5 params,
+   -- 6 parent, 7 state_at, 8 metadata, 9 result, 10 created_at.
+   local function mk(h)
+     local p = {}
+     for i = 1, 10 do p[i] = enc(h[i]) end
+     return table.concat(p)
    end
    -- The workflow that the STARTED event id belongs to, or false.
    local function resolve(id)
      if redis.call('EXISTS', wk(id)) == 1 then return id end
      return redis.call('HGET', INV, id)
    end
-   local ROW = {'invocation_id', 'name', 'params', 'parent', 'state', 'state_at',
-                'expires_at', 'metadata', 'result', 'created_at'}
-   local function row(wid) return redis.call('HMGET', wk(wid), unpack(ROW)) end
    local function hist_add(wid, id, state, at, data, inv)
      redis.call('RPUSH', hk(wid), cmsgpack.pack({tonumber(id), state, at, data or false, num(inv)}))
    end
@@ -105,13 +135,13 @@
    end
    -- Moves wid from the indexes of state old (nil: none) to those of new.
    local function index_state(wid, old, new)
-     local last_reuse = redis.call('HGET', wk(wid), 'last_reuse')
      if old and old ~= 'DONE' then
        redis.call('ZREM', sk(old), wid)
        redis.call('ZREM', sk(old) .. ':reused', wid)
      end
      if new ~= 'DONE' then
        redis.call('ZADD', sk(new), wid, wid)
+       local last_reuse = redis.call('HGET', LR, wid)
        if last_reuse then redis.call('ZADD', sk(new) .. ':reused', last_reuse, wid) end
      end
    end
@@ -127,12 +157,8 @@
    if timeout then expires = t + tonumber(timeout) end
    redis.call('HSET', IDEM, key, id)
    redis.call('SADD', P .. ':defs', wf_def)
-   local f = {'invocation_id', id, 'name', wf_def, 'params', params, 'state', 'STARTED',
-              'state_at', fmt(t), 'created_at', fmt(t)}
-   put(f, 'parent', parent)
-   put(f, 'metadata', metadata)
-   put(f, 'expires_at', expires and fmt(expires))
-   redis.call('HSET', wk(id), unpack(f))
+   redis.call('SET', wk(id), mk({expires and fmt(expires), 'STARTED', id, wf_def, params, parent or false,
+                                 fmt(t), metadata or false, false, fmt(t)}))
    hist_add(id, id, 'STARTED', t, metadata, nil)
    index_state(id, nil, 'STARTED')
    if expires then set_lease(id, expires) end
@@ -145,15 +171,13 @@
   "local id, state, result, expired_only = ARGV[2], ARGV[3], opt(ARGV[4]), ARGV[5]
    local wid = resolve(id)
    if not wid then return 0 end
-   local w = redis.call('HMGET', wk(wid), 'invocation_id', 'state', 'expires_at')
-   if w[1] ~= id or w[2] ~= 'STARTED' then return 0 end
+   local h = dec(redis.call('GET', wk(wid)))
+   if h[3] ~= id or h[2] ~= 'STARTED' then return 0 end
    local t = now()
-   if expired_only == '1' and (not w[3] or tonumber(w[3]) > t) then return 0 end
+   if expired_only == '1' and (not h[1] or tonumber(h[1]) > t) then return 0 end
    local nid = next_id()
-   local f = {'state', state, 'state_at', fmt(t)}
-   put(f, 'result', result)
-   redis.call('HDEL', wk(wid), 'expires_at')
-   redis.call('HSET', wk(wid), unpack(f))
+   h[1], h[2], h[7], h[9] = false, state, fmt(t), result or false
+   redis.call('SET', wk(wid), mk(h))
    hist_add(wid, nid, state, t, result, id)
    index_state(wid, 'STARTED', state)
    set_lease(wid, false)
@@ -164,20 +188,18 @@
   "local id, metadata, timeout = ARGV[2], opt(ARGV[3]), opt(ARGV[4])
    local wid = resolve(id)
    if not wid then return false end
-   local w = redis.call('HMGET', wk(wid), 'invocation_id', 'state')
-   if w[1] ~= id or w[2] == 'STARTED' then return false end
+   local h = dec(redis.call('GET', wk(wid)))
+   if h[3] ~= id or h[2] == 'STARTED' then return false end
+   local old = h[2]
    local t = now()
    local nid = next_id()
    local expires = false
    if timeout then expires = t + tonumber(timeout) end
-   local f = {'invocation_id', nid, 'state', 'STARTED', 'state_at', fmt(t)}
-   put(f, 'metadata', metadata)
-   put(f, 'expires_at', expires and fmt(expires))
-   redis.call('HDEL', wk(wid), 'result', 'metadata', 'expires_at')
-   redis.call('HSET', wk(wid), unpack(f))
+   h[1], h[2], h[3], h[7], h[8], h[9] = expires and fmt(expires), 'STARTED', nid, fmt(t), metadata or false, false
+   redis.call('SET', wk(wid), mk(h))
    redis.call('HSET', INV, nid, wid)
    hist_add(wid, nid, 'STARTED', t, metadata, nil)
-   index_state(wid, w[2], 'STARTED')
+   index_state(wid, old, 'STARTED')
    set_lease(wid, expires)
    return nid")
 
@@ -186,28 +208,25 @@
   "local id, parent, metadata = ARGV[2], opt(ARGV[3]), opt(ARGV[4])
    local wid = resolve(id)
    if not wid then return 0 end
-   local w = redis.call('HMGET', wk(wid), 'name', 'state')
+   local h = dec(redis.call('GET', wk(wid)), 4)
    local nid = next_id()
    redis.call('HSET', RU, nid, cmsgpack.pack({tonumber(wid), now(), metadata or false, tonumber(id), num(parent)}))
    redis.call('ZADD', rk(wid), nid, nid)
-   redis.call('HSET', wk(wid), 'last_reuse', nid)
-   if w[2] ~= 'DONE' then redis.call('ZADD', sk(w[2]) .. ':reused', nid, wid) end
+   redis.call('HSET', LR, wid, nid)
+   if h[2] ~= 'DONE' then redis.call('ZADD', sk(h[2]) .. ':reused', nid, wid) end
    add_kid(parent, nid)
-   add_call(w[1], nid, not parent)
+   add_call(h[4], nid, not parent)
    return 1")
 
 (def ^:private get-lua
   "local wid = resolve(ARGV[2])
    if not wid then return false end
-   local r = row(wid)
-   r[11] = 0
-   if r[7] and tonumber(r[7]) <= now() then r[11] = 1 end
-   return r")
+   return redis.call('GET', wk(wid))")
 
 (def ^:private find-lua
   "local wid = redis.call('HGET', IDEM, ARGV[2])
    if not wid then return false end
-   return row(wid)")
+   return redis.call('GET', wk(wid))")
 
 (def ^:private calls-lua
   ;; ARGV: state, wf_def, top-level-only?, limit, before
@@ -230,19 +249,26 @@
        from = '(' .. chunk[#chunk]
      end
    end
+   -- The blob of the workflow that call cid belongs to, and its reuse entry if it is one.
+   local function call_blob(cid)
+     local b = redis.call('GET', wk(cid))
+     if b then return b, nil end
+     local ru = cmsgpack.unpack(redis.call('HGET', RU, cid))
+     return redis.call('GET', wk(fmt(ru[1]))), ru
+   end
    local ids
    if state == 'STARTED' or state == 'ERROR' or state == 'TIMEOUT' then
      -- The (few) workflows in the state: each one's first call, and the
      -- calls that reused it. Only reuses newer than the page's oldest first
      -- call can make it onto the page.
      ids = scan(sk(state), function(wid)
-       local f = redis.call('HMGET', wk(wid), 'parent', 'name')
-       return not (top_only and f[1]) and not (wf_def and f[2] ~= wf_def)
+       local h = dec(redis.call('GET', wk(wid)), 6)
+       return not (top_only and h[6]) and not (wf_def and h[4] ~= wf_def)
      end)
      local bound = '0'
      if limit and #ids >= limit then bound = ids[#ids] end
      for _, wid in ipairs(redis.call('ZRANGEBYSCORE', sk(state) .. ':reused', bound, '+inf')) do
-       if not wf_def or redis.call('HGET', wk(wid), 'name') == wf_def then
+       if not wf_def or dec(redis.call('GET', wk(wid)), 4)[4] == wf_def then
          for _, r in ipairs(redis.call('ZREVRANGEBYSCORE', rk(wid), max, bound)) do
            if not top_only or not cmsgpack.unpack(redis.call('HGET', RU, r))[5] then
              ids[#ids + 1] = r
@@ -263,25 +289,21 @@
      end
      ids = scan(key, function(cid)
        if not state then return true end
-       local st = redis.call('HGET', wk(cid), 'state')
-       if not st then
-         st = redis.call('HGET', wk(fmt(cmsgpack.unpack(redis.call('HGET', RU, cid))[1])), 'state')
-       end
-       return st == state
+       return dec((call_blob(cid)), 2)[2] == state
      end)
    end
-   local rows = {}
+   -- A row: call id, 0 and the workflow blob; or for a reuse call id, 1, when,
+   -- the caller and the blob.
+   local out = {}
    for i = 1, #ids do
-     local r = row(ids[i])
-     if r[5] then
-       rows[i] = {ids[i], r[10], r[4], 0, r[1], r[2], r[3], r[5], r[6], r[7], r[8], r[9]}
+     local b, ru = call_blob(ids[i])
+     if ru then
+       out[i] = enc(ids[i]) .. '1:1' .. enc(fmt(ru[2])) .. enc(str(ru[5])) .. enc(b)
      else
-       local ru = cmsgpack.unpack(redis.call('HGET', RU, ids[i]))
-       r = row(fmt(ru[1]))
-       rows[i] = {ids[i], fmt(ru[2]), str(ru[5]), 1, r[1], r[2], r[3], r[5], r[6], r[7], r[8], r[9]}
+       out[i] = enc(ids[i]) .. '1:0' .. enc(b)
      end
    end
-   return rows")
+   return table.concat(out)")
 
 (def ^:private timeline-lua
   ;; The tree is found by walking the calls each workflow made, from the
@@ -290,7 +312,7 @@
   ;; Each tree workflow's events come from its history; of the root's
   ;; reuses only those made from outside the tree are added, at depth 0.
   "local root = resolve(ARGV[2])
-   if not root then return {} end
+   if not root then return '' end
    local tree = {[root] = true}
    local queue = {{root, 0}}
    local entries = {}
@@ -322,19 +344,20 @@
      if not (pw and tree[pw]) then reuse_entry(cid, 0) end
    end
    table.sort(entries, function(a, b) return a.id < b.id end)
-   local infos, rows = {}, {}
+   local infos, out = {}, {}
    for i = 1, #entries do
      local e = entries[i]
-     local w = infos[e.wid]
-     if not w then
-       w = redis.call('HMGET', wk(e.wid), 'invocation_id', 'name', 'parent')
-       infos[e.wid] = w
+     local h = infos[e.wid]
+     if not h then
+       h = dec(redis.call('GET', wk(e.wid)), 6)
+       infos[e.wid] = h
      end
-     local parent = w[3]
+     local parent = h[6]
      if e.state == 'REUSED' then parent = str(e.parent) end
-     rows[i] = {e.inv and fmt(e.inv) or fmt(e.id), w[1], parent, w[2], e.state, fmt(e.at), e.data, e.depth}
+     out[i] = enc(e.inv and fmt(e.inv) or fmt(e.id)) .. enc(h[3]) .. enc(parent) .. enc(h[4]) .. enc(e.state)
+              .. enc(fmt(e.at)) .. enc(e.data) .. enc(fmt(e.depth))
    end
-   return rows")
+   return table.concat(out)")
 
 (def ^:private extend-lease-lua
   ;; ARGV: comma-separated ids, timeout
@@ -343,47 +366,316 @@
    for id in string.gmatch(ARGV[2], '[^,]+') do
      local wid = resolve(id)
      if wid then
-       local w = redis.call('HMGET', wk(wid), 'invocation_id', 'state', 'expires_at')
-       if w[1] == id and w[2] == 'STARTED' and w[3] then
-         redis.call('HSET', wk(wid), 'expires_at', fmt(expires))
+       local b = redis.call('GET', wk(wid))
+       local h = dec(b, 3)
+       if h[3] == id and h[2] == 'STARTED' and h[1] then
+         local colon = string.find(b, ':', 1, true)
+         local rest = string.sub(b, colon + tonumber(string.sub(b, 1, colon - 1)) + 1)
+         redis.call('SET', wk(wid), enc(fmt(expires)) .. rest)
          set_lease(wid, expires)
          done[#done + 1] = id
        end
      end
    end
-   return done")
+   return table.concat(done, ',')")
 
 (def ^:private list-expired-lua
   "local wids = redis.call('ZRANGEBYSCORE', P .. ':leases', '-inf', now())
    table.sort(wids, function(a, b) return tonumber(a) < tonumber(b) end)
-   local rows = {}
-   for i = 1, #wids do
-     local r = row(wids[i])
-     r[11] = 1
-     rows[i] = r
-   end
-   return rows")
-
-(defn- script [body] (str prelude body))
+   local out = {}
+   for i = 1, #wids do out[i] = enc(redis.call('GET', wk(wids[i]))) end
+   return table.concat(out)")
 
 (def ^:private scripts
-  {:insert (script insert-lua) :finish (script finish-lua) :restart (script restart-lua)
-   :reuse (script reuse-lua) :get (script get-lua) :find (script find-lua)
-   :calls (script calls-lua) :timeline (script timeline-lua)
-   :extend-lease (script extend-lease-lua) :list-expired (script list-expired-lua)})
+  (into {} (map (fn [[k body]] [k (str prelude body)]))
+        {:insert insert-lua :finish finish-lua :restart restart-lua :reuse reuse-lua :get get-lua
+         :find find-lua :calls calls-lua :timeline timeline-lua :extend-lease extend-lease-lua
+         :list-expired list-expired-lua}))
 
-;;; Client
+(def ^:private script-shas
+  (into {} (map (fn [[k script]] [k (car/script-hash script)])) scripts))
 
-(deftype RedisStorage [conn ^String prefix ^Closeable pool]
+;;; Sending: concurrent callers share a pipeline
+
+(deftype RedisStorage [conn-opts ^String prefix ^Closeable pool
+                       ^ConcurrentLinkedQueue queue
+                       ^AtomicInteger sending ^long max-senders ^AtomicInteger waiting]
   Closeable
   (close [_] (.close pool)))
 
-(defn- run
-  "Evaluates the script named script-name against storage, with args."
-  [^RedisStorage storage script-name & args]
+(deftype Request [cmds ^AtomicReference outcome ^Thread thread])
+
+(defn- load-scripts! [^RedisStorage storage]
+  (car/wcar (.-conn-opts storage)
+    (doseq [[_ script] scripts] (car/redis-call ["SCRIPT" "LOAD" script]))))
+
+;; RESP, by hand: carmine's wcar costs more per call than Redis does, so the
+;; connection - carmine's: pool, URI, auth, TLS, timeouts - is written to
+;; and read directly.
+
+(def ^:private crlf (byte-array [13 10]))
+
+(defn- write-command! [^OutputStream out cmd]
+  (.write out 42)
+  (.write out (.getBytes (str (count cmd)) StandardCharsets/US_ASCII))
+  (.write out ^bytes crlf)
+  (doseq [arg cmd]
+    (let [bs (.getBytes (str arg) StandardCharsets/UTF_8)]
+      (.write out 36)
+      (.write out (.getBytes (str (alength bs)) StandardCharsets/US_ASCII))
+      (.write out ^bytes crlf)
+      (.write out bs)
+      (.write out ^bytes crlf))))
+
+(defn- read-line! ^String [^InputStream in]
+  (let [sb (StringBuilder.)]
+    (loop []
+      (let [c (.read in)]
+        (cond (neg? c) (throw (java.io.EOFException. "Redis closed the connection"))
+              (== c 13) (do (.read in) (str sb))
+              :else (do (.append sb (char c)) (recur)))))))
+
+(defn- read-reply!
+  "A reply: byte array (bulk string), long, string (status), vector, nil, or
+   an ExceptionInfo for an error."
+  [^InputStream in]
+  (let [t (.read in)]
+    (case (char t)
+      \+ (read-line! in)
+      \- (ex-info (read-line! in) {})
+      \: (parse-long (read-line! in))
+      \$ (let [n (parse-long (read-line! in))]
+           (when-not (neg? n)
+             (let [b (byte-array n)]
+               (loop [off 0]
+                 (when (< off n)
+                   (let [r (.read in b off (- n off))]
+                     (when (neg? r) (throw (java.io.EOFException. "Redis closed the connection")))
+                     (recur (+ off r)))))
+               (.read in) (.read in)
+               b)))
+      \* (let [n (parse-long (read-line! in))]
+           (when-not (neg? n)
+             (loop [i 0 acc (transient [])]
+               (if (< i n) (recur (inc i) (conj! acc (read-reply! in))) (persistent! acc)))))
+      (throw (java.io.IOException. (str "Unexpected reply type " t))))))
+
+(defn- send-batch!
+  "Sends the commands of requests in one pipeline, and gives each its
+   replies - byte arrays for strings - or the exception."
+  [^RedisStorage storage requests]
+  (let [[pool conn] (try (conn/pooled-conn (.-conn-opts storage)) (catch Throwable e [nil e]))
+        replies
+        (if (instance? Throwable conn)
+          conn
+          (try (let [^OutputStream out (:out conn)
+                     ^InputStream in (:in conn)]
+                 (doseq [^Request r requests, cmd (.-cmds r)] (write-command! out cmd))
+                 (.flush out)
+                 (let [replies (loop [rs (seq requests) acc (transient [])]
+                                 (if rs
+                                   (recur (next rs) (reduce (fn [acc _] (conj! acc (read-reply! in))) acc (.-cmds ^Request (first rs))))
+                                   (persistent! acc)))]
+                   (conn/release-conn pool conn)
+                   replies))
+               (catch Throwable e
+                 (conn/release-conn pool conn e)
+                 e)))]
+    (if (instance? Throwable replies)
+      (doseq [^Request r requests] (.set (.-outcome r) replies))
+      (loop [rs (seq requests), replies replies]
+        (when rs
+          (let [^Request r (first rs)
+                n (count (.-cmds r))
+                mine (subvec replies 0 n)
+                failed (first (filter #(instance? Throwable %) mine))]
+            (.set (.-outcome r) (or failed mine))
+            (recur (next rs) (subvec replies n))))))
+    (doseq [^Request r requests] (LockSupport/unpark (.-thread r)))))
+
+(defn- send-until-done! [^RedisStorage storage ^Request mine]
+  (let [^ConcurrentLinkedQueue queue (.-queue storage)]
+    (loop []
+      (when (nil? (.get (.-outcome mine)))
+        (let [batch (loop [acc (transient [])]
+                      (if-let [r (when (< (count acc) 1024) (.poll queue))]
+                        (recur (conj! acc r))
+                        (persistent! acc)))]
+          (when (seq batch)
+            (send-batch! storage batch)
+            (recur)))))))
+
+(def ^:private spin-ns
+  "How long a caller waiting for its reply spins before it parks - when
+   there are cores to spare."
+  30000)
+
+(def ^:private spare-cores
+  (max 0 (- (.availableProcessors (Runtime/getRuntime)) 2)))
+
+(defn- take-sender-slot! [^RedisStorage storage]
+  (let [^AtomicInteger sending (.-sending storage)]
+    (loop []
+      (let [n (.get sending)]
+        (and (< n (.-max-senders storage))
+             (or (.compareAndSet sending n (inc n)) (recur)))))))
+
+(defn- wait-for-reply!
+  "Spins for a moment, if cores are free, then parks."
+  [^RedisStorage storage ^Request req]
+  (let [^AtomicInteger waiting (.-waiting storage)
+        n (.incrementAndGet waiting)]
+    (try
+      (when (<= n spare-cores)
+        (let [deadline (+ (System/nanoTime) spin-ns)]
+          (loop []
+            (when (and (nil? (.get (.-outcome req))) (< (System/nanoTime) deadline))
+              (Thread/onSpinWait)
+              (recur)))))
+      (when (nil? (.get (.-outcome req)))
+        (LockSupport/parkNanos storage 200000))
+      (finally (.decrementAndGet waiting)))))
+
+(defn- exec!
+  "Sends cmds - vectors of strings - and returns their replies, strings as
+   byte arrays."
+  [^RedisStorage storage cmds]
+  (let [^ConcurrentLinkedQueue queue (.-queue storage)
+        ^Request req (->Request cmds (AtomicReference.) (Thread/currentThread))]
+    (.add queue req)
+    (loop []
+      (let [outcome (.get (.-outcome req))]
+        (cond
+          (some? outcome)
+          (if (instance? Throwable outcome)
+            (if (str/includes? (str (ex-message outcome)) "NOSCRIPT")
+              (do (load-scripts! storage) (exec! storage cmds))
+              (throw outcome))
+            outcome)
+
+          (take-sender-slot! storage)
+          (do (try (send-until-done! storage req)
+                   (finally
+                     (.decrementAndGet ^AtomicInteger (.-sending storage))
+                     (when-let [^Request next-up (.peek queue)]
+                       (LockSupport/unpark (.-thread next-up)))))
+              (recur))
+
+          :else
+          (do (wait-for-reply! storage req) (recur)))))))
+
+(defn- script-cmd [^RedisStorage storage script-name & args]
   (let [p (.-prefix storage)]
-    (car/wcar (.-conn storage)
-      (apply car/eval* (scripts script-name) 1 (str p ":seq") p args))))
+    (into ["EVALSHA" (script-shas script-name) "1" (str p ":seq") p] args)))
+
+(defn- run1
+  "The reply of one script."
+  [storage script-name & args]
+  (first (exec! storage [(apply script-cmd storage script-name args)])))
+
+;;; Decoding
+
+(defn- ->str ^String [^bytes b] (when b (String. b StandardCharsets/UTF_8)))
+
+(defn- read-len!
+  "The length prefix at pos; moves pos after the colon."
+  ^long [^bytes b ^ints pos]
+  (let [start (aget pos 0)]
+    (loop [i start n 0]
+      (let [c (aget b i)]
+        (if (== c 58)
+          (do (aset pos 0 (inc i)) n)
+          (recur (inc i) (+ (* n 10) (- c 48))))))))
+
+(defn- read-str! [^bytes b ^ints pos]
+  (if (== 45 (aget b (aget pos 0)))
+    (do (aset pos 0 (inc (aget pos 0))) nil)
+    (let [n (read-len! b pos)
+          i (aget pos 0)]
+      (aset pos 0 (+ i n))
+      (String. b i n StandardCharsets/UTF_8))))
+
+(defn- read-long! [^bytes b ^ints pos]
+  (if (== 45 (aget b (aget pos 0)))
+    (do (aset pos 0 (inc (aget pos 0))) nil)
+    (let [n (read-len! b pos)
+          i (aget pos 0)]
+      (aset pos 0 (+ i n))
+      (loop [j i acc 0]
+        (if (< j (+ i n))
+          (recur (inc j) (+ (* acc 10) (- (aget b j) 48)))
+          acc)))))
+
+(defn- read-row!
+  "A workflow blob (after its length prefix) as a Storage row, with its
+   lease end and creation time as the second and third values."
+  [^bytes b ^ints pos]
+  (let [expires-at (read-long! b pos)
+        state (read-str! b pos)
+        invocation-id (read-long! b pos)
+        wf-def (read-str! b pos)
+        params (read-str! b pos)
+        parent (read-long! b pos)
+        state-changed-at (read-long! b pos)
+        metadata (read-str! b pos)
+        result (read-str! b pos)
+        created-at (read-long! b pos)]
+    [{:workflow/invocation-id invocation-id
+      :workflow/name wf-def
+      :workflow/params params
+      :workflow/parent-invocation-id parent
+      :workflow/state state
+      :workflow/state-changed-at state-changed-at
+      :workflow/expires-at expires-at
+      :workflow/metadata metadata
+      :workflow/result result}
+     created-at]))
+
+(defn- blob-row [^bytes b]
+  (first (read-row! b (int-array 1))))
+
+(defn- blobs->rows
+  "The rows of a sequence of length-prefixed blobs."
+  [^bytes b]
+  (let [pos (int-array 1)]
+    (loop [rows (transient [])]
+      (if (< (aget pos 0) (alength b))
+        (do (read-len! b pos)
+            (recur (conj! rows (first (read-row! b pos)))))
+        (persistent! rows)))))
+
+(defn- calls->rows [^bytes b]
+  (let [pos (int-array 1)]
+    (loop [rows (transient [])]
+      (if (< (aget pos 0) (alength b))
+        (let [call-id (read-long! b pos)
+              reused? (= "1" (read-str! b pos))
+              created-at (when reused? (read-long! b pos))
+              caller (when reused? (read-long! b pos))
+              _ (read-len! b pos)
+              [row first-created-at] (read-row! b pos)]
+          (recur (conj! rows (assoc row
+                                    :workflow/parent-invocation-id (if reused? caller (:workflow/parent-invocation-id row))
+                                    :event/call-id call-id
+                                    :event/created-at (if reused? created-at first-created-at)
+                                    :event/reused reused?))))
+        (persistent! rows)))))
+
+(defn- timeline->rows [^bytes b]
+  (let [pos (int-array 1)]
+    (loop [rows (transient [])]
+      (if (< (aget pos 0) (alength b))
+        (recur (conj! rows {:workflow/invocation-id (read-long! b pos)
+                            :workflow/current-invocation-id (read-long! b pos)
+                            :workflow/parent-invocation-id (read-long! b pos)
+                            :workflow/name (read-str! b pos)
+                            :workflow/state (read-str! b pos)
+                            :workflow/state-changed-at (read-long! b pos)
+                            :event/data (read-str! b pos)
+                            :workflow/depth (read-long! b pos)}))
+        (persistent! rows)))))
+
+;;; Storage
 
 (defn- opt-arg
   "An optional argument: nil, or the value after a plus."
@@ -399,58 +691,30 @@
   (hex (.digest (MessageDigest/getInstance "SHA-256")
                 (.getBytes (str wf-def "\u0000" params-edn-str) "UTF-8"))))
 
-(defn- ->long [v] (when (some? v) (if (string? v) (parse-long v) (long v))))
-
-(defn- state-row
-  "The map of a workflow's row, as returned by the Storage methods."
-  [[invocation-id wf-def params parent state state-changed-at expires-at metadata result]]
-  {:workflow/invocation-id invocation-id
-   :workflow/name wf-def
-   :workflow/params params
-   :workflow/parent-invocation-id parent
-   :workflow/state state
-   :workflow/state-changed-at state-changed-at
-   :workflow/expires-at expires-at
-   :workflow/metadata metadata
-   :workflow/result result})
-
-(defn- workflow-row [[invocation-id wf-def params parent state state-changed-at expires-at metadata result _created-at expired]]
-  (cond-> (state-row [(->long invocation-id) wf-def params (->long parent) state (->long state-changed-at)
-                      (->long expires-at) metadata result])
-    (some? expired) (assoc :workflow/expired (= 1 expired))))
-
-(defn- call-row [[call-id created-at parent reused invocation-id wf-def params state state-changed-at expires-at metadata result]]
-  (assoc (state-row [(->long invocation-id) wf-def params (->long parent) state (->long state-changed-at)
-                     (->long expires-at) metadata result])
-         :event/call-id (->long call-id)
-         :event/created-at (->long created-at)
-         :event/reused (= 1 reused)))
-
-(defn- timeline-row [[invocation-id current-invocation-id parent wf-def state state-changed-at data depth]]
-  {:workflow/invocation-id (->long invocation-id)
-   :workflow/current-invocation-id (->long current-invocation-id)
-   :workflow/parent-invocation-id (->long parent)
-   :workflow/name wf-def
-   :workflow/state state
-   :workflow/state-changed-at (->long state-changed-at)
-   :event/data data
-   :workflow/depth (long depth)})
-
 (def ^:private finish-states #{"DONE" "ERROR" "TIMEOUT"})
 
 (defn- finish! [storage invocation-id state result-edn-str expired-only?]
   (when-not (finish-states state)
     (throw (IllegalArgumentException. (str "Not a state a STARTED invocation can end in: " (pr-str state)))))
-  (= 1 (run storage :finish (str invocation-id) state (opt-arg result-edn-str) (if expired-only? "1" "0"))))
+  (= 1 (run1 storage :finish (str invocation-id) state (opt-arg result-edn-str) (if expired-only? "1" "0"))))
+
+(defn- redis-now
+  "The Redis server's clock, in epoch milliseconds."
+  [storage]
+  (let [[sec usec] (exec! storage [["TIME"]])]
+    (+ (* 1000 (parse-long (->str (first sec)))) (quot (parse-long (->str (second sec))) 1000))))
+
+(defn- reply-long [^bytes b] (some-> b ->str parse-long))
 
 (extend-type RedisStorage
   db/Storage
   (init-db! [this]
+    (load-scripts! this)
     this)
 
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (->long (run this :insert (idempotence-key wf-def params-edn-str) wf-def params-edn-str
-                 (opt-arg parent-invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
+    (reply-long (run1 this :insert (idempotence-key wf-def params-edn-str) wf-def params-edn-str
+                      (opt-arg parent-invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
 
   (finish! [this invocation-id state result-edn-str]
     (finish! this invocation-id state result-edn-str false))
@@ -459,62 +723,71 @@
     (finish! this invocation-id "TIMEOUT" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
-    (->long (run this :restart (str invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
+    (reply-long (run1 this :restart (str invocation-id) (opt-arg metadata-edn-str) (opt-arg timeout-ms))))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
-    (run this :reuse (str invocation-id) (opt-arg parent-invocation-id) (opt-arg metadata-edn-str))
+    (run1 this :reuse (str invocation-id) (opt-arg parent-invocation-id) (opt-arg metadata-edn-str))
     nil)
 
-  (get-workflow [this invocation-id]
-    (some-> (run this :get (str invocation-id)) workflow-row))
+  (get-workflow [^RedisStorage this invocation-id]
+    ;; a first invocation id is the key of its workflow; any other one asks the script
+    (when-let [blob (or (first (exec! this [["GET" (str (.-prefix this) ":wf:" invocation-id)]]))
+                        (run1 this :get (str invocation-id)))]
+      (let [row (blob-row blob)
+            lease-end (:workflow/expires-at row)]
+        (assoc row :workflow/expired (boolean (and lease-end (<= lease-end (redis-now this))))))))
 
   (find-by-wf-def-and-params [this wf-def params-edn-str]
-    (some-> (run this :find (idempotence-key wf-def params-edn-str)) workflow-row))
+    (some-> (run1 this :find (idempotence-key wf-def params-edn-str)) blob-row))
 
   (top-level-workflows
     ([this]
      (db/top-level-workflows this nil))
     ([this {:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
-     (mapv call-row (run this :calls (opt-arg state) (opt-arg wf-def) (if top-level-only? "1" "0")
-                         (opt-arg limit) (opt-arg before)))))
+     (calls->rows (run1 this :calls (opt-arg state) (opt-arg wf-def) (if top-level-only? "1" "0")
+                        (opt-arg limit) (opt-arg before)))))
 
   (top-level-wf-defs [^RedisStorage this top-level-only?]
-    (let [p (.-prefix this)]
-      (vec (sort (car/wcar (.-conn this) (car/smembers (str p (if top-level-only? ":defs:top" ":defs"))))))))
+    (->> (first (exec! this [["SMEMBERS" (str (.-prefix this) (if top-level-only? ":defs:top" ":defs"))]]))
+         (mapv ->str)
+         sort
+         vec))
 
   (full-timeline [this invocation-id]
-    (mapv timeline-row (run this :timeline (str invocation-id))))
+    (timeline->rows (run1 this :timeline (str invocation-id))))
 
   db/Timeouts
   (extend-lease! [this invocation-ids timeout-ms]
     (if (empty? invocation-ids)
       #{}
-      (into #{} (map ->long)
-            (run this :extend-lease (str/join "," (map long invocation-ids)) (long timeout-ms)))))
+      (let [done (->str (run1 this :extend-lease (str/join "," (map long invocation-ids)) (long timeout-ms)))]
+        (into #{} (map parse-long) (remove str/blank? (str/split done #","))))))
 
   (list-expired [this]
-    (mapv (comp #(assoc % :workflow/expired true) workflow-row) (run this :list-expired))))
+    (mapv #(assoc % :workflow/expired true) (blobs->rows (run1 this :list-expired)))))
 
 (defn datasource
   "A Storage and Timeouts over the Redis at uri (default redis://localhost:6379),
-   with its own connection pool of up to pool-size (32) connections. All keys
+   with its own connection pool, from which up to senders (2) callers at a
+   time send everyone's queued commands in a pipeline. All keys
    start with {prefix} (default \"tenon\"), so that several storages can share
-   a server. Pass it to tenon.workflow.db/init-db! (a no-op - Redis has no
-   schema). Closeable: close it once it's no longer needed."
+   a server. Pass it to tenon.workflow.db/init-db! (which loads the scripts -
+   Redis has no schema). Closeable: close it once it's no longer needed."
   ^java.io.Closeable
   ([] (datasource {}))
-  ([{:keys [uri prefix pool-size] :or {uri "redis://localhost:6379" prefix "tenon" pool-size 32}}]
+  ([{:keys [uri prefix senders] :or {uri "redis://localhost:6379" prefix "tenon" senders 2}}]
    ;; carmine memoizes pools by options: an :id makes this one ours alone
-   (let [pool (conn/conn-pool {:id (random-uuid) :max-total-per-key pool-size :max-idle-per-key pool-size})]
-     (->RedisStorage {:pool pool :spec {:uri uri}} (str "{" prefix "}") pool))))
+   (let [pool (conn/conn-pool {:id (random-uuid) :max-total-per-key (+ senders 2) :max-idle-per-key (+ senders 2)})]
+     (->RedisStorage {:pool pool :spec {:uri uri}} (str "{" prefix "}") pool
+                     (ConcurrentLinkedQueue.) (AtomicInteger. 0) senders (AtomicInteger. 0)))))
 
 (defn flush!
   "Deletes every key of storage. For tests and benchmarks - there's no undo."
   [^RedisStorage storage]
   (let [pattern (str (str/replace (.-prefix storage) #"[\\*?\[\]]" #(str "\\" %)) ":*")]
     (loop [cursor "0"]
-      (let [[next-cursor ks] (car/wcar (.-conn storage) (car/scan cursor "MATCH" pattern "COUNT" 1000))]
+      (let [[next-cursor ks] (car/wcar (.-conn-opts storage) (car/scan cursor "MATCH" pattern "COUNT" 1000))]
         (when (seq ks)
-          (car/wcar (.-conn storage) (apply car/del ks)))
+          (car/wcar (.-conn-opts storage) (apply car/del ks)))
         (when-not (= "0" next-cursor)
           (recur next-cursor))))))

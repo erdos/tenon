@@ -22,7 +22,7 @@
 (defn- open [target]
   (if (.startsWith ^String target "sqlite:")
     (db/init-db! (sqlite/datasource (subs target 7)))
-    (db/init-db! (redis/datasource {:uri target :prefix "bench" :pool-size 64}))))
+    (db/init-db! (redis/datasource {:uri target :prefix "bench" :senders (parse-long (or (System/getenv "SENDERS") "2"))}))))
 
 ;;; Load generator
 
@@ -56,6 +56,7 @@
 (defn- scenario
   "Times op under `threads` threads. Prints and returns the result."
   [results label threads op]
+  (when (or (nil? (System/getenv "BENCH_ONLY")) (re-find (re-pattern (System/getenv "BENCH_ONLY")) label))
   (load! threads warmup-ms op)
   (let [t0 (System/nanoTime)
         {:keys [ops lat]} (load! threads run-ms op)
@@ -67,7 +68,7 @@
     (printf "%-34s %2d thr %9d ops/s   p50 %9.1f us   p99 %9.1f us%n" label threads (:ops-per-s r) (:p50-us r) (:p99-us r))
     (flush)
     (swap! results conj r)
-    r))
+    r)))
 
 ;;; Data set
 
