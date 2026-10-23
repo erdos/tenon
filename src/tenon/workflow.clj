@@ -501,17 +501,15 @@
                       distinct
                       vec)
         task-name (task-name expr)
-        ns-sym (ns-name *ns*)]
-    (try
-      (register-task! ns-sym task-name (eval `(fn ~captured ~expr)))
-      (catch Throwable _))
-    (let [register `(do
-                      (declare ~task-name)
-                      (register-task! '~ns-sym '~task-name (fn ~captured ~expr)))]
-      (when *compile-files*
-        (compile-task-companion! ns-sym task-name register))
-      `(do ~register
-           (~task-name ~@captured)))))
+        ns-sym (ns-name *ns*)
+        register `(do
+                    (declare ~task-name)
+                    (register-task! '~ns-sym '~task-name (fn ~captured ~expr)))]
+    (try (eval register) (catch Throwable _))
+    (when *compile-files*
+      (compile-task-companion! ns-sym task-name register))
+    `(do ~register
+         (~task-name ~@captured))))
 
 (defn task
   "Tag reader for #task to be placed in front of an expression. Expands
