@@ -1,5 +1,7 @@
 (ns tenon.workflow
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.walk :as walk]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
@@ -11,17 +13,26 @@
 
 (defn raw-fn [v] (::raw-fn (meta v)))
 
+(declare load-recorded-tasks!)
+
 (defn lookup
   "The var named by the namespace-qualified symbol sym, if it exists (its
    namespace must already be loaded) and was registered via register! -
    i.e. it carries raw-fn metadata. Returns nil otherwise - including when
    sym's namespace was never loaded (find-var itself throws in that case,
-   which lookup must not do for an ordinary miss)."
+   which lookup must not do for an ordinary miss). A task of an
+   AOT-compiled namespace not registered yet is registered from the
+   source recorded at compile time first."
   [sym]
-  (let [v (when (find-ns (symbol (namespace sym)))
-            (find-var sym))]
-    (when (and v (raw-fn v))
-      v)))
+  (let [ns-sym (symbol (namespace sym))
+        registered (fn []
+                     (let [v (when (find-ns ns-sym) (find-var sym))]
+                       (when (and v (raw-fn v))
+                         v)))]
+    (or (registered)
+        (when (find-ns ns-sym)
+          (load-recorded-tasks! ns-sym)
+          (registered)))))
 
 (defmacro ^:private emit! [engine event data]
   `((:tenon/on-event ~engine) ~event ~data))
@@ -446,38 +457,36 @@
 
 (defn register-task-source!
   "Registers the task task-name in ns-sym whose raw fn is compiled lazily
-   from src, a (fn [captured...] expr) form, on its first call. For tasks
-   registered by AOT-compiled code (see TaskRegistration), which has no fn
-   object to register when it is loaded."
+   from src, a (fn [captured...] expr) form, on its first call."
   [ns-sym task-name src]
   (let [compiled (delay (binding [*ns* (the-ns ns-sym)] (eval src)))]
     (register-task! ns-sym task-name (fn [& args] (apply @compiled args)))))
 
-;; An AOT-compiled namespace stores a quoted constant in the static
-;; initializer of the class holding it, as the string print-dup writes and
-;; reads back (evaluating #=) when the class is loaded. Printing a
-;; TaskRegistration as a call to register-task-source! therefore registers
-;; the task when the compiled namespace is loaded, though no code in it runs
-;; (the namespace has to have required tenon.workflow by then, as any using
-;; #task does).
-;; (A deftype would not do: the compiler emits those as constructor calls.)
-(definterface TaskRegistration
-  (^clojure.lang.Symbol nsSym [])
-  (^clojure.lang.Symbol taskName [])
-  (src []))
+(defn- tasks-resource-path [ns-sym]
+  (str (-> (munge (str ns-sym)) (str/replace \. \/)) "__tasks.edn"))
 
-(defn ->task-registration [ns-sym task-name src]
-  (reify TaskRegistration
-    (nsSym [_] ns-sym)
-    (taskName [_] task-name)
-    (src [_] src)))
+(def ^:private recorded-tasks (atom {}))
 
-(defmethod print-dup TaskRegistration
-  [^TaskRegistration r ^java.io.Writer w]
-  (.write w (str "#=(tenon.workflow/register-task-source! "
-                 (pr-str (.nsSym r)) " " (pr-str (.taskName r)) " "
-                 (binding [*print-dup* false] (pr-str (.src r)))
-                 ")")))
+(defn record-task-source!
+  "While compiling ahead of time, writes the source of every task of ns-sym
+   seen so far, task-name to its (fn [captured...] expr) form, to the
+   ns's __tasks.edn file under *compile-path*. Compiled code carries no
+   source of closures, so this is how a later process finds the tasks of an
+   AOT-compiled namespace; see load-recorded-tasks!."
+  [ns-sym task-name src]
+  (let [tasks (get (swap! recorded-tasks assoc-in [ns-sym task-name] src) ns-sym)
+        f (io/file *compile-path* (tasks-resource-path ns-sym))]
+    (io/make-parents f)
+    (spit f (binding [*print-dup* false] (pr-str tasks)))))
+
+(defn- load-recorded-tasks!
+  "Registers (register-task-source!) every task that AOT compilation of
+   ns-sym recorded in a __tasks.edn resource, if there is one."
+  [ns-sym]
+  (when-let [r (io/resource (tasks-resource-path ns-sym))]
+    (let [tasks (binding [*read-eval* false] (read-string (slurp r)))]
+      (doseq [[task-name src] tasks]
+        (register-task-source! ns-sym task-name src)))))
 
 (defmacro run-task
   "Runs expr as a workflow invocation, capturing the locals of the
@@ -492,12 +501,10 @@
    The task is registered when the surrounding code is loaded, not only when
    it first runs, so a fresh process can restart it without having called
    it. That needs expr to compile at load time; if it does not, the task is
-   registered by its first call instead. The same goes for AOT-compiled
-   code, where registering means compiling expr from its source on the
-   task's first run - provided the #task is directly in the body of a
-   top-level fn, not inside a closure in it (map's fn, for, future...),
-   whose class is only loaded when the closure is created: then the task is
-   registered by the first call of the surrounding code as well."
+   registered by its first call instead. When compiling ahead of time the
+   task's source is also written to a <namespace>__tasks.edn resource next
+   to the classes, which lookup loads when it finds the task unregistered
+   (see load-recorded-tasks!), compiling expr on the task's first run."
   [expr]
   (let [captured (->> (tree-seq coll? seq expr)
                       (filter symbol?)
@@ -509,8 +516,9 @@
     (try
       (register-task! ns-sym task-name (eval `(fn ~captured ~expr)))
       (catch Throwable _))
-    `(let [~(gensym "registration") ~(when *compile-files*
-                  `(quote ~(->task-registration ns-sym task-name `(fn ~captured ~expr))))]
+    (when *compile-files*
+      (record-task-source! ns-sym task-name `(fn ~captured ~expr)))
+    `(do
        (declare ~task-name)
        (register-task! '~ns-sym '~task-name (fn ~captured ~expr))
        (~task-name ~@captured))))
