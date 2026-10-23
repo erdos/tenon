@@ -13,7 +13,33 @@
 
 (defn raw-fn [v] (::raw-fn (meta v)))
 
-(declare load-task-companion!)
+;; The companion of a task is a compiled "file" of its own next to the classes
+;; of an AOT-compiled namespace, holding the forms that register the task. It
+;; is compiled in the namespace of the task (so its expression resolves
+;; symbols as in the source), and loading it - which lookup does for an
+;; unregistered task - registers the task with its compiled fn.
+
+(defn- companion-path [ns-sym task-name]
+  (str (-> (munge (str ns-sym)) (str/replace \. \/)) "__" (munge (str task-name))))
+
+(defn compile-task-companion!
+  "Compiles form, which registers the task, as the companion of task-name of
+   ns-sym, writing its classes under *compile-path*. Call it while
+   compiling ahead of time, with *ns* being ns-sym."
+  [ns-sym task-name form]
+  (let [file (str (companion-path ns-sym task-name) ".clj")]
+    (clojure.lang.Compiler/compile
+     (java.io.StringReader. (binding [*print-meta* true] (pr-str form)))
+     file file)))
+
+(defn- load-task-companion!
+  "Loads the compiled companion of task-name of ns-sym, if AOT compilation
+   made one - registering the task."
+  [ns-sym task-name]
+  (let [path (companion-path ns-sym task-name)]
+    (when (io/resource (str path clojure.lang.RT/LOADER_SUFFIX ".class"))
+      (binding [*ns* (the-ns ns-sym)]
+        (load (str "/" path))))))
 
 (defn lookup
   "The var named by the namespace-qualified symbol sym, if it exists (its
@@ -25,14 +51,11 @@
    compiled companion first."
   [sym]
   (let [ns-sym (symbol (namespace sym))
-        registered (fn []
-                     (let [v (when (find-ns ns-sym) (find-var sym))]
-                       (when (and v (raw-fn v))
-                         v)))]
-    (or (registered)
-        (when (find-ns ns-sym)
-          (load-task-companion! ns-sym (symbol (name sym)))
-          (registered)))))
+        registered #(let [v (find-var sym)] (when (raw-fn v) v))]
+    (when (find-ns ns-sym)
+      (or (registered)
+          (do (load-task-companion! ns-sym (symbol (name sym)))
+              (registered))))))
 
 (defmacro ^:private emit! [engine event data]
   `((:tenon/on-event ~engine) ~event ~data))
@@ -454,45 +477,6 @@
     (alter-var-root v (constantly (fn [& args]
                                     (run-invocation v raw-fn args))))
     (register! v raw-fn)))
-
-;; The companion of a task is a compiled "file" of its own next to the classes
-;; of an AOT-compiled namespace, holding the forms that register the task. It
-;; is compiled in the namespace of the task (so its expression resolves
-;; symbols as in the source), and loading it - which lookup does for an
-;; unregistered task - registers the task with its compiled fn.
-
-(defn- companion-path [ns-sym task-name]
-  (str (-> (munge (str ns-sym)) (str/replace \. \/)) "__" (munge (str task-name))))
-
-(defn- printable-form
-  "form without the source position metadata the reader adds, to print
-   (keeping type hints and other metadata) and read back."
-  [form]
-  (walk/postwalk (fn [f]
-                   (if (instance? clojure.lang.IObj f)
-                     (vary-meta f dissoc :line :column :end-line :end-column)
-                     f))
-                 form))
-
-(defn compile-task-companion!
-  "Compiles form, which registers the task, as the companion of task-name of
-   ns-sym, writing its classes under *compile-path*. Call it while
-   compiling ahead of time, with *ns* being ns-sym."
-  [ns-sym task-name form]
-  (let [path (companion-path ns-sym task-name)
-        text (binding [*print-meta* true] (pr-str (printable-form form)))]
-    (clojure.lang.Compiler/compile (java.io.StringReader. text)
-                                   (str path ".clj")
-                                   (str (last (str/split path #"/")) ".clj"))))
-
-(defn- load-task-companion!
-  "Loads the compiled companion of task-name of ns-sym, if AOT compilation
-   made one - registering the task."
-  [ns-sym task-name]
-  (let [path (companion-path ns-sym task-name)]
-    (when (io/resource (str path clojure.lang.RT/LOADER_SUFFIX ".class"))
-      (binding [*ns* (the-ns ns-sym)]
-        (load (str "/" path))))))
 
 (defmacro run-task
   "Runs expr as a workflow invocation, capturing the locals of the
