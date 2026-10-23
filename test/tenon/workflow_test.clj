@@ -233,7 +233,7 @@
   ;; caller's transaction-bound connection), so they're durable the
   ;; instant they're written, regardless of what the surrounding
   ;; transaction later does.
-  (let [outer-ds (jdbc/get-datasource (str "jdbc:sqlite:" test-util/*db-path*))]
+  (let [outer-ds (jdbc/get-datasource (tenon.workflow.sqlite/jdbc-url test-util/*db-path*))]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"caller failure after the workflow call"
           (jdbc/with-transaction [_tx outer-ds]
             (engine/run-invocation #'transactional-fn transactional-fn [10 20])

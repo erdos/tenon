@@ -4,7 +4,11 @@
         org.xerial/sqlite-jdbc {:mvn/version "3.53.4.0"}
         com.zaxxer/HikariCP {:mvn/version "7.1.0"}}
  :aliases
- {:test {:extra-paths ["test" "http/test"]
+ {:turso {:extra-deps {tech.turso/turso {:mvn/version "0.8.3"}}
+          :jvm-opts ["-Dtenon.backend=turso"]}
+  :bench {:extra-paths ["bench"]}
+
+  :test {:extra-paths ["test" "http/test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                       ring/ring-mock {:mvn/version "0.4.0"}

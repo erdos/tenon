@@ -14,46 +14,69 @@
 (defn- close-quietly [^java.lang.AutoCloseable c]
   (try (.close c) (catch Throwable _)))
 
-(defn- with-statement [^Connection conn ^Map stmts ^String sql params f]
-  (let [^PreparedStatement ps (or (.get stmts sql)
-                                  (let [ps (.prepareStatement conn sql)] (.put stmts sql ps) ps))]
-    (try
-      (f (prepare/set-parameters ps params))
-      (catch Throwable e
-        (.remove stmts sql)
-        (close-quietly ps)
-        (throw e)))))
+(defn- with-statement [^Connection conn ^Map stmts turso? ^String sql params f]
+  (if turso?
+    ;; Turso's driver (0.8.3) never resets a statement: run again, it
+    ;; returns no rows and an update does nothing. So no caching there.
+    (with-open [ps (.prepareStatement conn sql)]
+      (f (prepare/set-parameters ps params)))
+    (let [^PreparedStatement ps (or (.get stmts sql)
+                                    (let [ps (.prepareStatement conn sql)] (.put stmts sql ps) ps))]
+      (try
+        (f (prepare/set-parameters ps params))
+        (catch Throwable e
+          (.remove stmts sql)
+          (close-quietly ps)
+          (throw e))))))
 
-(defn- result-set ^ResultSet [^PreparedStatement ps opts]
-  (if (.execute ps)
-    (.getResultSet ps)
-    (when (:return-keys opts)
-      (try (.getGeneratedKeys ps) (catch Exception _)))))
+(defn turso-url? [^String url]
+  (.startsWith url "jdbc:turso:"))
+
+(defn- returns-rows?
+  "Whether sql yields rows. Turso's driver (0.8.3) needs to be told: its
+   PreparedStatement.execute() steps the first row itself and getResultSet()
+   then hands back the advanced cursor, losing that row - executeQuery()
+   does not."
+  [^String sql]
+  (boolean (re-find #"(?is)^\s*(select|with|pragma|values)\b|\breturning\b" sql)))
+
+(defn- result-set ^ResultSet [turso? sql ^PreparedStatement ps opts]
+  (if turso?
+    (when (returns-rows? sql) (.executeQuery ps))
+    (if (.execute ps)
+      (.getResultSet ps)
+      (when (:return-keys opts)
+        (try (.getGeneratedKeys ps) (catch Exception _))))))
 
 (defn- first-row
   "The first row of ps's result. Reads the result to its end: SQLite only
    auto-checkpoints the WAL when a statement steps to its end, so a
    RETURNING write closed after its first row would let the WAL grow forever."
-  [^Connection conn ^PreparedStatement ps opts]
-  (if-let [^ResultSet r (result-set ps opts)]
+  [turso? sql ^Connection conn ^PreparedStatement ps opts]
+  (if-let [^ResultSet r (result-set turso? sql ps opts)]
     (try
       (reduce (fn [first-row row] (or first-row (rs/datafiable-row row conn opts)))
               nil
               (rs/reducible-result-set r opts))
       (finally (close-quietly r)))
-    {:next.jdbc/update-count (.getUpdateCount ps)}))
+    {:next.jdbc/update-count (if turso? (.executeUpdate ps) (.getUpdateCount ps))}))
 
-(deftype Conn [^Connection conn ^Map stmts]
+(deftype Conn [^Connection conn ^Map stmts turso?]
   p/Executable
   (-execute [_ sql-params opts]
     ;; a reducible outlives this call: no caching
     (p/-execute conn sql-params opts))
   (-execute-one [_ [sql & params] opts]
-    (with-statement conn stmts sql params
-      #(first-row conn % (merge {:return-keys false} opts))))
+    (with-statement conn stmts turso? sql params
+      #(first-row turso? sql conn % (merge {:return-keys false} opts))))
   (-execute-all [_ [sql & params] opts]
-    (with-statement conn stmts sql params
-      #(p/-execute-all % nil (merge {:return-keys false} opts))))
+    (with-statement conn stmts turso? sql params
+      (fn [^PreparedStatement ps]
+        (if turso?
+          (if (returns-rows? sql)
+            (rs/datafiable-result-set (.executeQuery ps) conn opts)
+            [{:next.jdbc/update-count (.executeUpdate ps)}])
+          (p/-execute-all ps nil (merge {:return-keys false} opts))))))
   p/Transactable
   (-transact [this body-fn opts]
     (p/-transact conn (fn [_] (body-fn this)) opts)))
@@ -158,13 +181,23 @@
       (recur pool)
       c)))
 
+(defn- new-conn ^Conn [^String url]
+  (let [conn (DriverManager/getConnection url)
+        turso? (turso-url? url)]
+    (when turso?
+      ;; no URL parameters in Turso's driver: the path is everything after the prefix
+      (with-open [st (.createStatement conn)]
+        (.execute st "PRAGMA busy_timeout = 5000")
+        (.execute st "PRAGMA cache_size = -16384")))
+    (->Conn conn (HashMap.) turso?)))
+
 (defn- borrow ^Conn [^Pool pool]
   (check-open pool)
   (.acquire ^Semaphore (.-permits pool))
   (try
     (check-open pool)
     (or (idle-conn pool)
-        (->Conn (DriverManager/getConnection (.-url pool)) (HashMap.)))
+        (new-conn (.-url pool)))
     (catch Throwable e
       (.release ^Semaphore (.-permits pool))
       (throw e))))

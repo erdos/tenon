@@ -38,6 +38,12 @@
   (:import [java.security MessageDigest]
            [tenon.workflow.sqlite.pool Pool]))
 
+(def backend
+  "The database engine: \"sqlite\" (the default) or \"turso\" - the Turso
+   Database rewrite, needing tech.turso/turso on the classpath (the :turso
+   alias). Set with -Dtenon.backend=turso."
+  (System/getProperty "tenon.backend" "sqlite"))
+
 (def ^:private now-ms
   "SQL expression for the current UTC time in epoch milliseconds. SQLite
    keeps 'now' fixed for the duration of a statement, so every use within
@@ -150,6 +156,31 @@
               NEW.params);
     END"])
 
+(def ^:private turso-schema
+  "schema, minus what Turso does not support (yet): WITHOUT ROWID tables
+   and INSTEAD OF triggers. new_workflow becomes a table that stays empty:
+   a BEFORE trigger drops a row whose key is taken, an AFTER trigger does
+   what the INSTEAD OF trigger does and deletes the row again."
+  (-> (mapv #(str/replace % "WITHOUT ROWID, STRICT" "STRICT") (subvec schema 0 (- (count schema) 2)))
+      (conj "CREATE TABLE IF NOT EXISTS new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at, expires_at)"
+            "CREATE TRIGGER IF NOT EXISTS new_workflow_check BEFORE INSERT ON new_workflow
+             BEGIN
+               SELECT RAISE(IGNORE) FROM idempotence WHERE key = NEW.key;
+             END"
+            "CREATE TRIGGER IF NOT EXISTS new_workflow AFTER INSERT ON new_workflow
+             BEGIN
+               INSERT INTO idempotence (key, workflow_id) VALUES (NEW.key, NEW.id);
+               INSERT OR IGNORE INTO wf_def (name) VALUES (NEW.wf_def);
+               INSERT INTO event (id, workflow_id, state, occurred_at, data, expires_at, parent_invocation_id, wf_def_id,
+                                  prev_call_id, params)
+               VALUES (NEW.id, NEW.id, 'STARTED', NEW.occurred_at, NEW.metadata, NEW.expires_at, NEW.parent_invocation_id,
+                       (SELECT id FROM wf_def WHERE name = NEW.wf_def),
+                       (SELECT w.last_call_id FROM event p JOIN workflow w ON w.id = p.workflow_id
+                         WHERE p.id = NEW.parent_invocation_id),
+                       NEW.params);
+               DELETE FROM new_workflow;
+             END")))
+
 (def ^:private state-columns
   "The columns of a workflow_state row (aliased s) returned by Storage."
   "s.invocation_id, s.name, s.params, s.parent_invocation_id, s.state,
@@ -171,6 +202,29 @@
                   rs (assoc opts :label-fn #(let [label (str/lower-case %)]
                                               (str (if (event-columns label) "event/" "workflow/")
                                                    (str/replace label \_ \-))))))})
+
+(def ^:private inlined-columns
+  {"invocation_id" "sw.invocation_id" "name" "sd.name" "params" "sf.params"
+   "parent_invocation_id" "sf.parent_invocation_id" "state" "sw.state"
+   "state_changed_at" "ss.occurred_at AS state_changed_at" "expires_at" "ss.expires_at"
+   "metadata" "si.data AS metadata" "result" "iif(sw.state = 'STARTED', NULL, ss.data) AS result"})
+
+(defn- for-backend
+  "sql as is for SQLite. Turso does not flatten views into the query
+   using them: it scans the whole view instead (SCAN workflow), so there
+   workflow_state (alias s) is spelled out as the joins it stands for."
+  [sql]
+  (if (= backend "turso")
+    (-> sql
+        (str/replace #"workflow_state s ON s\.workflow_id = ([\w.]+)"
+                     (fn [[_ id]]
+                       (str "workflow sw ON sw.id = " id
+                            " CROSS JOIN event ss ON ss.id = sw.state_id"
+                            " CROSS JOIN event si ON si.id = sw.invocation_id"
+                            " CROSS JOIN event sf ON sf.id = sw.id"
+                            " CROSS JOIN wf_def sd ON sd.id = sf.wf_def_id")))
+        (str/replace #"\bs\.(\w+)" (fn [[m col]] (get inlined-columns col m))))
+    sql))
 
 (defn- write!
   "Runs a write statement, returning its first row (RETURNING) if any."
@@ -252,7 +306,7 @@
       wf-def
       (let [branch (fn [top-level]
                      (str "SELECT " call-columns "
-                             FROM event c INDEXED BY event_call
+                             FROM event c " (when-not (= backend "turso") "INDEXED BY event_call") "
                              CROSS JOIN workflow_state s ON s.workflow_id = c.workflow_id
                             WHERE " (where (str "c.wf_def_id = " def-id)
                                            (str "(c.parent_invocation_id IS NULL) = " top-level)
@@ -290,7 +344,7 @@
    (fn [c]
      (jdbc/execute! c ["BEGIN IMMEDIATE"])
      (try
-       (doseq [ddl schema]
+       (doseq [ddl (if (pool/turso-url? (.-url ^Pool pool)) turso-schema schema)]
          (jdbc/execute! c [ddl]))
        (jdbc/execute! c ["COMMIT"])
        (catch Throwable e
@@ -341,19 +395,19 @@
     nil)
 
   (get-workflow [this invocation-id]
-    (some-> (jdbc/execute-one! this [(str "SELECT " state-columns ", s.expires_at <= " now-ms " IS 1 AS expired
+    (some-> (jdbc/execute-one! this [(for-backend (str "SELECT " state-columns ", s.expires_at <= " now-ms " IS 1 AS expired
                                              FROM event i
                                              CROSS JOIN workflow_state s ON s.workflow_id = i.workflow_id
-                                            WHERE i.id = ? AND i.state = 'STARTED'")
+                                            WHERE i.id = ? AND i.state = 'STARTED'"))
                                      invocation-id]
                                opts)
             (update :workflow/expired pos?)))
 
   (find-by-wf-def-and-params [this wf-def params-edn-str]
-    (jdbc/execute-one! this [(str "SELECT " state-columns "
+    (jdbc/execute-one! this [(for-backend (str "SELECT " state-columns "
                                      FROM idempotence k
                                      CROSS JOIN workflow_state s ON s.workflow_id = k.workflow_id
-                                    WHERE k.key = ?")
+                                    WHERE k.key = ?"))
                              (idempotence-key wf-def params-edn-str)]
                        opts))
 
@@ -362,7 +416,7 @@
      (db/top-level-workflows this nil))
     ([this filters]
      (let [[sql params] (calls-sql filters)]
-       (mapv #(update % :event/reused pos?) (jdbc/execute! this (into [sql] params) opts)))))
+       (mapv #(update % :event/reused pos?) (jdbc/execute! this (into [(for-backend sql)] params) opts)))))
 
   (top-level-wf-defs [this top-level-only?]
     (mapv :name (jdbc/execute! this ["SELECT name FROM wf_def WHERE top_level OR NOT ? ORDER BY name"
@@ -426,6 +480,12 @@
        invocation-id]
       opts)))
 
+(defn jdbc-url [db-path]
+  (if (= backend "turso")
+    (str "jdbc:turso:" db-path)
+    (str "jdbc:sqlite:" db-path "?journal_mode=WAL&busy_timeout=5000"
+         "&mmap_size=1073741824&cache_size=-16384&temp_store=MEMORY")))
+
 (defn datasource
   "A connection pool (tenon.workflow.sqlite.pool) for the SQLite file at
    db-path (creating it if needed) - just the connections, no schema. Pass
@@ -441,9 +501,7 @@
   ;; they are served from a memory map of the file (shared by every
   ;; connection, through the OS page cache) rather than copied into each
   ;; connection's small default page cache.
-  (pool/open (str "jdbc:sqlite:" db-path "?journal_mode=WAL&busy_timeout=5000"
-                  "&mmap_size=1073741824&cache_size=-16384&temp_store=MEMORY")
-             10))
+  (pool/open (jdbc-url db-path) 10))
 
 (extend-protocol db/Timeouts
   Pool
@@ -464,9 +522,9 @@
 
   (list-expired [this]
     (mapv #(assoc % :workflow/expired true)
-          (jdbc/execute! this [(str "SELECT " state-columns "
+          (jdbc/execute! this [(for-backend (str "SELECT " state-columns "
                                        FROM workflow w INDEXED BY workflow_not_done
                                        CROSS JOIN workflow_state s ON s.workflow_id = w.id
                                       WHERE w.state = 'STARTED' AND w.state <> 'DONE' AND s.expires_at <= " now-ms "
-                                      ORDER BY w.id")]
+                                      ORDER BY w.id"))]
                          opts))))

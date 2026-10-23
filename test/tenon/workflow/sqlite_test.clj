@@ -41,7 +41,7 @@
           ;; the file's first connection switches it to WAL mode, which
           ;; connections opened at the same instant can fail to wait for -
           ;; not what is under test
-          (jdbc/execute! (first pools) ["SELECT 1"])
+          (jdbc/execute! (first pools) ["SELECT 1"] {:builder-fn next.jdbc.result-set/as-unqualified-maps})
           (let [started (promise)
                 inits (mapv #(future @started (db/init-db! %)) pools)]
             (deliver started true)
@@ -60,6 +60,6 @@
         (db/init-db! ds)
         (dotimes [i 1500]
           (db/finish! ds (db/insert-workflow! ds "test.ns/wal" (pr-str [i]) nil nil nil) "DONE" "1"))
-        (let [page-size (:page_size (jdbc/execute-one! ds ["PRAGMA page_size"]))
+        (let [page-size (:page_size (jdbc/execute-one! ds ["PRAGMA page_size"] {:builder-fn next.jdbc.result-set/as-unqualified-maps}))
               wal-pages (quot (.length (java.io.File. (str path "-wal"))) (+ 24 page-size))]
           (is (< wal-pages 1100) (str "the WAL has " wal-pages " pages")))))))

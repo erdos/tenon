@@ -4,6 +4,8 @@
             [tenon.workflow.sqlite :as sqlite]
             [tenon.workflow.sqlite.pool :as pool]))
 
+(def ^:private plain {:builder-fn next.jdbc.result-set/as-unqualified-maps})
+
 (defn- with-pool [f]
   (let [path (.getAbsolutePath (java.io.File/createTempFile "tenon-pool" ".db"))]
     (try
@@ -26,7 +28,7 @@
             results (->> (partition-all 25 xs)
                          (mapv (fn [part] (future (mapv (juxt identity insert) part))))
                          (mapcat deref))
-            stored (set (map :t/x (jdbc/execute! ds ["SELECT x FROM t"])))]
+            stored (set (map :x (jdbc/execute! ds ["SELECT x FROM t"] plain)))]
         (is (= (count (distinct xs)) (count stored)))
         (is (= stored (set (map first (filter #(= :ok (second %)) results)))))
         (is (= (- (count xs) (count (distinct xs))) (count (filter #(= :failed (second %)) results))))))))
@@ -40,4 +42,4 @@
            (mapv (fn [_] (future (dotimes [_ 50]
                                    (pool/write! ds #(jdbc/execute-one! % ["UPDATE c SET n = n + 1"]))))))
            (run! deref))
-      (is (= 800 (:c/n (jdbc/execute-one! ds ["SELECT n FROM c"])))))))
+      (is (= 800 (:n (jdbc/execute-one! ds ["SELECT n FROM c"] plain)))))))
