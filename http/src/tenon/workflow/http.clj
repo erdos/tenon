@@ -1,43 +1,43 @@
 (ns tenon.workflow.http
-  (:require [ring.middleware.json :refer [wrap-json-response]]
-            [ring.middleware.params :refer [wrap-params]]
+  (:require [ring.middleware.params :refer [wrap-params]]
             [ring.util.response :as response]
-            [clojure.edn :as edn]
             [clojure.string :as str]
             [tenon.workflow :as engine]
-            [tenon.workflow.http.details-page :as details-page]
-            [tenon.workflow.http.listing-page :as listing-page]
+            [tenon.workflow.http.details-page]
+            [tenon.workflow.http.endpoint :as endpoint]
+            [tenon.workflow.http.listing-page]
             [tenon.workflow.ui :as ui]))
 
-(defn- workflow->response [wf]
-  (try
-    {:invocation_id (:workflow/invocation-id wf) :wf_def (:workflow/name wf) :params (edn/read-string (:workflow/params wf))}
-    (catch Throwable _
-      {:invocation_id (:workflow/invocation-id wf) :wf_def (:workflow/name wf) :params_raw (:workflow/params wf)})))
+(defmethod endpoint/model :view/pending [_ _]
+  {:rows (engine/list-pending)})
 
-(defn- restart!
-  "Restarts workflow id from the detail page's restart form - along with
-   its failed nested workflows if recursive? - then redirects (303) back to
-   the page - with the failure as a restart_error query param if it failed,
-   which the page shows."
-  [id recursive?]
+(defmethod endpoint/model :view/restart
+  [_ {{:keys [id]} :path-params :keys [query-params]}]
   (let [error (try
-                (if recursive?
+                (if (= "true" (get query-params "recursive"))
                   (engine/restart-invocation-recursively id)
                   (engine/restart-invocation id))
                 nil
-                (catch Throwable e (or (ex-message e) (str (class e)))))
-        current (or (some-> id engine/get-invocation :workflow/invocation-id) id)]
-    (response/redirect (ui/uri :workflows current {:restart_error error}) :see-other)))
+                (catch Throwable e (or (ex-message e) (str (class e)))))]
+    {:requested-id id
+     :invocation-id (or (some-> id engine/get-invocation :workflow/invocation-id) id)
+     :restart-error error}))
 
-(defn- pending! []
-  (try
-    (response/response (mapv workflow->response (engine/list-pending)))
-    (catch Throwable e
-      (-> (response/response {:error (ex-message e)}) (response/status 500)))))
+(defmethod endpoint/status :view/restart [_ {:keys [restart-error]}]
+  (if restart-error 409 200))
 
-(defn- html-response [body]
-  (-> (response/response body) (response/content-type "text/html; charset=utf-8")))
+(defmethod endpoint/view :view/restart [_ {:keys [invocation-id restart-error]}]
+  (response/redirect (ui/uri :workflows invocation-id {:restart_error restart-error}) :see-other))
+
+(defn- route [{:keys [request-method uri]}]
+  (let [[_ id restart] (re-matches #"/workflows/(\d+)(/restart)?" uri)
+        id (some-> id parse-long)
+        get? (= :get request-method)]
+    (cond
+      (and get? (= uri "/")) [:view/listing]
+      (and get? (= uri "/workflows/pending")) [:view/pending]
+      (and id restart (= :post request-method)) [:view/restart {:id id}]
+      (and id get? (not restart)) [:view/details {:id id}])))
 
 (defn handler
   "Ring handler for tenon's dashboard/detail pages, restart form and
@@ -51,19 +51,11 @@
    link/URL this handler's HTML generates gets prefix prepended back on
    via ui/*uri-prefix*, also bound here. Pass \"\" to mount unprefixed at the
    app's own root."
-  [engine prefix {:keys [request-method uri query-params]}]
+  [engine prefix request]
   (binding [ui/*uri-prefix* prefix
             engine/*workflow-engine* engine]
-    (let [[_ id restart] (re-matches #"/workflows/(\d+)(/restart)?" uri)
-          id (some-> id parse-long)
-          get? (= :get request-method)]
-      (or (cond
-            (and get? (= uri "/")) (html-response (listing-page/html query-params))
-            (and get? (= uri "/workflows/pending")) (pending!)
-            (and id restart (= :post request-method)) (restart! id (= "true" (get query-params "recursive")))
-            (and id get? (not restart)) (some-> (details-page/html id (not-empty (get query-params "restart_error")))
-                                                html-response))
-          (response/not-found {:error "not found"})))))
+    (let [[endpoint path-params] (route request)]
+      (endpoint/respond endpoint (assoc request :path-params path-params)))))
 
 (defn- strip-prefix
   "request-uri relative to prefix, or nil if request-uri isn't actually
@@ -92,9 +84,7 @@
    request tenon serves."
   [engine tenon-uri-prefix original-handler]
   (let [prefix (if (= "/" tenon-uri-prefix) "" tenon-uri-prefix)
-        tenon-handler (-> (fn [request] (handler engine prefix request))
-                          wrap-params
-                          wrap-json-response)]
+        tenon-handler (wrap-params (fn [request] (handler engine prefix request)))]
     (fn
       ([{:keys [uri] :as request}]
        (if-let [relative-uri (strip-prefix prefix uri)]
@@ -107,7 +97,7 @@
          (original-handler request respond raise))))))
 
 (defn- not-found-handler
-  ([_request] (response/not-found {:error "not found"}))
+  ([request] (endpoint/respond nil request))
   ([request respond _raise] (respond (not-found-handler request))))
 
 (defn app

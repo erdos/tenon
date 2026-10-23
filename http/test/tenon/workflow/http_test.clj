@@ -3,8 +3,8 @@
             [clojure.string :as str]
             [ring.mock.request :as mock]
             [cheshire.core :as json]
+            [clojure.edn :as edn]
             [matcher-combinators.test :refer [match? thrown-match?]]
-            [matcher-combinators.matchers :as m]
             [kerodon.core :as k :refer [within]]
             [kerodon.test :refer [has status? some-text? regex?
                                   attr? value? missing? heading? link?]]
@@ -58,21 +58,8 @@
   (let [id (test-util/insert! "test.ns/crashed" :params (pr-str [1 2]))
         response (request :get "/workflows/pending")
         body (json/parse-string (:body response) true)]
-    (is (match? {:status 200} response))
-    (is (match? [{:invocation_id id :params [1 2]}] body))))
-
-(deftest pending-endpoint-handles-invalid-params-edn-test
-  ;; A single row with unreadable :params must not fail the whole
-  ;; response - it should fall back to :params_raw while every other
-  ;; (valid) row still comes through normally.
-  (let [good-id (test-util/insert! "test.ns/good" :params (pr-str [1 2]))
-        bad-id (test-util/insert! "test.ns/bad" :params "(1 2")
-        response (request :get "/workflows/pending")
-        body (json/parse-string (:body response) true)]
-    (is (match? {:status 200} response))
-    (is (match? (m/in-any-order [{:invocation_id good-id :params [1 2]}
-                                 {:invocation_id bad-id :params_raw "(1 2"}])
-                body))))
+    (is (match? {:status 200 :headers {"Content-Type" #"^application/json"}} response))
+    (is (match? {:rows [{:workflow/invocation-id id :workflow/params "[1 2]"}]} body))))
 
 (deftest pending-endpoint-returns-500-on-unexpected-error-test
   (with-redefs [engine/list-pending (fn [] (throw (ex-info "kaboom" {})))]
@@ -633,7 +620,7 @@
         (has (attr? (selected-option "state") :value "STARTED")))
     (let [id (test-util/insert! "test.ns/prefixed")
           body (:body (app (mock/request :get "/tenon/workflows/pending")))]
-      (is (match? [{:invocation_id id}] (json/parse-string body true))))))
+      (is (match? {:rows [{:workflow/invocation-id id}]} (json/parse-string body true))))))
 
 (deftest wrap-handler-generates-prefixed-links-test
   (let [original (constantly {:status 200 :body "unreachable"})
@@ -841,3 +828,91 @@
     (-> state
         k/follow-redirect
         (has (attr? [:section.wf-summary] :class "wf-summary state-DONE")))))
+
+(defn- edn-request
+  ([uri] (edn-request :get uri))
+  ([method uri] (call (-> (mock/request method uri) (mock/header "Accept" "application/edn")))))
+
+(deftest listing-as-edn-test
+  (let [id (test-util/insert! "test.ns/top")
+        response (edn-request "/?state=STARTED")]
+    (is (match? {:status 200 :headers {"Content-Type" #"^application/edn"}} response))
+    (is (match? {:filters {:state "STARTED"}
+                 :rows [{:workflow/invocation-id id :workflow/name "test.ns/top"}]
+                 :wf-defs ["test.ns/top"]}
+                (edn/read-string (:body response))))))
+
+(deftest detail-page-as-edn-test
+  (let [parent-id (test-util/insert! "test.ns/parent")
+        id (test-util/insert! "test.ns/child" :parent parent-id :params (pr-str [1]))
+        response (edn-request (href id))]
+    (is (match? {:status 200 :headers {"Content-Type" #"^application/edn"}} response))
+    (is (match? {:workflow {:workflow/invocation-id id :workflow/params "[1]"}
+                 :requested-id id
+                 :ancestors [{:workflow/invocation-id parent-id}]
+                 :registered? false}
+                (edn/read-string (:body response))))))
+
+(deftest detail-page-as-edn-404-for-unknown-id-test
+  (is (match? {:status 404} (edn-request "/workflows/999999"))))
+
+(deftest accept-header-picks-the-most-preferred-supported-type-test
+  (let [content-type (fn [accept]
+                       (get-in (call (-> (mock/request :get "/") (mock/header "Accept" accept)))
+                               [:headers "Content-Type"]))]
+    (is (str/starts-with? (content-type "text/html,application/xhtml+xml,*/*;q=0.8") "text/html"))
+    (is (str/starts-with? (content-type "text/html;q=0.5, application/edn") "application/edn"))
+    (is (str/starts-with? (content-type "image/png") "text/html"))
+    (is (str/starts-with? (content-type "application/*") "application/json"))
+    (is (str/starts-with? (content-type "*/*;q=0.5, text/html;q=0") "application/json"))
+    (is (str/starts-with? (content-type "Application/EDN") "application/edn"))))
+
+(deftest format-query-param-overrides-accept-header-test
+  (is (match? {:headers {"Content-Type" #"^application/edn"}} (request :get "/?format=edn")))
+  (is (match? {:headers {"Content-Type" #"^text/html"}}
+              (call (-> (mock/request :get "/?format=html") (mock/header "Accept" "application/json")))))
+  (is (match? {:headers {"Content-Type" #"^application/json"}} (request :get "/workflows/pending?format=html"))))
+
+(deftest responses-vary-by-accept-test
+  (is (match? {:headers {"Vary" "Accept"}} (request :get "/")))
+  (is (match? {:headers {"Vary" "Accept"}} (request :get "/no/such/route"))))
+
+(deftest unknown-endpoint-is-an-error-test
+  (with-redefs-fn {#'http/route (constantly [:view/no-such-endpoint])}
+    #(is (match? {:status 500} (request :get "/")))))
+
+(deftest pending-as-edn-test
+  (let [id (test-util/insert! "test.ns/pending-edn" :params (pr-str [1]))
+        response (edn-request "/workflows/pending")]
+    (is (match? {:status 200 :headers {"Content-Type" #"^application/edn"}} response))
+    (is (match? {:rows [{:workflow/invocation-id id}]} (edn/read-string (:body response))))))
+
+(deftest restart-as-edn-test
+  (let [id (flaky-invocation!)
+        _ (engine/register! #'http-flaky-fn (fn [] :ok))
+        response (edn-request :post (str (href id) "/restart"))
+        current (:workflow/invocation-id (engine/get-invocation id))]
+    (is (not= id current))
+    (is (match? {:status 200} response))
+    (is (= {:requested-id id :invocation-id current :restart-error nil}
+           (edn/read-string (:body response))))))
+
+(deftest restart-failure-as-edn-is-a-conflict-test
+  (let [id (test-util/insert! "test.ns/still-running")
+        response (edn-request :post (str (href id) "/restart"))]
+    (is (match? {:status 409} response))
+    (is (match? {:restart-error #"Cannot restart"} (edn/read-string (:body response))))))
+
+(deftest detail-page-as-json-test
+  (let [id (test-util/insert! "test.ns/json")
+        response (call (-> (mock/request :get (href id)) (mock/header "Accept" "application/json")))]
+    (is (match? {:status 200 :headers {"Content-Type" #"^application/json"}} response))
+    (is (match? {:workflow {:workflow/invocation-id id}} (json/parse-string (:body response) true)))))
+
+(deftest not-found-and-error-are-not-html-test
+  (is (match? {:status 404 :headers {"Content-Type" #"^application/json"}}
+              (call (-> (mock/request :get "/no/such/route") (mock/header "Accept" "text/html")))))
+  (with-redefs [engine/list-pending (fn [] (throw (ex-info "kaboom" {})))]
+    (let [response (call (-> (mock/request :get "/workflows/pending") (mock/header "Accept" "application/edn")))]
+      (is (match? {:status 500 :headers {"Content-Type" #"^application/edn"}} response))
+      (is (= {:error "kaboom"} (edn/read-string (:body response)))))))

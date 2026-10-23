@@ -2,6 +2,7 @@
   "The workflow listing page (the dashboard at tenon's root): top-level
    workflows, newest first, filterable by state and workflow, paginated."
   (:require [tenon.workflow :as engine]
+            [tenon.workflow.http.endpoint :as endpoint]
             [tenon.workflow.ui :as ui]))
 
 (def ^:private refresh-seconds 10)
@@ -63,11 +64,11 @@
   (for [[k v] params :when (some? v)]
     [:input {:type "hidden" :name (name k) :value v}]))
 
-(defn- filter-form [{:keys [state wf-def show-all? refresh?] :as f}]
+(defn- filter-form [{:keys [state wf-def show-all? refresh?] :as f} wf-defs]
   [:form.filters {:method "get" :action (ui/uri)}
    (hidden-inputs (select-keys (listing-params f) [:page_size :refresh]))
    (ui/select-filter "state" "State" states state)
-   (ui/select-filter "wf_def" "Workflow" (engine/list-wf-defs (not show-all?)) wf-def)
+   (ui/select-filter "wf_def" "Workflow" wf-defs wf-def)
    [:span.filters-right
     [:label
      [:input (cond-> {:type "checkbox" :name "all" :value "1" :onchange "this.form.submit()"}
@@ -92,30 +93,28 @@
      [:a.btn.primary {:href (ui/uri (assoc (listing-params f) :before_id next-cursor))} "Next page →"]
      [:span.btn.disabled "Next page →"])])
 
-(defn- dashboard-html [{:keys [state wf-def show-all? page-size refresh?] :as f} before]
-  (let [rows (engine/list-invocations {:state state :wf-def wf-def
+(defmethod endpoint/model :view/listing
+  [_ {:keys [query-params]}]
+  (let [{:keys [page-size page_cursor]} (ui/parse-pagination query-params [:before_id])
+        {:keys [state wf-def show-all?] :as f} {:state (not-empty (get query-params "state"))
+                                                :wf-def (not-empty (get query-params "wf_def"))
+                                                :show-all? (some? (get query-params "all"))
+                                                :page-size page-size
+                                                :refresh? (some? (get query-params "refresh"))}
+        rows (engine/list-invocations {:state state :wf-def wf-def
                                        :top-level-only? (not show-all?)
-                                       :limit page-size :before before})
-        has-more? (> (count rows) page-size)
-        page-rows (vec (take page-size rows))
-        next-cursor (when has-more? (:event/call-id (last page-rows)))]
-    (ui/layout "Workflows"
-               {:refresh (when refresh? refresh-seconds)}
-               [:div
-                (filter-form f)
-                (workflows-table page-rows show-all? (System/currentTimeMillis)
-                                 (pagination-footer f next-cursor))])))
+                                       :limit page-size
+                                       :before (some-> page_cursor first parse-long)})
+        page-rows (vec (take page-size rows))]
+    {:filters f
+     :rows page-rows
+     :next-cursor (when (> (count rows) page-size) (:event/call-id (last page-rows)))
+     :wf-defs (engine/list-wf-defs (not show-all?))}))
 
-(defn html
-  "The listing page as an HTML string, for the request's query-params:
-   state and wf_def filters, all (also list sub-workflows), page_size,
-   before_id (the pagination cursor) and refresh (reload the page
-   periodically)."
-  [query-params]
-  (let [{:keys [page-size page_cursor]} (ui/parse-pagination query-params [:before_id])]
-    (dashboard-html {:state (not-empty (get query-params "state"))
-                     :wf-def (not-empty (get query-params "wf_def"))
-                     :show-all? (some? (get query-params "all"))
-                     :page-size page-size
-                     :refresh? (some? (get query-params "refresh"))}
-                    (some-> page_cursor first parse-long))))
+(defmethod endpoint/view :view/listing [_ {:keys [filters rows next-cursor wf-defs]}]
+  (ui/layout "Workflows"
+             {:refresh (when (:refresh? filters) refresh-seconds)}
+             [:div
+              (filter-form filters wf-defs)
+              (workflows-table rows (:show-all? filters) (System/currentTimeMillis)
+                               (pagination-footer filters next-cursor))]))

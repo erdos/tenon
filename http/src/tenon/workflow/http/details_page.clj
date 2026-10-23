@@ -3,6 +3,7 @@
    result and metadata, and the timeline of it and its sub-workflows."
   (:require [clojure.string :as str]
             [tenon.workflow :as engine]
+            [tenon.workflow.http.endpoint :as endpoint]
             [tenon.workflow.ui :as ui]))
 
 (defn- params-html [params-str]
@@ -292,19 +293,15 @@
           start (reduce min (map :workflow/state-changed-at events))]
       [:ul.tree (timeline-tree-node nodes children start [:root])])))
 
-(defn- can-restart? [wf]
-  (and (or (engine/finished? wf) (engine/expired? wf))
-       (some? (engine/lookup (symbol (:workflow/name wf))))))
-
-(defn- unregistered? [wf]
-  (nil? (engine/lookup (symbol (:workflow/name wf)))))
+(defn- can-restart? [wf registered?]
+  (and (or (engine/finished? wf) (engine/expired? wf)) registered?))
 
 (defn- workflow-summary
   "The card at the top of the detail page: the workflow's state, how it ran
    and how it relates to other workflows. requested-id is the id in the
    URL - a past invocation of a since restarted workflow shows the current
    one, saying so. events is its full-timeline."
-  [wf requested-id events restart-error]
+  [{wf :workflow :keys [requested-id events restart-error registered?]}]
   (let [id (:workflow/invocation-id wf)
         own (filter (comp zero? :workflow/depth) events)
         runs (remove engine/reused? own)
@@ -317,7 +314,7 @@
      {:state (:workflow/state wf)
       :head [(when (engine/expired? wf) [:span.chip.wf-expired "Expired"])
              (when duration [:span.wf-summary-duration duration])
-             (when (can-restart? wf)
+             (when (can-restart? wf registered?)
                (ui/panel-toggle-btn
                 [:button "\u21BB Restart"]
                 [:div.restart
@@ -330,7 +327,7 @@
                    "Restart recursively"]]]))
              ;; When wf_def is not registered in this process, show a warning
              ;; badge so operators know why the Restart buttons are missing.
-             (when (unregistered? wf)
+             (when-not registered?
                [:span.chip.wf-unregistered "Unregistered var \u2014 cannot restart in this process"])]
       :error (when restart-error ["Restart failed: " restart-error])
       :note (when (not= requested-id id)
@@ -364,32 +361,35 @@
 (def ^:private expand-all-js
   "let d=[...document.querySelectorAll('ul.tree details')],o=d.every(x=>x.open);d.forEach(x=>x.open=!o);this.textContent=o?'Expand all':'Collapse all'")
 
-(defn html
-  "The page of the workflow requested-id belongs to as an HTML string, or
-   nil if there is no such workflow. restart-error, if not nil, is a
-   failed restart's message to show."
-  [requested-id restart-error]
+(defmethod endpoint/model :view/details
+  [_ {{requested-id :id} :path-params :keys [query-params]}]
   (when-let [wf (engine/get-invocation requested-id)]
-    (let [id (:workflow/invocation-id wf)
-          events (engine/full-timeline id)
-          ancestors (ancestors-of wf)]
-      (ui/layout (:workflow/name wf)
-              {:back [(ui/uri) "Workflows"]
-               :tab-title (str (ui/state-symbol (:workflow/state wf)) " " (:workflow/name wf) " \u00B7 " id)}
-              [:div
-               (when (seq ancestors)
-                 (ui/breadcrumb (concat (for [a ancestors]
-                                          [[:span (ui/workflow-name (:workflow/name a)) " " (ui/workflow-id (:workflow/invocation-id a))]
-                                           (ui/uri :workflows (:workflow/invocation-id a))])
-                                        [[[:span (ui/workflow-name (:workflow/name wf)) " " (ui/workflow-id id)] nil]])))
-               (workflow-summary wf requested-id events restart-error)
-               [:div.panels
-                (params-html (:workflow/params wf))
-                (result-panel wf)
-                (when (:workflow/metadata wf) (metadata-html (:workflow/metadata wf)))]
-               [:div.page-head
-                [:h2 "Timeline"]
-                (when (seq events)
-                  [:div.head-actions
-                   [:button.btn {:type "button" :onclick expand-all-js} "Expand all"]])]
-               (full-timeline-tree events)]))))
+    {:workflow wf
+     :requested-id requested-id
+     :restart-error (not-empty (get query-params "restart_error"))
+     :events (vec (engine/full-timeline (:workflow/invocation-id wf)))
+     :ancestors (vec (ancestors-of wf))
+     :registered? (some? (engine/lookup (symbol (:workflow/name wf))))}))
+
+(defmethod endpoint/view :view/details [_ {wf :workflow :keys [events ancestors] :as m}]
+  (let [id (:workflow/invocation-id wf)]
+    (ui/layout (:workflow/name wf)
+               {:back [(ui/uri) "Workflows"]
+                :tab-title (str (ui/state-symbol (:workflow/state wf)) " " (:workflow/name wf) " \u00B7 " id)}
+               [:div
+                (when (seq ancestors)
+                  (ui/breadcrumb (concat (for [a ancestors]
+                                           [[:span (ui/workflow-name (:workflow/name a)) " " (ui/workflow-id (:workflow/invocation-id a))]
+                                            (ui/uri :workflows (:workflow/invocation-id a))])
+                                         [[[:span (ui/workflow-name (:workflow/name wf)) " " (ui/workflow-id id)] nil]])))
+                (workflow-summary m)
+                [:div.panels
+                 (params-html (:workflow/params wf))
+                 (result-panel wf)
+                 (when (:workflow/metadata wf) (metadata-html (:workflow/metadata wf)))]
+                [:div.page-head
+                 [:h2 "Timeline"]
+                 (when (seq events)
+                   [:div.head-actions
+                    [:button.btn {:type "button" :onclick expand-all-js} "Expand all"]])]
+                (full-timeline-tree events)])))
