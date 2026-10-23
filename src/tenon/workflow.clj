@@ -444,6 +444,41 @@
                                     (run-invocation v raw-fn args))))
     (register! v raw-fn)))
 
+(defn register-task-source!
+  "Registers the task task-name in ns-sym whose raw fn is compiled lazily
+   from src, a (fn [captured...] expr) form, on its first call. For tasks
+   registered by AOT-compiled code (see TaskRegistration), which has no fn
+   object to register when it is loaded."
+  [ns-sym task-name src]
+  (let [compiled (delay (binding [*ns* (the-ns ns-sym)] (eval src)))]
+    (register-task! ns-sym task-name (fn [& args] (apply @compiled args)))))
+
+;; An AOT-compiled namespace stores a quoted constant in the static
+;; initializer of the class holding it, as the string print-dup writes and
+;; reads back (evaluating #=) when the class is loaded. Printing a
+;; TaskRegistration as a call to register-task-source! therefore registers
+;; the task when the compiled namespace is loaded, though no code in it runs
+;; (the namespace has to have required tenon.workflow by then, as any using
+;; #task does).
+;; (A deftype would not do: the compiler emits those as constructor calls.)
+(definterface TaskRegistration
+  (^clojure.lang.Symbol nsSym [])
+  (^clojure.lang.Symbol taskName [])
+  (src []))
+
+(defn ->task-registration [ns-sym task-name src]
+  (reify TaskRegistration
+    (nsSym [_] ns-sym)
+    (taskName [_] task-name)
+    (src [_] src)))
+
+(defmethod print-dup TaskRegistration
+  [^TaskRegistration r ^java.io.Writer w]
+  (.write w (str "#=(tenon.workflow/register-task-source! "
+                 (pr-str (.nsSym r)) " " (pr-str (.taskName r)) " "
+                 (binding [*print-dup* false] (pr-str (.src r)))
+                 ")")))
+
 (defmacro run-task
   "Runs expr as a workflow invocation, capturing the locals of the
    surrounding code that expr uses and passing them as the invocation's
@@ -456,9 +491,13 @@
 
    The task is registered when the surrounding code is loaded, not only when
    it first runs, so a fresh process can restart it without having called
-   it. That needs expr to compile at load time; if it does not (it uses a
-   var defined further down, say) the task is registered by its first call
-   instead."
+   it. That needs expr to compile at load time; if it does not, the task is
+   registered by its first call instead. The same goes for AOT-compiled
+   code, where registering means compiling expr from its source on the
+   task's first run - provided the #task is directly in the body of a
+   top-level fn, not inside a closure in it (map's fn, for, future...),
+   whose class is only loaded when the closure is created: then the task is
+   registered by the first call of the surrounding code as well."
   [expr]
   (let [captured (->> (tree-seq coll? seq expr)
                       (filter symbol?)
@@ -470,7 +509,8 @@
     (try
       (register-task! ns-sym task-name (eval `(fn ~captured ~expr)))
       (catch Throwable _))
-    `(do
+    `(let [~(gensym "registration") ~(when *compile-files*
+                  `(quote ~(->task-registration ns-sym task-name `(fn ~captured ~expr))))]
        (declare ~task-name)
        (register-task! '~ns-sym '~task-name (fn ~captured ~expr))
        (~task-name ~@captured))))
