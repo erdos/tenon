@@ -428,3 +428,34 @@
            (fn [& args#]
              (run-invocation (var ~fname) raw-fn# args#)))
          (register! (var ~fname) raw-fn#)))))
+
+(defmacro run-task
+  "Runs expr as a workflow invocation, capturing the locals of the
+   surrounding code that expr uses and passing them as the invocation's
+   arguments. expr is wrapped into a fn of those locals and registered under
+   a var named after the hash of expr in the current namespace, so the
+   invocation is audited, deduplicated by the captured values, and
+   restartable (restart-invocation) just like a #workflow defn call - as
+   long as the form has been evaluated in the restarting process, and the
+   captured values print and read back as EDN. Returns expr's value."
+  [expr]
+  (let [captured (->> (tree-seq coll? seq expr)
+                      (filter symbol?)
+                      (filter #(contains? &env %))
+                      distinct
+                      vec)
+        task-name (symbol (format "task-%08x" (hash (pr-str expr))))]
+    `(do
+       (declare ~task-name)
+       (let [raw-fn# (fn ~captured ~expr)]
+         (def ~task-name
+           (fn [& args#]
+             (run-invocation (var ~task-name) raw-fn# args#)))
+         (register! (var ~task-name) raw-fn#))
+       (~task-name ~@captured))))
+
+(defn task
+  "Tag reader for #task to be placed in front of an expression. Expands
+   into a run-task call, which makes the expression a workflow."
+  [form]
+  `(run-task ~form))

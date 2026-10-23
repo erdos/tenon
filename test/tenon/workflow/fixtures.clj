@@ -58,3 +58,7 @@
 (defn say-hi-twice [x]
   (say-hi x)
   (say-hi x))
+
+;; Captures a and b (but not the unused c) from the surrounding locals.
+(defn multiply-in-task [a b c]
+  #task (* a b))

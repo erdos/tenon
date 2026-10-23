@@ -160,3 +160,17 @@
     (is (thrown-match? clojure.lang.ExceptionInfo
                        {:type ::engine/precondition-failed}
                        (fixtures/add-numbers 1 2)))))
+
+(defn- task-wf-def
+  "The wf_def of the one #task in the fixtures namespace."
+  []
+  (str "tenon.workflow.fixtures/"
+       (first (filter #(re-find #"^task-" %) (map name (keys (ns-interns 'tenon.workflow.fixtures)))))))
+
+(deftest task-captures-used-locals-and-audits-test
+  (is (= 12 (fixtures/multiply-in-task 3 4 :unused)))
+  (let [wf (first (test-util/find-by-wf-def (task-wf-def)))]
+    ;; only the locals the expression uses are captured, in order of appearance
+    (is (= [3 4] (edn/read-string (:workflow/params wf))))
+    (is (match? [{:workflow/state "STARTED"} {:workflow/state "DONE" :event/data (pr-str 12)}]
+                (test-util/timeline (:workflow/invocation-id wf))))))
