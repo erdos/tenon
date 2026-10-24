@@ -29,6 +29,19 @@
 (defn- metadata-html [metadata-str]
   (ui/panel {:title "Metadata"} (metadata-body metadata-str)))
 
+(defn- system-html
+  "The workflow's version and what tenon recorded about the code its
+   current invocation ran - nil if neither is known."
+  [{:workflow/keys [version system-metadata]}]
+  (let [system (some-> system-metadata ui/read-edn)
+        rows (concat (when version [[[:code ":version"] (ui/folded-pre version)]])
+                     (if (map? system)
+                       (for [[k v] (sort-by (comp str key) system)]
+                         [[:code (pr-str k)] (ui/folded-pre (ui/pretty v))])
+                       (when system-metadata [[[:code "system"] (ui/edn-block system-metadata)]])))]
+    (when (seq rows)
+      (ui/panel {:title "System"} (ui/key-values rows)))))
+
 (defmulti ^:private result-panel :workflow/state)
 
 (defmethod result-panel "DONE" [wf]
@@ -390,7 +403,8 @@
                 [:div.panels
                  (params-html (:workflow/params wf))
                  (result-panel wf)
-                 (when (:workflow/metadata wf) (metadata-html (:workflow/metadata wf)))]
+                 (when (:workflow/metadata wf) (metadata-html (:workflow/metadata wf)))
+                 (system-html wf)]
                 [:div.page-head
                  [:h2 "Timeline"]
                  (when (seq events)

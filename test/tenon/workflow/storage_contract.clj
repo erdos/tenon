@@ -21,7 +21,9 @@
    :workflow/state-changed-at     int?
    :workflow/expires-at           (nilable int?)
    :workflow/metadata             (nilable string?)
-   :workflow/result               (nilable string?)})
+   :workflow/result               (nilable string?)
+   :workflow/version              (nilable string?)
+   :workflow/system-metadata      (nilable string?)})
 
 (def get-workflow-shape
   "get-workflow rows."
@@ -69,13 +71,15 @@
   (testing "init-db! returns the storage"
     (is (identical? storage (db/init-db! storage))))
   (let [root (db/insert-workflow! storage "contract/root" "[1]" nil "{:actor 1}" 60000)
-        child (db/insert-workflow! storage "contract/child" "[2]" root nil nil)
+        child (db/insert-workflow! storage "contract/child" "1" "[2]" root nil "{:code-hash \"c1\"}" nil)
         failing (db/insert-workflow! storage "contract/failing" "[3]" root nil nil)
         failed (db/insert-workflow! storage "contract/failed" "[5]" nil nil nil)
         expiring (db/insert-workflow! storage "contract/expiring" "[4]" nil nil 0)]
     (testing "insert-workflow! returns the invocation id, nil for an existing workflow"
       (is (every? int? [root child failing failed expiring]))
-      (is (nil? (db/insert-workflow! storage "contract/root" "[1]" nil nil nil))))
+      (is (nil? (db/insert-workflow! storage "contract/root" "[1]" nil nil nil)))
+      (is (nil? (db/insert-workflow! storage "contract/child" "1" "[2]" root nil nil nil)) "nor for an existing version")
+      (is (int? (db/insert-workflow! storage "contract/child" "2" "[2]" root nil nil nil)) "but for another one"))
     (testing "finish! returns whether it finished the invocation"
       (is (true? (db/finish! storage child "DONE" "42")))
       (is (true? (db/finish! storage failing "ERROR" "{:message \"boom\"}")))
@@ -89,8 +93,10 @@
       (is (false? (db/time-out! storage root "{:message \"timed out\"}")))
       (is (true? (db/time-out! storage expiring "{:message \"timed out\"}"))))
     (testing "restart! returns the new invocation id, nil unless DONE, ERROR or TIMEOUT"
-      (is (int? (db/restart! storage failing "{:actor 2}" nil)))
-      (is (nil? (db/restart! storage failing nil nil))))
+      (is (int? (db/restart! storage failing "{:actor 2}" "{:code-hash \"f2\"}" nil)))
+      (is (nil? (db/restart! storage failing nil nil)))
+      (is (= "{:code-hash \"f2\"}" (:workflow/system-metadata (db/get-workflow storage failing)))
+          "restart! records the new system metadata"))
     (testing "record-reuse! returns nil"
       (is (nil? (db/record-reuse! storage child root "{:actor 3}")))
       (is (nil? (db/record-reuse! storage child nil nil))))
@@ -98,9 +104,13 @@
     (let [ids [root child failing expiring]]
       (check-rows "get-workflow" get-workflow-shape (mapv #(db/get-workflow storage %) ids))
       (check-rows "find-by-wf-def-and-params" workflow-shape
-                  (mapv #(db/find-by-wf-def-and-params storage %1 %2)
+                  (mapv #(db/find-by-wf-def-and-params storage %1 %2 %3)
                         ["contract/root" "contract/child" "contract/failing" "contract/expiring"]
+                        [nil "1" nil nil]
                         ["[1]" "[2]" "[3]" "[4]"]))
+      (testing "the shorter find-by-wf-def-and-params finds the unversioned workflow"
+        (is (= root (:workflow/invocation-id (db/find-by-wf-def-and-params storage "contract/root" "[1]"))))
+        (is (nil? (db/find-by-wf-def-and-params storage "contract/child" "[2]"))))
       (testing "a missing workflow is nil"
         (is (nil? (db/get-workflow storage Long/MAX_VALUE)))
         (is (nil? (db/find-by-wf-def-and-params storage "contract/none" "[]")))))

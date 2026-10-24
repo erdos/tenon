@@ -58,6 +58,25 @@ To change it, pass a `:tenon/metadata-fn` when initializing the engine. It is ca
 
 The function runs once per call: for a call that reuses a stored result, the metadata describes the reusing call, and a restart replaces the metadata with the restarting call's.
 
+## Versions
+
+A call reuses the stored result of an earlier call with the same args, even after the function's code changed. To make calls run anew instead, give the function a `:version` - any EDN value - and bump it when the change should invalidate earlier results:
+
+```clojure
+#workflow
+(defn charge-card
+  {:version 2}
+  [customer-id idempotency-key amount]
+  ...)
+```
+
+The version is part of the workflow's identity, with its name and args: results recorded under another version (or none) are left alone, and stay in the history. Functions without a `:version` are unversioned, which is what every workflow recorded before versions existed is too - so they keep their results until a `:version` is added.
+
+Code changes without a version bump are not ignored either: each invocation records system metadata - a hash of the function's code (`:code-hash`, insensitive to formatting, comments and the docstring) and its parameter lists (`:arglists`). Both show up in the web UI.
+
+- **Reuse across a code change** - the result is reused, as the version is the same, but a `:code-changed` event (with `:recorded-code-hash` and `:code-hash`) warns about it.
+- **Restart** runs the current code with the stored args, so it is refused when that can't work: when the function's version differs from the one the workflow was recorded under (`::version-mismatch` - call it again to run the new version), or when the stored args don't fit its parameter lists any more (`::signature-mismatch`). A renamed parameter restarts fine.
+
 ## State transitions
 
 ```mermaid

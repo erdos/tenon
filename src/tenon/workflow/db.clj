@@ -11,6 +11,15 @@
    running it. Every history row carries the parent_invocation_id it was
    recorded under - for REUSED rows, the reusing caller's.
 
+   A workflow's identity is (wf_def, version, params): version is the EDN
+   of the workflow fn's :version (nil when it has none), so bumping it
+   makes calls run anew instead of reusing results recorded under the old
+   one. Each invocation also stores system metadata next to the caller's
+   metadata: the EDN of what tenon itself records about the code it ran
+   (see tenon.workflow/system-metadata), nil if none. Rows carry both, as
+   :workflow/version and :workflow/system-metadata (the current
+   invocation's).
+
    Rows returned by the methods below are maps whose keys are the column
    names in kebab-case, qualified with :workflow - e.g. :workflow/name,
    :workflow/invocation-id, :workflow/state-changed-at. Arguments and filter
@@ -26,10 +35,14 @@
 
   (insert-workflow!
     [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    [this wf-def version-edn-str params-edn-str parent-invocation-id metadata-edn-str system-metadata-edn-str
+     timeout-ms]
     "Inserts a STARTED workflow row, unless one already exists for this exact
-     (wf_def, params) pair, in which case nothing is inserted. Its lease
-     expires timeout-ms after now (nil: never). Returns the new row's
-     invocation_id, or nil if nothing was inserted.")
+     (wf_def, version, params) triple, in which case nothing is inserted.
+     Its lease expires timeout-ms after now (nil: never). system-metadata-edn-str
+     is stored with this invocation, like metadata-edn-str. The shorter
+     arity inserts an unversioned workflow with no system metadata. Returns
+     the new row's invocation_id, or nil if nothing was inserted.")
 
   (finish! [this invocation-id state result-edn-str]
     "Moves invocation-id from STARTED to state (DONE or ERROR) with
@@ -41,10 +54,14 @@
     "Like finish! with state TIMEOUT, but only if the lease of invocation-id
      has also expired. Returns true if the row was updated.")
 
-  (restart! [this invocation-id metadata-edn-str timeout-ms]
+  (restart!
+    [this invocation-id metadata-edn-str timeout-ms]
+    [this invocation-id metadata-edn-str system-metadata-edn-str timeout-ms]
     "Moves invocation-id from DONE, ERROR or TIMEOUT back to STARTED under a new,
      larger invocation_id, clearing its result, replacing its metadata and
-     leasing it for timeout-ms (nil: never expires). Returns the new
+     system metadata (the shorter arity: with none) and leasing it for
+     timeout-ms (nil: never expires). Its version stays: it is part of the
+     workflow's identity. Returns the new
      invocation_id, or nil if invocation-id is no longer DONE, ERROR or TIMEOUT
      (e.g. a concurrent restart got there first).")
 
@@ -62,7 +79,11 @@
      row also carries :workflow/expired true if its lease has run out (by the storage's
      clock), so time-out! would succeed.")
 
-  (find-by-wf-def-and-params [this wf-def params-edn-str])
+  (find-by-wf-def-and-params
+    [this wf-def params-edn-str]
+    [this wf-def version-edn-str params-edn-str]
+    "The workflow row of this exact (wf_def, version, params) triple, or
+     nil. The shorter arity finds the unversioned one.")
 
   (top-level-workflows
     [this]

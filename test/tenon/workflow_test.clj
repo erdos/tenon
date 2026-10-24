@@ -332,10 +332,12 @@
   (let [real-insert-workflow! db/insert-workflow!
         calls (atom 0)]
     (with-redefs [db/insert-workflow!
-                  (fn [ds wf-def params-str parent-id meta-str timeout-ms]
-                    (db/finish! ds (real-insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms)
+                  (fn [ds wf-def version-str params-str parent-id meta-str system-meta-str timeout-ms]
+                    (db/finish! ds (real-insert-workflow! ds wf-def version-str params-str parent-id meta-str
+                                                          system-meta-str timeout-ms)
                                 "DONE" (pr-str :winner-result))
-                    (real-insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms))]
+                    (real-insert-workflow! ds wf-def version-str params-str parent-id meta-str system-meta-str
+                                           timeout-ms))]
       (let [result (engine/run-invocation #'dedup-fn
                                            (fn [x] (swap! calls inc) (* x 10))
                                            [999])]

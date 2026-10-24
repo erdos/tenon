@@ -1,5 +1,6 @@
 (ns tenon.workflow.sqlite-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
+            [matcher-combinators.test :refer [match?]]
             [next.jdbc :as jdbc]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
@@ -71,13 +72,47 @@
     (fn [path]
       (with-open [ds (sqlite/datasource path)]
         (db/init-db! ds)
-        (with-redefs [sqlite/idempotence-key (fn ^long [^String _ ^String _] 42)]
+        (with-redefs [sqlite/idempotence-key (fn ^long [^String _ ^String _ ^String _] 42)]
           (let [a (db/insert-workflow! ds "test.ns/a" "[1]" nil nil nil)
                 b (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)
-                c (db/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)]
-            (is (every? int? [a b c]) "colliding keys don't make them the same workflow")
-            (is (= 3 (count (distinct [a b c]))))
+                c (db/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)
+                d (db/insert-workflow! ds "test.ns/a" "2" "[1]" nil nil nil nil)]
+            (is (every? int? [a b c d]) "colliding keys don't make them the same workflow")
+            (is (= 4 (count (distinct [a b c d]))))
             (is (nil? (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)) "but the same one is still found")
+            (is (nil? (db/insert-workflow! ds "test.ns/a" "2" "[1]" nil nil nil nil)) "versioned too")
             (is (= [a b c] (mapv #(:workflow/invocation-id (db/find-by-wf-def-and-params ds %1 %2))
                                  ["test.ns/a" "test.ns/a" "test.ns/c"] ["[1]" "[2]" "[1]"])))
+            (is (= d (:workflow/invocation-id (db/find-by-wf-def-and-params ds "test.ns/a" "2" "[1]"))))
+            (is (nil? (db/find-by-wf-def-and-params ds "test.ns/a" "3" "[1]")))
             (is (nil? (db/find-by-wf-def-and-params ds "test.ns/c" "[2]")))))))))
+
+(deftest version-migration-test
+  ;; A database from before versions: no version and system_metadata
+  ;; columns, and the old new_workflow view. Its workflows are unversioned.
+  (with-temp-db
+    (fn [path]
+      (with-open [ds (sqlite/datasource path)]
+        (db/init-db! ds)
+        (db/finish! ds (db/insert-workflow! ds "test.ns/old" "[1]" nil nil nil) "DONE" ":old"))
+      (jdbc/execute! (jdbc/get-datasource (str "jdbc:sqlite:" path))
+                     ["DROP VIEW new_workflow"])
+      (with-open [c (jdbc/get-connection (jdbc/get-datasource (str "jdbc:sqlite:" path)))]
+        (doseq [ddl ["ALTER TABLE workflow DROP COLUMN version"
+                     "ALTER TABLE event DROP COLUMN system_metadata"
+                     "CREATE VIEW new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at,
+                                                expires_at)
+                        AS SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL WHERE 0"]]
+          (jdbc/execute! c [ddl])))
+      (with-open [ds (sqlite/datasource path)]
+        (db/init-db! ds)
+        (let [old (db/find-by-wf-def-and-params ds "test.ns/old" "[1]")]
+          (is (= ":old" (:workflow/result old)) "the old workflow is found, unversioned")
+          (is (nil? (:workflow/version old))))
+        (is (nil? (db/insert-workflow! ds "test.ns/old" "[1]" nil nil nil)) "and still taken")
+        (let [id (db/insert-workflow! ds "test.ns/old" "2" "[1]" nil nil "{:code-hash \"h\"}" nil)]
+          (is (int? id) "another version is a workflow of its own")
+          (is (match? {:workflow/version "2" :workflow/system-metadata "{:code-hash \"h\"}"}
+                      (db/get-workflow ds id))))
+        (testing "init-db! of the migrated database changes nothing"
+          (is (identical? ds (db/init-db! ds))))))))

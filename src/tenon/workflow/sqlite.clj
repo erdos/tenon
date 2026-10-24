@@ -12,8 +12,8 @@
      results) are stored here, once. States are small integers (see
      `states`): 0 and 1, the most common, take no space at all.
    - workflow: one row per workflow, keyed by its first invocation id,
-     maintained by triggers on event: its identity (wf_def, params, the
-     64-bit hash of both, its caller), its current invocation, state and
+     maintained by triggers on event: its identity (wf_def, version,
+     params, the 64-bit hash of the three, its caller), its current invocation, state and
      lease, and the heads of its event lists. It holds everything a read
      needs but the payloads, so a workflow's current state is this row
      plus its current events. The lease is the one value written in place
@@ -21,8 +21,8 @@
    - wf_def: the distinct wf_def names, so rows carry a small integer
      instead of the name, and the dropdown lists a handful of rows.
 
-   Idempotence is an index on the 64-bit hash of (wf_def, params): the
-   lookup compares the params too, so a hash collision costs a row read,
+   Idempotence is an index on the 64-bit hash of (wf_def, version,
+   params): the lookup compares all three too, so a hash collision costs a row read,
    never a wrong answer. Uniqueness is guaranteed by the insert itself,
    which checks and inserts in one statement.
 
@@ -65,7 +65,7 @@
     ;; the columns of a workflow's current state but its parent, as read
     ;; by current-row-fn
     ["{{current-columns}}" "w.invocation_id, d.name, w.params, w.state, s.occurred_at, w.expires_at, i.data,
-                            iif(w.state = {{STARTED}}, NULL, s.data)"]
+                            iif(w.state = {{STARTED}}, NULL, s.data), w.version, i.system_metadata"]
     ;; the joins resolving the workflow row aliased w to its current
     ;; state: s its state event, i its invocation's (STARTED) event, d its
     ;; wf_def
@@ -96,10 +96,14 @@
         h))))
 
 (defn- idempotence-key
-  "A 64-bit hash of (wf-def, params): FNV-1a over the chars of both,
-   finished with MurmurHash3's fmix64 so every bit depends on every char."
-  ^long [^String wf-def ^String params]
-  (let [h (hash-chars (hash-chars -3750763034362895579 wf-def) params)
+  "A 64-bit hash of (wf-def, version, params): FNV-1a over the chars of
+   the three, finished with MurmurHash3's fmix64 so every bit depends on
+   every char. A nil version (unversioned) adds nothing, so the keys of
+   unversioned workflows are those of before versions existed."
+  ^long [^String wf-def ^String version ^String params]
+  (let [h (hash-chars -3750763034362895579 wf-def)
+        h (if version (hash-chars (hash-chars h "\u0000") version) h)
+        h (hash-chars h params)
         h (unchecked-multiply (bit-xor h (unsigned-bit-shift-right h 33)) -49064778989728563)
         h (unchecked-multiply (bit-xor h (unsigned-bit-shift-right h 33)) -4265267296055464877)]
     (bit-xor h (unsigned-bit-shift-right h 33))))
@@ -120,6 +124,7 @@
       state                INTEGER NOT NULL CHECK (state BETWEEN {{STARTED}} AND {{REUSED}}), -- see states
       occurred_at          INTEGER NOT NULL,
       data                 TEXT,     -- metadata (STARTED, REUSED) or result (DONE, ERROR, TIMEOUT)
+      system_metadata      TEXT,     -- STARTED: tenon's own metadata of the code run
       invocation_id        INTEGER,  -- DONE, ERROR, TIMEOUT, REUSED: the invocation finished or reused
       expires_at           INTEGER,  -- STARTED: the lease it was started with
       parent_invocation_id INTEGER,  -- calls: the caller's invocation
@@ -140,7 +145,7 @@
       ON event(parent_invocation_id) WHERE wf_def_id IS NOT NULL AND parent_invocation_id IS NULL"
    "CREATE TABLE IF NOT EXISTS workflow (
       id                   INTEGER PRIMARY KEY,  -- its first invocation id
-      key                  INTEGER NOT NULL,     -- idempotence-key of (wf_def, params)
+      key                  INTEGER NOT NULL,     -- idempotence-key of (wf_def, version, params)
       wf_def_id            INTEGER NOT NULL,
       parent_invocation_id INTEGER,              -- the caller of its first invocation
       invocation_id        INTEGER NOT NULL,     -- the current invocation (its STARTED event)
@@ -149,6 +154,7 @@
       expires_at           INTEGER,              -- while STARTED: the lease
       last_reuse_id        INTEGER,              -- its latest REUSED event, head of their prev_id list
       last_call_id         INTEGER,              -- the latest call it made, head of the prev_call_id list
+      version              TEXT,                 -- the workflow fn's :version, nil if it has none
       params               TEXT    NOT NULL      -- last, as it may be large
     ) STRICT"
    "CREATE INDEX IF NOT EXISTS workflow_key ON workflow(key)"
@@ -181,24 +187,26 @@
    ;; key, logs the first event (whose id the INSERT computes, RETURNING
    ;; it) and creates the workflow row. RAISE(IGNORE) drops the row, so a
    ;; taken key returns nothing.
-   "CREATE VIEW IF NOT EXISTS new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at, expires_at)
-      AS SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL WHERE 0"
+   "CREATE VIEW IF NOT EXISTS new_workflow (key, id, wf_def, version, params, parent_invocation_id, metadata,
+                                            system_metadata, occurred_at, expires_at)
+      AS SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL WHERE 0"
    "CREATE TRIGGER IF NOT EXISTS new_workflow INSTEAD OF INSERT ON new_workflow
     BEGIN
       SELECT RAISE(IGNORE) FROM workflow w JOIN wf_def d ON d.id = w.wf_def_id
-       WHERE w.key = NEW.key AND w.params = NEW.params AND d.name = NEW.wf_def;
+       WHERE w.key = NEW.key AND w.params = NEW.params AND w.version IS NEW.version AND d.name = NEW.wf_def;
       INSERT INTO wf_def (name, top_level) VALUES (NEW.wf_def, NEW.parent_invocation_id IS NULL)
         ON CONFLICT (name) DO UPDATE SET top_level = 1 WHERE excluded.top_level AND NOT top_level;
-      INSERT INTO event (id, workflow_id, state, occurred_at, data, expires_at, parent_invocation_id, wf_def_id,
-                         prev_call_id)
-      VALUES (NEW.id, NEW.id, {{STARTED}}, NEW.occurred_at, NEW.metadata, NEW.expires_at, NEW.parent_invocation_id,
+      INSERT INTO event (id, workflow_id, state, occurred_at, data, system_metadata, expires_at, parent_invocation_id,
+                         wf_def_id, prev_call_id)
+      VALUES (NEW.id, NEW.id, {{STARTED}}, NEW.occurred_at, NEW.metadata, NEW.system_metadata, NEW.expires_at,
+              NEW.parent_invocation_id,
               (SELECT id FROM wf_def WHERE name = NEW.wf_def),
               (SELECT w.last_call_id FROM event p JOIN workflow w ON w.id = p.workflow_id
                 WHERE p.id = NEW.parent_invocation_id));
       INSERT INTO workflow (id, key, wf_def_id, parent_invocation_id, invocation_id, state, state_id, expires_at,
-                            params)
+                            version, params)
       VALUES (NEW.id, NEW.key, (SELECT id FROM wf_def WHERE name = NEW.wf_def), NEW.parent_invocation_id,
-              NEW.id, {{STARTED}}, NEW.id, NEW.expires_at, NEW.params);
+              NEW.id, {{STARTED}}, NEW.id, NEW.expires_at, NEW.version, NEW.params);
       UPDATE workflow SET last_call_id = NEW.id
        WHERE id = (SELECT workflow_id FROM event WHERE id = NEW.parent_invocation_id);
     END"]))
@@ -215,6 +223,8 @@
            :workflow/expires-at (int-or-nil-at %)
            :workflow/metadata (text-at %)
            :workflow/result (text-at %)
+           :workflow/version (text-at %)
+           :workflow/system-metadata (text-at %)
            ~@kvs))
 
 (def ^:private read-state
@@ -379,8 +389,25 @@
          (let [sql (sql)] (.put ^ConcurrentHashMap calls-sql-cache shape sql) sql))
      params]))
 
+(def ^:private needs-version-migration-sql
+  "Whether the database predates versions: it has a workflow table, but
+   without the version column."
+  "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'workflow')
+      AND NOT EXISTS (SELECT 1 FROM pragma_table_info('workflow') WHERE name = 'version')")
+
+(def ^:private version-migration
+  "Brings a database from before versions up to date: adds the columns
+   (at the end - ALTER TABLE can't put them anywhere else) and drops the
+   new_workflow view, and with it its trigger, for the schema to recreate
+   them with the new columns. Existing workflows are unversioned, and keep
+   their keys (see idempotence-key)."
+  {:alter ["ALTER TABLE workflow ADD COLUMN version TEXT"
+           "ALTER TABLE event ADD COLUMN system_metadata TEXT"]
+   :drop ["DROP VIEW IF EXISTS new_workflow"]})
+
 (defn- init-schema!
-  "Creates the schema in a single transaction that takes the write lock up
+  "Creates the schema - migrating a database from before versions first,
+   see version-migration - in a single transaction that takes the write lock up
    front. A deferred one reads first, and cannot then upgrade to a write if
    another process committed meanwhile (SQLite fails it at once, whatever
    the busy timeout) - while this way, of several processes starting at
@@ -392,6 +419,14 @@
    (fn [c]
      (pool/execute! c "BEGIN IMMEDIATE")
      (try
+       (when (= 1 (first (pool/query c needs-version-migration-sql [] read-id)))
+         ;; ALTER TABLE ADD COLUMN goes through query: the driver's
+         ;; executeUpdate refuses it ("Query returns results") - and
+         ;; executeQuery refuses the DROP VIEW.
+         (doseq [ddl (:alter version-migration)]
+           (pool/query c ddl [] read-id))
+         (doseq [ddl (:drop version-migration)]
+           (pool/execute! c ddl)))
        (doseq [ddl schema]
          (pool/execute! c ddl))
        (pool/execute! c "COMMIT")
@@ -400,14 +435,15 @@
          (throw e))))))
 
 (def ^:private insert-sql
-  (sql "INSERT INTO new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at, expires_at)
-       SELECT ?, coalesce(max(id), 0) + 1, ?, ?, ?, ?, {{now}}, {{now}} + ?
+  (sql "INSERT INTO new_workflow (key, id, wf_def, version, params, parent_invocation_id, metadata, system_metadata,
+                                  occurred_at, expires_at)
+       SELECT ?, coalesce(max(id), 0) + 1, ?, ?, ?, ?, ?, ?, {{now}}, {{now}} + ?
          FROM event
        RETURNING id"))
 
 (def ^:private restart-sql
-  (sql "INSERT INTO event (workflow_id, state, occurred_at, data, expires_at, prev_id)
-       SELECT w.id, {{STARTED}}, {{now}}, ?, {{now}} + ?, w.state_id
+  (sql "INSERT INTO event (workflow_id, state, occurred_at, data, system_metadata, expires_at, prev_id)
+       SELECT w.id, {{STARTED}}, {{now}}, ?, ?, {{now}} + ?, w.state_id
          FROM event i
          JOIN workflow w ON w.id = i.workflow_id
         WHERE i.id = ? AND w.invocation_id = i.id AND w.state <> {{STARTED}}
@@ -492,10 +528,14 @@
     (init-schema! this)
     this)
 
-  (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (first (write! this insert-sql
-                   [(idempotence-key wf-def params-edn-str) wf-def params-edn-str
-                    parent-invocation-id metadata-edn-str timeout-ms])))
+  (insert-workflow!
+    ([this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+     (db/insert-workflow! this wf-def nil params-edn-str parent-invocation-id metadata-edn-str nil timeout-ms))
+    ([this wf-def version-edn-str params-edn-str parent-invocation-id metadata-edn-str system-metadata-edn-str
+      timeout-ms]
+     (first (write! this insert-sql
+                    [(idempotence-key wf-def version-edn-str params-edn-str) wf-def version-edn-str params-edn-str
+                     parent-invocation-id metadata-edn-str system-metadata-edn-str timeout-ms]))))
 
   (finish! [this invocation-id state result-edn-str]
     (finish! this invocation-id state result-edn-str false))
@@ -503,9 +543,12 @@
   (time-out! [this invocation-id result-edn-str]
     (finish! this invocation-id "TIMEOUT" result-edn-str true))
 
-  (restart! [this invocation-id metadata-edn-str timeout-ms]
-    (first (write! this restart-sql
-                   [metadata-edn-str timeout-ms invocation-id])))
+  (restart!
+    ([this invocation-id metadata-edn-str timeout-ms]
+     (db/restart! this invocation-id metadata-edn-str nil timeout-ms))
+    ([this invocation-id metadata-edn-str system-metadata-edn-str timeout-ms]
+     (first (write! this restart-sql
+                    [metadata-edn-str system-metadata-edn-str timeout-ms invocation-id]))))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
     (write! this reuse-sql
@@ -517,12 +560,18 @@
                        (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
                                        :workflow/expired (.getBoolean %)))))
 
-  (find-by-wf-def-and-params [this wf-def params-edn-str]
-    ;; The rows with the key - all but never more than one - are told apart
-    ;; by their name and params here, rather than by binding both to the
-    ;; statement too.
-    (some #(when (and (= params-edn-str (:workflow/params %)) (= wf-def (:workflow/name %))) %)
-          (pool/query this find-sql [(idempotence-key wf-def params-edn-str)] read-state)))
+  (find-by-wf-def-and-params
+    ([this wf-def params-edn-str]
+     (db/find-by-wf-def-and-params this wf-def nil params-edn-str))
+    ([this wf-def version-edn-str params-edn-str]
+     ;; The rows with the key - all but never more than one - are told
+     ;; apart by their name, version and params here, rather than by
+     ;; binding them to the statement too.
+     (some #(when (and (= params-edn-str (:workflow/params %))
+                       (= version-edn-str (:workflow/version %))
+                       (= wf-def (:workflow/name %)))
+              %)
+           (pool/query this find-sql [(idempotence-key wf-def version-edn-str params-edn-str)] read-state))))
 
   (top-level-workflows
     ([this]

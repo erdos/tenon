@@ -61,10 +61,10 @@
 (defn insert!
   "Inserts a STARTED workflow row for tests setting up a workflow's history,
    returning its invocation id. opts: :params (an edn string, \"[]\" by
-   default), :parent, :metadata and :timeout-ms (nil by default - never
-   expires)."
-  [wf-def & {:keys [params parent metadata timeout-ms] :or {params "[]"}}]
-  (db/insert-workflow! (ds) wf-def params parent metadata timeout-ms))
+   default), :parent, :metadata, :version, :system-metadata (edn strings)
+   and :timeout-ms (nil by default - never expires)."
+  [wf-def & {:keys [params parent metadata version system-metadata timeout-ms] :or {params "[]"}}]
+  (db/insert-workflow! (ds) wf-def version params parent metadata system-metadata timeout-ms))
 
 (defn finish!
   "Moves STARTED invocation-id to state (DONE or ERROR) with result, an edn

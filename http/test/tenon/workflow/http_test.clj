@@ -245,6 +245,21 @@
     (-> (visit (href id))
         (has (missing? (panel "Metadata"))))))
 
+(deftest workflow-detail-page-shows-version-and-system-metadata-test
+  (let [id (test-util/insert! "test.ns/versioned" :version "3"
+                              :system-metadata (pr-str {:code-hash "abc" :arglists '([a b])}))]
+    (-> (visit (href id))
+        (has (heading? "System"))
+        (within (panel "System")
+          (has (texts? [:dt] [":version" ":arglists" ":code-hash"]))
+          (has (texts? (conj (dd-of ":version") :pre) ["3"]))
+          (has (texts? (conj (dd-of ":code-hash") :pre) ["\"abc\""]))))))
+
+(deftest workflow-detail-page-hides-system-section-when-absent-test
+  (let [id (test-util/insert! "test.ns/unversioned")]
+    (-> (visit (href id))
+        (has (missing? (panel "System"))))))
+
 (deftest workflow-detail-page-shows-error-test
   (let [id (test-util/insert! "test.ns/failed")]
     (test-util/finish! id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))

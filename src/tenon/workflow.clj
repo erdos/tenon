@@ -1,13 +1,24 @@
 (ns tenon.workflow
   (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.walk :as walk]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
             [tenon.workflow.timeout :as timeout])
-  (:import [java.io Closeable]))
+  (:import [java.io Closeable]
+           [java.nio.charset StandardCharsets]
+           [java.security MessageDigest]))
 
-(defn register! [v raw-fn]
-  (doto v (alter-meta! assoc ::raw-fn raw-fn)))
+(defn register!
+  "Makes raw-fn the implementation of the workflow var v. code-hash
+   identifies raw-fn's code (see code-hash) - the #workflow reader passes
+   it; without one the code is unknown, so reusing a result can't tell
+   whether the code changed since."
+  ([v raw-fn] (register! v raw-fn nil))
+  ([v raw-fn code-hash]
+   (doto v (alter-meta! #(cond-> (assoc % ::raw-fn raw-fn)
+                           code-hash (assoc ::code-hash code-hash)
+                           (not code-hash) (dissoc ::code-hash))))))
 
 (defn raw-fn [v] (::raw-fn (meta v)))
 
@@ -49,7 +60,9 @@
    renewing it, before the next call of the same wf+params, a restart or a
    sweep moves it to TIMEOUT; nil never times out) and
    :tenon/on-event (a 2-arg fn (fn [event data]), never nil - does nothing by default,
-   called on :started, :restarted, :done, :error, :reused, :timed-out,
+   called on :started, :restarted, :done, :error, :reused, :code-changed
+   - a reused result was recorded by other code of the same version, see
+   system-metadata - :timed-out,
    :lease-lost - a running invocation found timed out or restarted by
    someone else - and :heartbeat-error and :sweep-error) and
    :tenon/metadata-fn (a 2-arg fn (fn [wf-type args]) returning the
@@ -132,6 +145,70 @@
   [{metadata-fn :tenon/metadata-fn} wf-type args]
   (metadata-fn wf-type (vec args)))
 
+(defn- normalize-gensyms
+  "form with the generated part of every auto-generated symbol's name
+   (p1__123#, x__123__auto__, ...) replaced by the same placeholder - it
+   differs every time the code is read."
+  [form]
+  (walk/postwalk
+   (fn [x]
+     (if (and (symbol? x) (nil? (namespace x)))
+       (let [n (name x)
+             n' (str/replace n #"__\d+(__auto__|#)$" "__0$1")]
+         (if (= n n') x (with-meta (symbol n') (meta x))))
+       x))
+   form))
+
+(defn code-hash
+  "A hash identifying fn-form, the code of a workflow fn: hex of the
+   SHA-256 of its printed form - without metadata (so not its position in
+   the file) and with auto-generated symbols normalized, so it is the
+   same each time the code is read, and on every JVM. The #workflow
+   reader hashes the fn the defn expands to, which leaves out the
+   docstring and the attribute map."
+  [fn-form]
+  (let [printed (binding [*print-meta* false *print-length* nil *print-level* nil]
+                  (pr-str (normalize-gensyms fn-form)))
+        digest (.digest (MessageDigest/getInstance "SHA-256") (.getBytes printed StandardCharsets/UTF_8))]
+    (apply str (map #(format "%02x" %) digest))))
+
+(defn version
+  "The version of the workflow var v - its :version metadata, nil if it
+   has none:
+
+     #workflow
+     (defn charge-card {:version 2} [customer-id amount] ...)
+
+   It is part of the workflow's identity, with its name and args: a call
+   reuses only a result recorded under the same version, so bumping it
+   makes calls run anew. Any EDN value will do."
+  [v]
+  (:version (meta v)))
+
+(defn system-metadata
+  "What tenon records with each invocation of the workflow var v about the
+   code it runs, nil if nothing is known:
+
+     :code-hash - see code-hash; a call reusing a result recorded under
+                  another one emits :code-changed
+     :arglists  - the fn's parameter lists"
+  [v]
+  (let [m (meta v)
+        sm (cond-> {}
+             (::code-hash m) (assoc :code-hash (::code-hash m))
+             (:arglists m) (assoc :arglists (:arglists m)))]
+    (when (seq sm) sm)))
+
+(defn- accepts-arg-count?
+  "Whether a fn with arglists can be called with n args - true when the
+   arglists are unknown."
+  [arglists n]
+  (or (empty? arglists)
+      (boolean (some (fn [params]
+                       (let [[fixed variadic] (split-with #(not= '& %) params)]
+                         (if (seq variadic) (>= n (count fixed)) (= n (count fixed)))))
+                     arglists))))
+
 (defn- execute-and-record!
   "Runs raw-fn with args as invocation-id, which the caller has already
    recorded as STARTED, and records how it ended - unless it was timed out
@@ -209,7 +286,7 @@
   "Awaits the invocation-id run started by someone else, logs that the
    current caller - under parent-id with metadata - reused it, then returns
    its result, or throws describing its failure."
-  [{ds :tenon/db :as engine} invocation-id parent-id metadata]
+  [{ds :tenon/db :as engine} invocation-id parent-id metadata code-hash]
   (when (some #{invocation-id} *invocation-stack*)
     (throw (ex-info "Cycle detected: workflow is already running on the current call stack"
                     {:type ::cycle-detected
@@ -217,6 +294,16 @@
                      :invocation-stack *invocation-stack*})))
   (let [wf (await-finished engine invocation-id)]
     (db/record-reuse! ds (:workflow/invocation-id wf) parent-id (some-> metadata safe-pr-str))
+    (let [recorded-hash (try (some-> (:workflow/system-metadata wf) edn/read-string :code-hash)
+                             ;; e.g. arglists with a regex default: no hash to compare
+                             (catch Exception _ nil))]
+      (when (and code-hash recorded-hash (not= code-hash recorded-hash))
+        (emit! engine :code-changed {:invocation-id (:workflow/invocation-id wf)
+                                     :parent-invocation-id parent-id
+                                     :wf-def (:workflow/name wf)
+                                     :version (some-> (:workflow/version wf) edn/read-string)
+                                     :recorded-code-hash recorded-hash
+                                     :code-hash code-hash})))
     (emit! engine :reused {:invocation-id (:workflow/invocation-id wf)
                            :parent-invocation-id parent-id
                            :wf-def (:workflow/name wf)
@@ -244,22 +331,29 @@
    (let [ds (:tenon/db engine)
          timeout-ms (:tenon/timeout-ms engine)
          wf-def-str (str (symbol v))
+         version (version v)
+         version-str (some-> version safe-pr-str)
+         system-meta (system-metadata v)
          args-vec (vec args)
          params-str (safe-pr-str args-vec)
          parent-id (first *invocation-stack*)
          metadata (metadata-for engine (symbol v) args-vec)
-         meta-str (some-> metadata safe-pr-str)]
-     (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-       (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-       (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
+         meta-str (some-> metadata safe-pr-str)
+         reuse! #(reuse-existing-result! engine (:workflow/invocation-id %) parent-id metadata
+                                         (:code-hash system-meta))]
+     (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str version-str params-str)]
+       (reuse! existing)
+       (if-let [invocation-id (db/insert-workflow! ds wf-def-str version-str params-str parent-id meta-str
+                                                   (some-> system-meta safe-pr-str) timeout-ms)]
          (do (emit! engine :started {:invocation-id invocation-id
                                      :parent-invocation-id parent-id
                                      :wf-def wf-def-str
+                                     :version version
                                      :args args-vec
                                      :metadata metadata})
              (execute-and-record! engine invocation-id wf-def-str raw-fn args))
-         (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-           (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
+         (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str version-str params-str)]
+           (reuse! existing)
            (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
                             {:type ::race-condition :wf-def wf-def-str}))))))))
 
@@ -292,6 +386,10 @@
                                     if not STARTED or never expiring
      :workflow/metadata             string - EDN of the :tenon/metadata-fn
                                     result when started, or nil
+     :workflow/version              string - EDN of the workflow fn's
+                                    :version (see version), nil if it has none
+     :workflow/system-metadata      string - EDN of the system-metadata of
+                                    the code the current invocation ran, or nil
      :workflow/result               string - EDN of the return value (DONE) or
                                     of the failure's Throwable->map (ERROR) or of
                                      the timeout's description (TIMEOUT),
@@ -352,7 +450,10 @@
    past invocation ids) under a new invocation id, keeping its history.
    Requires it to be DONE, ERROR or TIMEOUT (or STARTED past its lease - see
    :tenon/timeout-ms in init), and its wf_def to currently be registered
-   in this process. engine defaults to *workflow-engine*, same as
+   in this process - at the version it was recorded under (else
+   ::version-mismatch: call it again to run the new version) and with
+   parameter lists its args fit (else ::signature-mismatch). It records the
+   system metadata of the code it runs. engine defaults to *workflow-engine*, same as
    run-invocation."
   ([invocation-id]
    (restart-invocation *workflow-engine* invocation-id))
@@ -378,17 +479,36 @@
                                    :wf-def (str wf-def-sym)})))
            impl (raw-fn v)
            args (edn/read-string (:workflow/params wf))
+           recorded-version (some-> (:workflow/version wf) edn/read-string)
+           ;; compared as stored, the way the lookup tells versions apart
+           _ (when (not= (:workflow/version wf) (some-> (version v) safe-pr-str))
+               (throw (ex-info (str "Cannot restart: workflow was recorded under version " (pr-str recorded-version)
+                                    ", the code is at version " (pr-str (version v))
+                                    " - call it again to run the new version")
+                               {:type ::version-mismatch
+                                :invocation-id invocation-id
+                                :recorded-version recorded-version
+                                :version (version v)})))
+           _ (when-not (accepts-arg-count? (:arglists (meta v)) (count args))
+               (throw (ex-info (str "Cannot restart: the code no longer takes " (count args) " args - its parameter lists are "
+                                    (pr-str (:arglists (meta v))))
+                               {:type ::signature-mismatch
+                                :invocation-id invocation-id
+                                :args args
+                                :arglists (:arglists (meta v))})))
            metadata (metadata-for engine wf-def-sym args)
-           meta-str (some-> metadata safe-pr-str)]
+           meta-str (some-> metadata safe-pr-str)
+           system-meta-str (some-> (system-metadata v) safe-pr-str)]
        ;; A concurrent restart may have restarted it since wf was read -
        ;; restarting only if it is still DONE/ERROR/TIMEOUT under the same
        ;; invocation id lets only one of them through.
-       (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) meta-str
+       (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) meta-str system-meta-str
                                               (:tenon/timeout-ms engine))]
          (do (emit! engine :restarted {:invocation-id new-invocation-id
                                        :previous-invocation-id (:workflow/invocation-id wf)
                                        :parent-invocation-id (:workflow/parent-invocation-id wf)
                                        :wf-def (:workflow/name wf)
+                                       :version recorded-version
                                        :args args
                                        :metadata metadata})
              (execute-and-record! engine new-invocation-id (:workflow/name wf) impl args))
@@ -427,4 +547,4 @@
          (def ~fname
            (fn [& args#]
              (run-invocation (var ~fname) raw-fn# args#)))
-         (register! (var ~fname) raw-fn#)))))
+         (register! (var ~fname) raw-fn# ~(code-hash fn-form))))))
