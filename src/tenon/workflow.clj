@@ -218,7 +218,27 @@
           (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id))))
     #(some-> in-flight deref (get (:workflow/invocation-id (db/get-workflow ds invocation-id))))))
 
-(defn- reuse-existing-result!
+(defn- reused-result
+  "Returns the result of wf - a DONE, ERROR or TIMEOUT row whose reuse by
+   the current caller, under parent-id with metadata, is logged - or
+   throws describing its failure."
+  [engine wf parent-id metadata]
+  (emit! engine :reused {:invocation-id (:workflow/invocation-id wf)
+                         :parent-invocation-id parent-id
+                         :wf-def (:workflow/name wf)
+                         :state (:workflow/state wf)
+                         :metadata metadata})
+  (cond
+    (done? wf) (edn/read-string (:workflow/result wf))
+    (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
+                   (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
+                                        (or (:cause failure) (:message failure)))
+                                   {:type ::previous-failure
+                                    :invocation-id (:workflow/invocation-id wf)
+                                    :state (:workflow/state wf)
+                                    :failure failure})))))
+
+(defn- reuse-running-result!
   "Awaits the invocation-id run started by someone else, logs that the
    current caller - under parent-id with metadata - reused it, then returns
    its result, or throws describing its failure."
@@ -230,20 +250,7 @@
                      :invocation-stack *invocation-stack*})))
   (let [wf (await-finished engine invocation-id)]
     (db/record-reuse! ds (:workflow/invocation-id wf) parent-id (some-> metadata safe-pr-str))
-    (emit! engine :reused {:invocation-id (:workflow/invocation-id wf)
-                           :parent-invocation-id parent-id
-                           :wf-def (:workflow/name wf)
-                           :state (:workflow/state wf)
-                           :metadata metadata})
-    (cond
-      (done? wf) (edn/read-string (:workflow/result wf))
-      (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
-                     (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
-                                          (or (:cause failure) (:message failure)))
-                                     {:type ::previous-failure
-                                      :invocation-id (:workflow/invocation-id wf)
-                                      :state (:workflow/state wf)
-                                      :failure failure}))))))
+    (reused-result engine wf parent-id metadata)))
 
 (defn run-invocation
   "Runs raw-fn with args, persisting the invocation.
@@ -262,19 +269,21 @@
          parent-id (first *invocation-stack*)
          metadata (metadata-for engine (symbol v) args-vec)
          meta-str (some-> metadata safe-pr-str)]
-     (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-       (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-       (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
-         (do (emit! engine :started {:invocation-id invocation-id
-                                     :parent-invocation-id parent-id
-                                     :wf-def wf-def-str
-                                     :args args-vec
-                                     :metadata metadata})
-             (execute-and-record! engine invocation-id wf-def-str raw-fn args))
-         (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-           (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-           (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
-                            {:type ::race-condition :wf-def wf-def-str}))))))))
+     ;; one storage call: it starts the workflow, or reuses its stored
+     ;; outcome - or finds it running, to be awaited
+     (let [{invocation-id :call/started reused :call/reused running :call/running}
+           (db/call! ds wf-def-str params-str parent-id meta-str timeout-ms)]
+       (cond
+         invocation-id (do (emit! engine :started {:invocation-id invocation-id
+                                                   :parent-invocation-id parent-id
+                                                   :wf-def wf-def-str
+                                                   :args args-vec
+                                                   :metadata metadata})
+                           (execute-and-record! engine invocation-id wf-def-str raw-fn args))
+         reused (reused-result engine reused parent-id metadata)
+         running (reuse-running-result! engine running parent-id metadata)
+         :else (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
+                               {:type ::race-condition :wf-def wf-def-str})))))))
 
 
 (defn sweep!

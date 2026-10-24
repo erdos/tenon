@@ -70,8 +70,8 @@
         pg-store (fn [label options]
                    {:name label
                     :open (fn [] (let [schema (str "bench_" (swap! schema-counter inc))]
-                                   (db/init-db! (postgres/storage (str base "&currentSchema=" schema options)
-                                                                  {:pool-size 16}))))
+                                   ;; as the library configures it: a pool of 10
+                                   (db/init-db! (postgres/storage (str base "&currentSchema=" schema options)))))
                     :size (fn [s] (:size (jdbc/execute-one! s ["SELECT sum(pg_total_relation_size(c.oid))::bigint AS size
                                                                  FROM pg_class c
                                                                  JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -117,6 +117,7 @@
 (defn- write-scenarios []
   [["start + finish a workflow, 1 thread" 1 1500 lifecycle!]
    ["start + finish a workflow, 16 threads" 16 600 lifecycle!]
+   ["start + finish a workflow, 64 threads" 64 150 lifecycle!]
    ["a workflow calling 3, reusing 1 (10 writes), 16 threads" 16 100 tree!]])
 
 ;; The engine
@@ -124,9 +125,9 @@
 (def ^:private engine-counter (atom 0))
 
 (defn- engine-scenarios []
-  [["engine: a nested call (6 storage calls), 16 threads" 16 200
+  [["engine: a nested call (4 storage calls), 16 threads" 16 200
     (fn [_ _ _] (fixtures/nested-parent (+ (* run-id 1000) (swap! engine-counter inc))))]
-   ["engine: a call reusing a stored result (2 storage calls), 16 threads" 16 500
+   ["engine: a call reusing a stored result (1 storage call), 16 threads" 16 500
     (fn [_ _ _] (fixtures/say-hi "again"))]])
 
 ;; Reads

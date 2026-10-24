@@ -47,8 +47,10 @@
    second one sees the first's row (the check compares wf_def and params
    too, so a key collision costs a row read, never a wrong answer). Every
    write is a single statement - a plain one, or a call of one of the
-   schema's functions - in a transaction of its own: one round trip, one
-   commit, and concurrent commits share their WAL flushes.
+   schema's functions - and concurrent ones share a transaction, so the
+   flush of its commit (tenon.workflow.postgres.group-commit). A call of a
+   workflow is one such write (call!): it starts the workflow, or logs the
+   reuse of its stored outcome.
 
    Reads follow pointers - and every list, e.g. from a page of calls to
    their workflows - by index lookups the planner has no choice about (see
@@ -66,10 +68,11 @@
    statement, in UTC epoch milliseconds."
   (:require [next.jdbc.protocols :as p]
             [tenon.workflow.db :as db]
+            [tenon.workflow.postgres.group-commit :as group-commit]
             [tenon.workflow.sqlite.jdbc :refer [int-at int-or-nil-at row-fn]])
   (:import [com.zaxxer.hikari HikariConfig HikariDataSource]
            [java.io Closeable]
-           [java.sql PreparedStatement ResultSet Types]
+           [java.sql Connection PreparedStatement ResultSet Types]
            [java.util.concurrent ConcurrentHashMap]
            [javax.sql DataSource]))
 
@@ -188,25 +191,64 @@
    ;; and looks sparse to the planner - this one stays dense.
    "CREATE INDEX IF NOT EXISTS workflow_failed ON {{s}}.workflow (state, id)
       WHERE state IN ({{ERROR}}, {{TIMEOUT}})"
-   ;; insert-workflow!: the key's advisory lock makes the check and the
-   ;; insert atomic. The wf_def is usually there already: then it is
-   ;; looked up, not upserted (an upsert would lock its row, serializing
-   ;; every insert of the wf_def).
-   "CREATE OR REPLACE FUNCTION {{s}}.insert_workflow(p_key bigint, p_wf_def text, p_params text, p_parent bigint,
-                                                     p_metadata text, p_timeout bigint)
-    RETURNS bigint LANGUAGE plpgsql AS $$
+   ;; call! and insert-workflow!: the key's advisory lock makes the check
+   ;; and the insert atomic. A workflow, once there, stays: so it is looked
+   ;; up first without the lock - which is held until the commit, and
+   ;; would queue up every call of a popular workflow. The wf_def is usually there already: then it
+   ;; is looked up, not upserted (an upsert would lock its row,
+   ;; serializing every insert of the wf_def). If the workflow exists, and
+   ;; p_reuse, its reuse is logged unless it is running; its row is
+   ;; returned either way. o_kind: 0 inserted, 1 reused, 2 running,
+   ;; 3 exists (not p_reuse).
+   "CREATE OR REPLACE FUNCTION {{s}}.call_workflow(p_key bigint, p_wf_def text, p_params text, p_parent bigint,
+                                                   p_metadata text, p_timeout bigint, p_reuse boolean)
+    RETURNS TABLE (o_kind smallint, o_invocation_id bigint, o_name text, o_params text, o_state smallint,
+                   o_state_changed_at bigint, o_expires_at bigint, o_metadata text, o_result text,
+                   o_parent_invocation_id bigint)
+    LANGUAGE plpgsql AS $$
     DECLARE
       v_now    bigint := {{now}};
+      v_wf     bigint;
       v_def    integer;
       v_top    boolean;
       v_caller bigint;
       v_id     bigint;
     BEGIN
-      PERFORM pg_advisory_xact_lock(p_key);
-      PERFORM FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
+      SELECT f.id INTO v_wf FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
        WHERE f.key = p_key AND f.params = p_params AND d.name = p_wf_def;
+      IF NOT FOUND THEN
+        PERFORM pg_advisory_xact_lock(p_key);
+        SELECT f.id INTO v_wf FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
+         WHERE f.key = p_key AND f.params = p_params AND d.name = p_wf_def;
+      END IF;
       IF FOUND THEN
-        RETURN NULL;
+        IF NOT p_reuse THEN
+          o_kind := 3;
+          RETURN NEXT;
+          RETURN;
+        END IF;
+        SELECT {{state-columns}}
+          INTO o_invocation_id, o_name, o_params, o_state, o_state_changed_at, o_expires_at, o_metadata,
+               o_result, o_parent_invocation_id
+          FROM {{s}}.workflow w {{state-joins}}
+         WHERE w.id = v_wf;
+        IF o_state = {{STARTED}} THEN
+          o_kind := 2;
+        ELSE
+          o_kind := 1;
+          SELECT workflow_id INTO v_caller FROM {{s}}.event WHERE id = p_parent;
+          INSERT INTO {{s}}.event (id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id,
+                                   caller_id, wf_def_id)
+          SELECT nextval('{{s}}.event_id_seq'), v_wf, {{REUSED}}, v_now, p_metadata, o_invocation_id, p_parent,
+                 v_caller, f.wf_def_id
+            FROM {{s}}.event f WHERE f.id = v_wf
+          RETURNING wf_def_id INTO v_def;
+          IF p_parent IS NULL THEN
+            UPDATE {{s}}.wf_def SET top_level = true WHERE id = v_def AND NOT top_level;
+          END IF;
+        END IF;
+        RETURN NEXT;
+        RETURN;
       END IF;
       SELECT id, top_level INTO v_def, v_top FROM {{s}}.wf_def WHERE name = p_wf_def;
       IF NOT FOUND THEN
@@ -228,7 +270,9 @@
               p_parent, v_caller, v_def);
       INSERT INTO {{s}}.workflow (id, invocation_id, state, state_id, expires_at)
       VALUES (v_id, v_id, {{STARTED}}, v_id, v_now + p_timeout);
-      RETURN v_id;
+      o_kind := 0;
+      o_invocation_id := v_id;
+      RETURN NEXT;
     END
     $$"
    ;; restart!: locking the row re-checks that the invocation is still the
@@ -296,6 +340,19 @@
   (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
                   :workflow/expired Boolean/TRUE))
 
+(def ^:private read-call-result
+  "Rows of call_workflow."
+  (row-fn :call/kind (.getInt %)
+          :workflow/invocation-id (int-at %)
+          :workflow/name (text-at %)
+          :workflow/params (text-at %)
+          :workflow/state (state-at %)
+          :workflow/state-changed-at (int-at %)
+          :workflow/expires-at (int-or-nil-at %)
+          :workflow/metadata (text-at %)
+          :workflow/result (text-at %)
+          :workflow/parent-invocation-id (int-or-nil-at %)))
+
 (def ^:private read-timeline
   (row-fn :workflow/invocation-id (int-at %)
           :workflow/current-invocation-id (int-at %)
@@ -337,22 +394,27 @@
   [^PreparedStatement ps i v]
   (if (nil? v) (.setNull ps (int i) Types/VARCHAR) (.setString ps (int i) v)))
 
-(defn- query
-  "Runs sql with params on a connection of ds, and returns the vector of
+(defn- query-on
+  "Runs sql with params on connection c, and returns the vector of
    (row-fn result-set) for every row of the result. text-params: the
    indexes (1-based) of the params that are text, so a nil one is a NULL
    of text."
+  [^Connection c ^String sql params text-params row-fn]
+  (with-open [ps (.prepareStatement c sql)]
+    (bind! ps params)
+    (doseq [i text-params] (bind-text! ps i (nth params (dec i))))
+    (with-open [r (.executeQuery ps)]
+      (loop [rows (transient [])]
+        (if (.next r)
+          (recur (conj! rows (row-fn r)))
+          (persistent! rows))))))
+
+(defn- query
+  "query-on a connection of ds."
   ([ds sql params row-fn] (query ds sql params #{} row-fn))
-  ([^DataSource ds ^String sql params text-params row-fn]
-   (with-open [c (.getConnection ds)
-               ps (.prepareStatement c sql)]
-     (bind! ps params)
-     (doseq [i text-params] (bind-text! ps i (nth params (dec i))))
-     (with-open [r (.executeQuery ps)]
-       (loop [rows (transient [])]
-         (if (.next r)
-           (recur (conj! rows (row-fn r)))
-           (persistent! rows)))))))
+  ([^DataSource ds sql params text-params row-fn]
+   (with-open [c (.getConnection ds)]
+     (query-on c sql params text-params row-fn))))
 
 ;; Following pointers
 
@@ -506,7 +568,7 @@
 ;; The statements
 
 (def ^:private statements
-  {:insert "SELECT {{s}}.insert_workflow(?::bigint, ?::text, ?::text, ?::bigint, ?::text, ?::bigint)"
+  {:call "SELECT * FROM {{s}}.call_workflow(?::bigint, ?::text, ?::text, ?::bigint, ?::text, ?::bigint, ?::boolean)"
 
    :finish
    ;; Compare-and-set on the workflow row: Postgres re-checks the WHERE on
@@ -648,19 +710,8 @@
       (finally
         (.setAutoCommit c true)))))
 
-(defn- finish! [ds sqls invocation-id state result-edn-str expired-only?]
-  (boolean (seq (query ds (:finish sqls) [(state-code state) invocation-id (not expired-only?) result-edn-str] #{4}
-                       read-id))))
-
-(defn- idempotence-key
-  "The 64-bit idempotence key of (wf-def, params) - see
-   tenon.workflow.db/idempotence-key. A var of its own, so tests can make
-   keys collide."
-  ^long [^String wf-def ^String params]
-  (db/idempotence-key wf-def params))
-
 (deftype PostgresStorage [^DataSource ds ^String schema sqls ^ConcurrentHashMap calls-cache
-                          ^ConcurrentHashMap wf-def-ids owns-ds?]
+                          ^ConcurrentHashMap wf-def-ids writer owns-ds?]
   Closeable
   (close [_]
     (when owns-ds? (.close ^Closeable ds)))
@@ -678,6 +729,33 @@
 (defn- ds-of ^DataSource [^PostgresStorage s] (.-ds s))
 
 (defn- sqls-of [^PostgresStorage s] (.-sqls s))
+
+(defn- write!
+  "Runs sql with params as a write of storage, through its group commit
+   (see query-on)."
+  [storage sql params text-params row-fn]
+  (group-commit/write! (.-writer ^PostgresStorage storage)
+                       #(query-on % sql params text-params row-fn)))
+
+(defn- idempotence-key
+  "The 64-bit idempotence key of (wf-def, params) - see
+   tenon.workflow.db/idempotence-key. A var of its own, so tests can make
+   keys collide."
+  ^long [^String wf-def ^String params]
+  (db/idempotence-key wf-def params))
+
+(defn- call
+  "call_workflow's row (see read-call-result)."
+  [storage wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms reuse?]
+  (first (write! storage (:call (sqls-of storage))
+                 [(idempotence-key wf-def params-edn-str) wf-def params-edn-str parent-invocation-id
+                  metadata-edn-str timeout-ms reuse?]
+                 #{5} read-call-result)))
+
+(defn- finish! [storage invocation-id state result-edn-str expired-only?]
+  (boolean (seq (write! storage (:finish (sqls-of storage))
+                        [(state-code state) invocation-id (not expired-only?) result-edn-str] #{4}
+                        read-id))))
 
 (defn- wf-def-id
   "The id of the wf_def named wf-def, or nil if there is none (yet). Ids
@@ -699,25 +777,31 @@
     this)
 
   (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (first (query (ds-of this) (:insert (sqls-of this))
-                  [(idempotence-key wf-def params-edn-str) wf-def params-edn-str parent-invocation-id
-                   metadata-edn-str timeout-ms]
-                  #{5}
-                  read-nilable-id)))
+    (let [{:call/keys [kind] id :workflow/invocation-id}
+          (call this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms false)]
+      (when (zero? kind) id)))
+
+  (call! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    (let [{:call/keys [kind] id :workflow/invocation-id :as row}
+          (call this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms true)]
+      (case (long kind)
+        0 {:call/started id}
+        1 {:call/reused (dissoc row :call/kind)}
+        2 {:call/running id})))
 
   (finish! [this invocation-id state result-edn-str]
-    (finish! (ds-of this) (sqls-of this) invocation-id state result-edn-str false))
+    (finish! this invocation-id state result-edn-str false))
 
   (time-out! [this invocation-id result-edn-str]
-    (finish! (ds-of this) (sqls-of this) invocation-id "TIMEOUT" result-edn-str true))
+    (finish! this invocation-id "TIMEOUT" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
-    (first (query (ds-of this) (:restart (sqls-of this)) [invocation-id metadata-edn-str timeout-ms] #{2}
-                  read-nilable-id)))
+    (first (write! this (:restart (sqls-of this)) [invocation-id metadata-edn-str timeout-ms] #{2}
+                   read-nilable-id)))
 
   (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
-    (query (ds-of this) (:reuse (sqls-of this)) [metadata-edn-str parent-invocation-id parent-invocation-id invocation-id]
-           #{1} read-nilable-id)
+    (write! this (:reuse (sqls-of this)) [metadata-edn-str parent-invocation-id parent-invocation-id invocation-id]
+            #{1} read-nilable-id)
     nil)
 
   (get-workflow [this invocation-id]
@@ -749,9 +833,9 @@
   (extend-lease! [this invocation-ids timeout-ms]
     (if (empty? invocation-ids)
       #{}
-      (into #{} (query (ds-of this) (:extend-lease (sqls-of this))
-                       [timeout-ms (long-array (map long invocation-ids))]
-                       read-id))))
+      (into #{} (write! this (:extend-lease (sqls-of this))
+                        [timeout-ms (long-array (map long invocation-ids))] #{}
+                        read-id))))
 
   (list-expired [this]
     (query (ds-of this) (:list-expired (sqls-of this)) [] read-expired)))
@@ -780,6 +864,11 @@
    storage is closed - or a javax.sql.DataSource the caller manages (its
    connections must run at READ COMMITTED, the default, and auto-commit).
 
+   Concurrent writes share transactions, and so their commits' flushes,
+   in :write-lanes lanes (4) - see tenon.workflow.postgres.group-commit;
+   each takes a connection while it runs a batch, so the pool needs more.
+   0 runs each write in a transaction of its own.
+
    Its tables live in the schema :schema, else the one the URL's
    currentSchema parameter names, else \"tenon\" - a lowercase SQL
    identifier.
@@ -787,14 +876,16 @@
    The storage is Closeable: close it (e.g. with-open or .close) once it's
    no longer needed. next.jdbc can run statements on it too."
   (^PostgresStorage [db] (storage db {}))
-  (^PostgresStorage [db {:keys [schema pool-size] :or {pool-size 10}}]
+  (^PostgresStorage [db {:keys [schema pool-size write-lanes] :or {pool-size 10 write-lanes 4}}]
    (let [owns-ds? (string? db)
          schema (or schema (when owns-ds? (url-schema db)) "tenon")]
      (when-not (re-matches #"[a-z_][a-z0-9_]{0,62}" schema)
        (throw (IllegalArgumentException. (str "not a lowercase SQL identifier: " (pr-str schema)))))
-     (PostgresStorage. (if owns-ds? (pool db pool-size) db)
-                       schema
-                       (update-vals statements #(sql schema %))
-                       (ConcurrentHashMap.)
-                       (ConcurrentHashMap.)
-                       owns-ds?))))
+     (let [ds (if owns-ds? (pool db pool-size) db)]
+       (PostgresStorage. ds
+                         schema
+                         (update-vals statements #(sql schema %))
+                         (ConcurrentHashMap.)
+                         (ConcurrentHashMap.)
+                         (group-commit/writer ds write-lanes)
+                         owns-ds?)))))

@@ -55,9 +55,9 @@ You can find the invocations in the web UI started at http://localhost:3000.
   `"jdbc:postgresql://db.example.com/app?user=app&password=secret"`. The tables live in the schema
   the URL's `currentSchema` parameter names, else in `tenon`; `init` creates the schema, its tables
   and functions if they don't exist yet (several processes may do so at once). Connections come from a
-  HikariCP pool of 10;
+  HikariCP pool of 10, and concurrent writes are committed together, in 4 lanes - each a connection;
 - or a storage you opened yourself, e.g. `(tenon.workflow.postgres/storage my-datasource {:schema "jobs"})`
-  over a `javax.sql.DataSource` you manage, or a pool of another size.
+  over a `javax.sql.DataSource` you manage, or with other `:pool-size` and `:write-lanes`.
 
 ```clojure
 (def my-engine (tenon.workflow/init "jdbc:postgresql://localhost/app?user=app&currentSchema=workflows"))

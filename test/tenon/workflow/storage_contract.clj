@@ -91,6 +91,13 @@
     (testing "restart! returns the new invocation id, nil unless DONE, ERROR or TIMEOUT"
       (is (int? (db/restart! storage failing "{:actor 2}" nil)))
       (is (nil? (db/restart! storage failing nil nil))))
+    (testing "call! returns what it did"
+      (is (int? (:call/started (db/call! storage "contract/called" "[6]" nil nil nil))))
+      (is (= {:call/running (db/insert-workflow! storage "contract/called" "[7]" nil nil nil)}
+             (db/call! storage "contract/called" "[7]" nil nil nil)))
+      (let [{reused :call/reused} (db/call! storage "contract/child" "[2]" root nil nil)]
+        (check-shape workflow-shape reused)
+        (is (= child (:workflow/invocation-id reused)))))
     (testing "record-reuse! returns nil"
       (is (nil? (db/record-reuse! storage child root "{:actor 3}")))
       (is (nil? (db/record-reuse! storage child nil nil))))
@@ -125,9 +132,9 @@
     (check-rows "full-timeline" timeline-shape (db/full-timeline storage root))
 
     (testing "top-level-wf-defs"
-      (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/failing" "contract/root"]
+      (is (= ["contract/called" "contract/child" "contract/expiring" "contract/failed" "contract/failing" "contract/root"]
              (db/top-level-wf-defs storage false)))
-      (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/root"]
+      (is (= ["contract/called" "contract/child" "contract/expiring" "contract/failed" "contract/root"]
              (db/top-level-wf-defs storage true))
           "child was reused at the top level"))))
 

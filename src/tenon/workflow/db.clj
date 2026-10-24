@@ -51,6 +51,18 @@
      expires timeout-ms after now (nil: never). Returns the new row's
      invocation_id, or nil if nothing was inserted.")
 
+  (call! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    "A call of the workflow (wf-def, params) by parent-invocation-id (nil:
+     top-level) with metadata-edn-str, as one write where the storage can:
+     - none such yet: inserts it, as insert-workflow!, and returns
+       {:call/started invocation-id};
+     - it is DONE, ERROR or TIMEOUT: logs the reuse of its current
+       invocation, as record-reuse!, and returns {:call/reused row}, row
+       as find-by-wf-def-and-params returns it;
+     - it is STARTED: changes nothing, and returns {:call/running
+       invocation-id} - the caller awaits it, then logs its reuse.
+     See call-in-steps for one made of the other methods.")
+
   (finish! [this invocation-id state result-edn-str]
     "Moves invocation-id from STARTED to state (DONE or ERROR) with
      result-edn-str as its result - but only if it is still STARTED under
@@ -133,6 +145,21 @@
      row is, a level below the reusing invocation. The workflow's own
      REUSED rows are part of its history wherever the reuse came from,
      at depth 0."))
+
+(defn call-in-steps
+  "Storage's call! made of its other methods - for a storage whose reads
+   are cheap: a lookup, then an insert or a reuse."
+  [storage wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+  (loop [attempts 2]
+    (if-let [wf (find-by-wf-def-and-params storage wf-def params-edn-str)]
+      (if (= "STARTED" (:workflow/state wf))
+        {:call/running (:workflow/invocation-id wf)}
+        (do (record-reuse! storage (:workflow/invocation-id wf) parent-invocation-id metadata-edn-str)
+            {:call/reused wf}))
+      (if-let [id (insert-workflow! storage wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms)]
+        {:call/started id}
+        ;; someone inserted it meanwhile: look again - once
+        (when (pos? attempts) (recur (dec attempts)))))))
 
 (defprotocol Timeouts
   "The part of a storage concerned with invocations that stop making

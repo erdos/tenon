@@ -175,8 +175,9 @@
               started (first (filter #(= "STARTED" (:workflow/state (db/get-workflow s %))) roots))
               mid (nth (sort roots) (quot (count roots) 2))
               statements (concat
-                          [["insert" (:insert sqls) [12345 "app.ns/wf-7" "[new]" some-root nil 15000]]
-                           ["insert an existing one" (:insert sqls) [(db/idempotence-key "app.ns/wf-0" "[0]") "app.ns/wf-0" "[0]" nil nil 1]]
+                          [["call: start" (:call sqls) [12345 "app.ns/wf-7" "[new]" some-root nil 15000 true]]
+                           ["call: reuse" (:call sqls) [(db/idempotence-key "app.ns/wf-0" "[0]") "app.ns/wf-0" "[0]" some-root nil 1 true]]
+                           ["insert an existing one" (:call sqls) [(db/idempotence-key "app.ns/wf-0" "[0]") "app.ns/wf-0" "[0]" nil nil 1 false]]
                            ["finish" (:finish sqls) [1 started true "42"]]
                            ["time-out" (:finish sqls) [3 started false "42"]]
                            ["restart" (:restart sqls) [some-root nil 15000]]

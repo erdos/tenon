@@ -486,6 +486,10 @@
                    [(idempotence-key wf-def params-edn-str) wf-def params-edn-str
                     parent-invocation-id metadata-edn-str timeout-ms])))
 
+  (call! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    ;; reads are cheap here, and the writes go through the group commit
+    (db/call-in-steps this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms))
+
   (finish! [this invocation-id state result-edn-str]
     (finish! this invocation-id state result-edn-str false))
 

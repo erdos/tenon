@@ -81,3 +81,21 @@
             (is (= [a b c] (mapv #(:workflow/invocation-id (db/find-by-wf-def-and-params ds %1 %2))
                                  ["test.ns/a" "test.ns/a" "test.ns/c"] ["[1]" "[2]" "[1]"])))
             (is (nil? (db/find-by-wf-def-and-params ds "test.ns/c" "[2]")))))))))
+
+(deftest call-in-steps-reuses-what-was-inserted-meanwhile-test
+  ;; call! made of steps: the lookup misses, then the insert loses to
+  ;; another caller's - the call looks again, and reuses the winner's.
+  (with-temp-db
+    (fn [path]
+      (with-open [ds (sqlite/datasource path)]
+        (db/init-db! ds)
+        (let [real-insert db/insert-workflow!
+              winner (atom nil)]
+          (with-redefs [db/insert-workflow!
+                        (fn [ds wf-def params parent metadata timeout-ms]
+                          (reset! winner (real-insert ds wf-def params nil nil nil))
+                          (db/finish! ds @winner "DONE" "1")
+                          (real-insert ds wf-def params parent metadata timeout-ms))]
+            (let [result (db/call! ds "test.ns/race" "[1]" nil nil nil)]
+              (is (some? @winner))
+              (is (= @winner (:workflow/invocation-id (:call/reused result)))))))))))

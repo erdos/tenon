@@ -1,5 +1,5 @@
 (ns tenon.workflow.db-test
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.edn :as edn]
             [matcher-combinators.test :refer [match? thrown-match?]]
             [matcher-combinators.matchers :as m]
@@ -384,3 +384,33 @@
                  {:workflow/state "REUSED" :workflow/depth 0 :workflow/parent-invocation-id other}
                  {:workflow/state "REUSED" :workflow/depth 0 :workflow/parent-invocation-id nil}]
                 (db/full-timeline ds root)))))
+
+(deftest call-starts-reuses-or-finds-running-test
+  (let [ds (test-util/ds)
+        parent (test-util/insert! "test.ns/caller")]
+    (testing "a new workflow is started"
+      (let [{id :call/started} (db/call! ds "test.ns/called" "[1]" parent (pr-str {:run 1}) 60000)]
+        (is (integer? id))
+        (is (match? {:workflow/state "STARTED" :workflow/parent-invocation-id parent
+                     :workflow/metadata (pr-str {:run 1}) :workflow/expires-at integer?}
+                    (db/get-workflow ds id)))
+        (testing "a running one is found running, and nothing logged"
+          (is (= {:call/running id} (db/call! ds "test.ns/called" "[1]" nil nil nil)))
+          (is (= ["STARTED"] (map :workflow/state (test-util/history ds id)))))
+        (testing "a finished one is reused: its row, and the reuse logged under the caller"
+          (db/finish! ds id "ERROR" (pr-str {:message "x"}))
+          (is (match? {:call/reused {:workflow/invocation-id id :workflow/state "ERROR"
+                                     :workflow/result (pr-str {:message "x"}) :workflow/name "test.ns/called"
+                                     :workflow/params "[1]" :workflow/parent-invocation-id parent}}
+                      (db/call! ds "test.ns/called" "[1]" nil (pr-str {:run 2}) nil)))
+          (is (match? [{:workflow/state "STARTED"} {:workflow/state "ERROR"}
+                       {:workflow/state "REUSED" :event/data (pr-str {:run 2}) :workflow/parent-invocation-id nil?}]
+                      (test-util/history ds id)))
+          (is (some #{"test.ns/called"} (db/top-level-wf-defs ds true)) "reused at the top level"))
+        (testing "after a restart, its current invocation"
+          (let [id2 (db/restart! ds id nil nil)]
+            (db/finish! ds id2 "DONE" "2")
+            (is (match? {:call/reused {:workflow/invocation-id id2 :workflow/result "2"}}
+                        (db/call! ds "test.ns/called" "[1]" parent nil nil)))
+            (is (match? {:workflow/state "REUSED" :workflow/invocation-id id2 :workflow/parent-invocation-id parent}
+                        (last (test-util/history ds id2))))))))))

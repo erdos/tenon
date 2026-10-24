@@ -321,21 +321,17 @@
         "logged once, after the awaited result arrived")))
 
 (deftest run-invocation-race-loser-awaits-winner-test
-  ;; Simulates two threads racing to start the same (wf-def, args) call,
-  ;; where the dedup pre-check (find-by-wf-def-and-params) sees nothing
-  ;; for both, then a "winner" wins the actual insert-workflow! race. The
-  ;; "loser" here is the real call: its own insert-workflow! is stubbed to
-  ;; first let the winner's row (already DONE) into the table, then attempt
-  ;; its own insert - which must hit ON CONFLICT DO NOTHING (0 rows, nil
-  ;; return) and fall back to awaiting (and returning) the winner's result
-  ;; instead of trying to execute raw-fn itself.
-  (let [real-insert-workflow! db/insert-workflow!
+  ;; Two callers racing to start the same (wf-def, args) call: the
+  ;; "winner" gets its row in (and DONE) just before the real call's -
+  ;; which must then reuse the winner's result instead of running raw-fn
+  ;; itself.
+  (let [real-call! db/call!
         calls (atom 0)]
-    (with-redefs [db/insert-workflow!
+    (with-redefs [db/call!
                   (fn [ds wf-def params-str parent-id meta-str timeout-ms]
-                    (db/finish! ds (real-insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms)
+                    (db/finish! ds (db/insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms)
                                 "DONE" (pr-str :winner-result))
-                    (real-insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms))]
+                    (real-call! ds wf-def params-str parent-id meta-str timeout-ms))]
       (let [result (engine/run-invocation #'dedup-fn
                                            (fn [x] (swap! calls inc) (* x 10))
                                            [999])]
