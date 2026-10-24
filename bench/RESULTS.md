@@ -16,8 +16,20 @@
 
 | | SQLite | PostgreSQL |
 |---|---:|---:|
-| engine: a nested call (6 storage calls), 16 threads | 2,516/s, p50 5.7 ms, p99 16.6 ms | 1,867/s, p50 6.8 ms, p99 33.7 ms |
-| engine: a call reusing a stored result (2 storage calls), 16 threads | 8,556/s, p50 1.5 ms, p99 7.3 ms | 3,824/s, p50 3.4 ms, p99 11.0 ms |
+| engine: a nested call (4 storage calls), 16 threads | 2,526/s, p50 5.3 ms, p99 21.1 ms | 1,685/s, p50 7.7 ms, p99 38.3 ms |
+| engine: a call reusing a stored result (1 storage call), 16 threads | 8,525/s, p50 1.6 ms, p99 5.6 ms | 7,328/s, p50 2.0 ms, p99 5.5 ms |
+
+Measured after starting or reusing a workflow became one storage call (`start-workflow!`), in a container
+~20% slower than the rest of this report's - so compare these two rows with each other, and with the
+table below, not with the other tables. Median of 3 runs of these scenarios alone, before and after,
+alternating, on that machine:
+
+| | SQLite, before | SQLite, after | PostgreSQL, before | PostgreSQL, after |
+|---|---:|---:|---:|---:|
+| a nested call, 16 threads | 1,777/s (6 calls) | 2,160/s (4 calls) | 1,364/s (6 calls) | 1,402/s (4 calls) |
+| a call reusing a stored result, 16 threads | 6,746/s (3 calls) | 8,667/s (1 call) | 3,403/s (3 calls) | 6,332/s (1 call) |
+
+(A reuse used to be 3 calls, not 2: the lookup, a read of the workflow's state, and the reuse record.)
 
 ## Reads, among 249,850 workflows (100,000 top-level)
 
@@ -49,10 +61,14 @@ Run to run, the write numbers vary by about 10-20%.
   without the flush (async commit), PostgreSQL runs about as fast as durable SQLite. Under concurrency, SQLite's own group commit
   (one writer runs everyone's queued writes in one transaction, one flush) does better than PostgreSQL's
   flushing per commit: ~55-60% of its throughput. PostgreSQL's `commit_delay` did not change that here.
-- **The engine end to end**: a nested call, where the function and the engine's bookkeeping take part of
-  the time, runs at ~75% of SQLite's rate. A reuse of a stored result is two cheap statements, so the
-  round trips weigh more: ~45%. (Before the call and reuse lists were replaced by indexes - each reuse of
-  one popular workflow locked its row until the commit was flushed - it was ~15%.)
+- **The engine end to end**: a call that runs is one write to start it and one to finish it; a reuse of
+  a finished result is one write that finds the workflow and records the reuse. A nested call is two
+  durable commits per workflow on PostgreSQL, bound by their flushes, at ~65% of SQLite's rate:
+  dropping its two lookups (6 storage calls to 4) didn't change that, they were cheap reads. On SQLite
+  it gained ~20% - the reads went through the same busy JVM. A reuse, where the round trips are most of
+  the cost, went from 3 calls to 1: ~1.9x on PostgreSQL, now ~75% of SQLite's rate (from ~45%), and ~25%
+  on SQLite. (Before the call and reuse lists were replaced by indexes - each reuse of one popular
+  workflow locked its row until the commit was flushed - PostgreSQL's reuses ran at ~15% of SQLite's.)
 - **Reads** are a round trip to a server against a function call: a point read is ~100 us against
   ~12 us, a page of the listing ~1.2 ms against ~0.4 ms, a timeline ~0.24 ms against ~0.04 ms. None scans
   a table: each is

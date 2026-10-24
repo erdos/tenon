@@ -149,7 +149,7 @@
     (check-rows "full-timeline" timeline-shape (db/full-timeline storage root))
 
     (testing "top-level-wf-defs"
-      (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/failing" "contract/root"]
+      (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/failing" "contract/root" "contract/started"]
              (db/top-level-wf-defs storage false)))
       (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/root"]
              (db/top-level-wf-defs storage true))
