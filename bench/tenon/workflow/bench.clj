@@ -96,18 +96,23 @@
 
 (defn- unique [t i] (str "[" run-id " " t " " i "]"))
 
+(defn- start!
+  "Starts a new workflow, returning its invocation id."
+  [s wf-def params parent metadata timeout-ms]
+  (:workflow/invocation-id (db/start-workflow! s wf-def params parent metadata timeout-ms)))
+
 (defn- lifecycle!
   "A workflow started and finished."
   [s t i]
-  (db/finish! s (db/insert-workflow! s "bench/flat" (unique t i) nil "{:host \"a\"}" 15000) "DONE" "42"))
+  (db/finish! s (start! s "bench/flat" (unique t i) nil "{:host \"a\"}" 15000) "DONE" "42"))
 
 (defn- tree!
   "A workflow calling three others, reusing one of them, then finishing -
    10 writes."
   [s t i]
   (let [params (unique t i)
-        root (db/insert-workflow! s "bench/root" params nil "{:host \"a\"}" 15000)
-        kids (mapv #(let [c (db/insert-workflow! s (str "bench/child-" %) params root nil 15000)]
+        root (start! s "bench/root" params nil "{:host \"a\"}" 15000)
+        kids (mapv #(let [c (start! s (str "bench/child-" %) params root nil 15000)]
                       (db/finish! s c "DONE" "{:ok true}")
                       c)
                    (range 3))]
@@ -124,9 +129,9 @@
 (def ^:private engine-counter (atom 0))
 
 (defn- engine-scenarios []
-  [["engine: a nested call (6 storage calls), 16 threads" 16 200
+  [["engine: a nested call (4 storage calls), 16 threads" 16 200
     (fn [_ _ _] (fixtures/nested-parent (+ (* run-id 1000) (swap! engine-counter inc))))]
-   ["engine: a call reusing a stored result (2 storage calls), 16 threads" 16 500
+   ["engine: a call reusing a stored result (1 storage call), 16 threads" 16 500
     (fn [_ _ _] (fixtures/say-hi "again"))]])
 
 ;; Reads
@@ -148,9 +153,9 @@
                           w! (fn [x] (.incrementAndGet writes) x)]
                       (dotimes [i n]
                         (let [k (str "[" t " " i "]")
-                              root (w! (db/insert-workflow! s (defs (.nextInt rnd 5)) k nil "{:host \"a\"}" 15000))
+                              root (w! (start! s (defs (.nextInt rnd 5)) k nil "{:host \"a\"}" 15000))
                               kids (vec (for [j (range (.nextInt rnd 4))]
-                                          (let [c (w! (db/insert-workflow! s (defs (+ 5 (.nextInt rnd 15)))
+                                          (let [c (w! (start! s (defs (+ 5 (.nextInt rnd 15)))
                                                                            (str "[" t " " i " " j "]") root nil 15000))]
                                             (w! (db/finish! s c (if (zero? (.nextInt rnd 50)) "ERROR" "DONE") "{:ok 1}"))
                                             c)))]

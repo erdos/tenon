@@ -128,13 +128,21 @@
   [wf-def params]
   (first (filter #(= params (:workflow/params %)) (find-by-wf-def wf-def))))
 
+(defn insert-workflow!
+  "start-workflow!'s new invocation id, or nil if the workflow exists
+   already - for tests setting up rows, as storages once took them."
+  [storage wf-def params parent metadata timeout-ms]
+  (let [wf (db/start-workflow! storage wf-def params parent metadata timeout-ms)]
+    (when (= :started (:start/outcome wf))
+      (:workflow/invocation-id wf))))
+
 (defn insert!
   "Inserts a STARTED workflow row for tests setting up a workflow's history,
    returning its invocation id. opts: :params (an edn string, \"[]\" by
    default), :parent, :metadata and :timeout-ms (nil by default - never
    expires)."
   [wf-def & {:keys [params parent metadata timeout-ms] :or {params "[]"}}]
-  (db/insert-workflow! (ds) wf-def params parent metadata timeout-ms))
+  (insert-workflow! (ds) wf-def params parent metadata timeout-ms))
 
 (defn finish!
   "Moves STARTED invocation-id to state (DONE or ERROR) with result, an edn

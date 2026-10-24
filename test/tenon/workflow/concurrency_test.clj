@@ -36,7 +36,7 @@
                (0 1 2) (let [wf-def (pick rnd ["c/a" "c/b" "c/c"])
                              params (str "[" (.nextInt rnd 60) "]")
                              parent (when (.nextBoolean rnd) (some-> (pick rnd @ids) current))
-                             id (db/insert-workflow! storage wf-def params parent nil (pick rnd [nil 0 60000]))]
+                             id (test-util/insert-workflow! storage wf-def params parent nil (pick rnd [nil 0 60000]))]
                          (when id
                            (swap! ids conj id)
                            (swap! inserted update [wf-def params] (fnil conj []) id)))
@@ -177,7 +177,7 @@
             (dotimes [round 30]
               (let [params (str "[" round "]")]
                 (testing "inserts of one workflow: one inserts it"
-                  (is (= 1 (count (remove nil? (race 8 #(db/insert-workflow! s "race/insert" params nil nil 60000)))))))
+                  (is (= 1 (count (remove nil? (race 8 #(test-util/insert-workflow! s "race/insert" params nil nil 60000)))))))
                 (let [id (:workflow/invocation-id (db/find-by-wf-def-and-params s "race/insert" params))]
                   (testing "finishes of one invocation: one finishes it"
                     (is (= 1 (count (filter true? (race 8 #(db/finish! s id (rand-nth ["DONE" "ERROR"]) "1")))))))
@@ -196,5 +196,9 @@
                         "its history: one start, one end, one restart, one end"))
                   (testing "reuses of it: each is logged"
                     (race 8 #(db/record-reuse! s id nil nil))
-                    (is (= 8 (count (filter #(= "REUSED" (:workflow/state %)) (db/full-timeline s id)))))))))
+                    (is (= 8 (count (filter #(= "REUSED" (:workflow/state %)) (db/full-timeline s id))))))
+                  (testing "starts of it, finished: each reuses it, and is logged"
+                    (is (= (repeat 8 :reused)
+                           (map :start/outcome (race 8 #(db/start-workflow! s "race/insert" params nil nil 60000)))))
+                    (is (= 16 (count (filter #(= "REUSED" (:workflow/state %)) (db/full-timeline s id)))))))))
             (check-tables backend s)))))))

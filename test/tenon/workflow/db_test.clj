@@ -10,7 +10,7 @@
 (use-fixtures :each temp-db-fixture)
 
 (deftest insert-and-fetch-workflow-test
-  (let [id (db/insert-workflow! (test-util/ds) "test.ns/foo" (pr-str [1 2]) nil nil nil)
+  (let [id (test-util/insert-workflow! (test-util/ds) "test.ns/foo" (pr-str [1 2]) nil nil nil)
         wf (db/get-workflow (test-util/ds) id)]
     (is (integer? id))
     (is (match? {:workflow/name "test.ns/foo"
@@ -24,16 +24,16 @@
         "a workflow is inserted already STARTED with db-supplied state_changed_at and nil lease")))
 
 (deftest insert-workflow-dedups-on-wf-def-and-params-test
-  (let [id (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil)]
-    (is (nil? (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil))
+  (let [id (test-util/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil)]
+    (is (nil? (test-util/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [1]) nil nil nil))
         "same (wf_def, params) - nothing inserted")
-    (is (some? (db/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [2]) nil nil nil)))
+    (is (some? (test-util/insert-workflow! (test-util/ds) "test.ns/dup" (pr-str [2]) nil nil nil)))
     (is (= id (:workflow/invocation-id (db/find-by-wf-def-and-params (test-util/ds) "test.ns/dup" (pr-str [1])))))
     (is (nil? (db/find-by-wf-def-and-params (test-util/ds) "test.ns/dup" (pr-str [3]))))))
 
 (deftest insert-workflow-stores-metadata-parent-and-lease-test
   (let [parent (test-util/insert! "test.ns/parent")
-        child (db/insert-workflow! (test-util/ds) "test.ns/child" (pr-str []) parent (pr-str {:actor-id 42}) 1000)
+        child (test-util/insert-workflow! (test-util/ds) "test.ns/child" (pr-str []) parent (pr-str {:actor-id 42}) 1000)
         wf (db/get-workflow (test-util/ds) child)]
     (is (match? {:workflow/parent-invocation-id parent
                  :workflow/metadata (pr-str {:actor-id 42})}
@@ -194,6 +194,32 @@
     (is (= "DONE" (:workflow/state (db/get-workflow (test-util/ds) child)))
         "the workflow row itself is untouched - still the current state")))
 
+(deftest start-workflow-reuses-finished-workflow-test
+  (let [ds (test-util/ds)
+        child (test-util/insert! "test.ns/start-reused" :params "[1]" :parent (test-util/insert! "test.ns/first-caller"))
+        caller (test-util/insert! "test.ns/second-caller")]
+    (is (match? {:start/outcome :running :workflow/invocation-id child :workflow/state "STARTED"}
+                (db/start-workflow! ds "test.ns/start-reused" "[1]" caller nil nil))
+        "running: returned as it is, nothing recorded")
+    (db/finish! ds child "ERROR" (pr-str {:message "x"}))
+    (is (match? {:start/outcome :reused :workflow/invocation-id child :workflow/state "ERROR"
+                 :workflow/result (pr-str {:message "x"}) :workflow/expired false}
+                (db/start-workflow! ds "test.ns/start-reused" "[1]" caller (pr-str {:actor-id 7}) nil)))
+    (is (match? [{:workflow/state "STARTED"}
+                 {:workflow/state "ERROR"}
+                 {:workflow/invocation-id child :workflow/state "REUSED" :event/data (pr-str {:actor-id 7})
+                  :workflow/parent-invocation-id caller}]
+                (test-util/history ds child))
+        "the reuse is logged, under the caller, with its metadata")
+    (is (not-any? #{"test.ns/start-reused"} (db/top-level-wf-defs ds true)))
+    (is (= :reused (:start/outcome (db/start-workflow! ds "test.ns/start-reused" "[1]" nil nil nil))))
+    (is (some #{"test.ns/start-reused"} (db/top-level-wf-defs ds true))
+        "a reuse at the top level makes the wf_def a top-level one")
+    (let [restarted (db/restart! ds child nil nil)]
+      (is (match? {:start/outcome :running :workflow/invocation-id restarted}
+                  (db/start-workflow! ds "test.ns/start-reused" "[1]" nil nil nil))
+          "restarted: running again, under its new invocation id"))))
+
 (deftest record-reuse-accepts-past-invocation-id-test
   ;; The served invocation may have been restarted between reading its
   ;; result and logging the reuse - the reuse still belongs to its workflow.
@@ -267,7 +293,7 @@
 
 (deftest concurrent-inserts-of-one-workflow-insert-once-test
   (let [results (->> (range 8)
-                     (mapv (fn [_] (future (db/insert-workflow! (test-util/ds) "test.ns/race" "[1]" nil nil nil))))
+                     (mapv (fn [_] (future (test-util/insert-workflow! (test-util/ds) "test.ns/race" "[1]" nil nil nil))))
                      (mapv deref))]
     (is (= 1 (count (remove nil? results))) "exactly one inserter wins")
     (is (= 7 (count (filter nil? results))))))
@@ -292,7 +318,7 @@
         defs ["test.ns/a" "test.ns/b" "test.ns/c"]
         ids (reduce (fn [ids i]
                       (let [parent (when (and (pos? i) (zero? (mod i 3))) (nth ids (quot i 2)))
-                            id (db/insert-workflow! ds (nth defs (mod i 3)) (pr-str [i]) parent nil nil)]
+                            id (test-util/insert-workflow! ds (nth defs (mod i 3)) (pr-str [i]) parent nil nil)]
                         (conj ids id)))
                     [] (range 45))]
     (doseq [[i id] (map-indexed vector ids)]

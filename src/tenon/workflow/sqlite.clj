@@ -35,7 +35,9 @@
 
    Every write is a single statement that appends one event (a new
    workflow goes through the new_workflow view, whose trigger also writes
-   its workflow row); triggers move the pointers along. SQLite runs one
+   its workflow row); triggers move the pointers along. Only
+   start-workflow! runs more than one - an insert, else a reuse - in a
+   savepoint. SQLite runs one
    writer at a time, so a statement's checks and writes are atomic, and
    ids are handed out in commit order."
   (:require [clojure.string :as str]
@@ -166,7 +168,7 @@
       UPDATE wf_def SET top_level = 1
        WHERE id = NEW.wf_def_id AND NEW.parent_invocation_id IS NULL AND top_level = 0;
     END"
-   ;; insert-workflow!: an INSERT into this view checks the idempotence
+   ;; start-workflow!: an INSERT into this view checks the idempotence
    ;; key, logs the first event (whose id the INSERT computes, RETURNING
    ;; it) and creates the workflow row. RAISE(IGNORE) drops the row, so a
    ;; taken key returns nothing.
@@ -210,6 +212,12 @@
   "Rows of state-columns."
   (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)))
 
+(def ^:private read-current
+  "Rows of state-columns and whether the lease has expired, as get-workflow
+   returns them."
+  (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
+                  :workflow/expired (.getBoolean %)))
+
 (defn- read-id [^ResultSet r]
   (.getLong r 1))
 
@@ -225,6 +233,21 @@
          JOIN workflow w ON w.id = i.workflow_id
         WHERE i.id = ? AND w.state_id = i.id AND (? OR w.expires_at <= {{now}})
        RETURNING id"))
+
+(defn- in-savepoint
+  "Calls (f c) in a savepoint of c, a connection write! passes to its fn:
+   so a write of several statements is atomic too - within its batch's
+   transaction, or in a transaction of its own."
+  [c f]
+  (pool/execute! c "SAVEPOINT tenon_write")
+  (let [result (try (f c)
+                    (catch Throwable e
+                      (try (pool/execute! c "ROLLBACK TO tenon_write")
+                           (pool/execute! c "RELEASE tenon_write")
+                           (catch Throwable _))
+                      (throw e)))]
+    (pool/execute! c "RELEASE tenon_write")
+    result))
 
 (defn- finish!
   "Appends a state-ended event for invocation-id - if it is still the
@@ -392,7 +415,25 @@
   (sql "INSERT INTO new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at, expires_at)
        SELECT ?, coalesce(max(id), 0) + 1, ?, ?, ?, ?, {{now}}, {{now}} + ?
          FROM event
+       RETURNING id, occurred_at, expires_at"))
+
+(def ^:private reuse-finished-sql
+  ;; reuse-sql, for the workflow of a key - if it is finished
+  (sql "INSERT INTO event (workflow_id, state, occurred_at, data, invocation_id,
+                          parent_invocation_id, wf_def_id, prev_id, prev_call_id)
+       SELECT w.id, {{REUSED}}, {{now}}, ?, w.invocation_id, ?, w.wf_def_id, w.last_reuse_id,
+              (SELECT pw.last_call_id FROM event p JOIN workflow pw ON pw.id = p.workflow_id
+                WHERE p.id = ?)
+         FROM workflow w INDEXED BY workflow_key
+         CROSS JOIN wf_def d ON d.id = w.wf_def_id
+        WHERE w.key = ? AND w.params = ? AND d.name = ? AND w.state <> {{STARTED}}
        RETURNING id"))
+
+(def ^:private find-current-sql
+  ;; find-sql, with get-workflow's expired column
+  (sql "SELECT {{state-columns}}, w.expires_at <= {{now}} IS 1
+         FROM workflow w INDEXED BY workflow_key {{state-joins}}
+        WHERE w.key = ?"))
 
 (def ^:private restart-sql
   (sql "INSERT INTO event (workflow_id, state, occurred_at, data, expires_at, prev_id)
@@ -481,10 +522,39 @@
     (init-schema! this)
     this)
 
-  (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (first (write! this insert-sql
-                   [(idempotence-key wf-def params-edn-str) wf-def params-edn-str
-                    parent-invocation-id metadata-edn-str timeout-ms])))
+  (start-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    ;; The insert goes first: as a write, it takes the write lock at once
+    ;; (a read first could not upgrade to a write if another process wrote
+    ;; meanwhile), and a taken key leaves it a no-op.
+    (let [key (idempotence-key wf-def params-edn-str)]
+      (pool/write!
+       this
+       (fn [c]
+         (in-savepoint
+          c
+          (fn [c]
+            (if-let [[id occurred-at expires-at]
+                     (first (pool/query c insert-sql
+                                        [key wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+                                        (fn [^ResultSet r] [(.getLong r 1) (.getLong r 2) (int-or-nil-at r 3)])))]
+              {:workflow/invocation-id id
+               :workflow/name wf-def
+               :workflow/params params-edn-str
+               :workflow/state "STARTED"
+               :workflow/state-changed-at occurred-at
+               :workflow/expires-at expires-at
+               :workflow/metadata metadata-edn-str
+               :workflow/result nil
+               :workflow/parent-invocation-id parent-invocation-id
+               :workflow/expired (boolean (some-> expires-at (<= occurred-at)))
+               :start/outcome :started}
+              (let [reused? (seq (pool/query c reuse-finished-sql
+                                             [metadata-edn-str parent-invocation-id parent-invocation-id
+                                              key params-edn-str wf-def]
+                                             read-id))]
+                (some #(when (and (= params-edn-str (:workflow/params %)) (= wf-def (:workflow/name %)))
+                         (assoc % :start/outcome (if reused? :reused :running)))
+                      (pool/query c find-current-sql [key] read-current))))))))))
 
   (finish! [this invocation-id state result-edn-str]
     (finish! this invocation-id state result-edn-str false))
@@ -502,9 +572,7 @@
     nil)
 
   (get-workflow [this invocation-id]
-    (first (pool/query this get-workflow-sql [invocation-id]
-                       (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
-                                       :workflow/expired (.getBoolean %)))))
+    (first (pool/query this get-workflow-sql [invocation-id] read-current)))
 
   (find-by-wf-def-and-params [this wf-def params-edn-str]
     ;; The rows with the key - all but never more than one - are told apart

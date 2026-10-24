@@ -320,27 +320,25 @@
                 (test-util/timeline id))
         "logged once, after the awaited result arrived")))
 
-(deftest run-invocation-race-loser-awaits-winner-test
-  ;; Simulates two threads racing to start the same (wf-def, args) call,
-  ;; where the dedup pre-check (find-by-wf-def-and-params) sees nothing
-  ;; for both, then a "winner" wins the actual insert-workflow! race. The
-  ;; "loser" here is the real call: its own insert-workflow! is stubbed to
-  ;; first let the winner's row (already DONE) into the table, then attempt
-  ;; its own insert - which must hit ON CONFLICT DO NOTHING (0 rows, nil
-  ;; return) and fall back to awaiting (and returning) the winner's result
-  ;; instead of trying to execute raw-fn itself.
-  (let [real-insert-workflow! db/insert-workflow!
-        calls (atom 0)]
-    (with-redefs [db/insert-workflow!
-                  (fn [ds wf-def params-str parent-id meta-str timeout-ms]
-                    (db/finish! ds (real-insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms)
-                                "DONE" (pr-str :winner-result))
-                    (real-insert-workflow! ds wf-def params-str parent-id meta-str timeout-ms))]
-      (let [result (engine/run-invocation #'dedup-fn
-                                           (fn [x] (swap! calls inc) (* x 10))
-                                           [999])]
-        (is (= :winner-result result))
-        (is (zero? @calls) "the loser must not have run raw-fn itself")))))
+(deftest run-invocation-storage-calls-test
+  ;; Each storage call is a round trip to a database server: a call that
+  ;; runs is one to start and one to finish, a call reusing a finished
+  ;; result one in all.
+  (let [calls (atom [])
+        caller (Thread/currentThread)
+        counted (fn [k f] (fn [& args]
+                            (when (identical? caller (Thread/currentThread)) (swap! calls conj k))
+                            (apply f args)))]
+    (with-redefs [db/start-workflow! (counted :start db/start-workflow!)
+                  db/finish! (counted :finish db/finish!)
+                  db/record-reuse! (counted :record-reuse db/record-reuse!)
+                  db/get-workflow (counted :get-workflow db/get-workflow)
+                  db/find-by-wf-def-and-params (counted :find db/find-by-wf-def-and-params)]
+      (is (= 11 (engine/run-invocation #'nested-outer-fn nested-outer-fn [5])))
+      (is (= [:start :start :finish :finish] @calls) "a nested call")
+      (reset! calls [])
+      (is (= 11 (engine/run-invocation #'nested-outer-fn nested-outer-fn [5])))
+      (is (= [:start] @calls) "a reuse"))))
 
 (deftest restart-preconditions-test
   (is (thrown-match? clojure.lang.ExceptionInfo

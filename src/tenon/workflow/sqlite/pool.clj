@@ -110,7 +110,8 @@
    result once they are durable. The others wait meanwhile: those whose
    write it ran return with their result, and one of the rest leads the
    next batch - every write that arrived during this one's commit. A write
-   must be a single statement (atomic on its own), and sees the effects of
+   must be atomic on its own - a single statement, or several in a
+   savepoint - and sees the effects of
    the writes before it in its batch. Writers of other processes still meet
    at SQLite's own lock."
   [^Pool pool f]

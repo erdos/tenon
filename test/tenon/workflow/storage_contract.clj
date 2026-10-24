@@ -5,7 +5,8 @@
    from a deftest with a fresh, empty storage of the implementation under
    test - and check-timeouts, for the db/Timeouts methods, with another."
   (:require [clojure.test :refer [is testing]]
-            [tenon.workflow.db :as db]))
+            [tenon.workflow.db :as db]
+            [tenon.workflow.test-util :as test-util]))
 
 (defn- nilable [pred] (fn [v] (or (nil? v) (pred v))))
 
@@ -26,6 +27,10 @@
 (def get-workflow-shape
   "get-workflow rows."
   (assoc workflow-shape :workflow/expired boolean?))
+
+(def start-shape
+  "start-workflow! rows."
+  (assoc get-workflow-shape :start/outcome #{:started :reused :running}))
 
 (def call-shape
   "top-level-workflows rows."
@@ -68,14 +73,28 @@
   [storage]
   (testing "init-db! returns the storage"
     (is (identical? storage (db/init-db! storage))))
-  (let [root (db/insert-workflow! storage "contract/root" "[1]" nil "{:actor 1}" 60000)
-        child (db/insert-workflow! storage "contract/child" "[2]" root nil nil)
-        failing (db/insert-workflow! storage "contract/failing" "[3]" root nil nil)
-        failed (db/insert-workflow! storage "contract/failed" "[5]" nil nil nil)
-        expiring (db/insert-workflow! storage "contract/expiring" "[4]" nil nil 0)]
-    (testing "insert-workflow! returns the invocation id, nil for an existing workflow"
+  (let [root (test-util/insert-workflow! storage "contract/root" "[1]" nil "{:actor 1}" 60000)
+        child (test-util/insert-workflow! storage "contract/child" "[2]" root nil nil)
+        failing (test-util/insert-workflow! storage "contract/failing" "[3]" root nil nil)
+        failed (test-util/insert-workflow! storage "contract/failed" "[5]" nil nil nil)
+        expiring (test-util/insert-workflow! storage "contract/expiring" "[4]" nil nil 0)]
+    (testing "start-workflow! of a new workflow starts it"
       (is (every? int? [root child failing failed expiring]))
-      (is (nil? (db/insert-workflow! storage "contract/root" "[1]" nil nil nil))))
+      (let [wf (db/start-workflow! storage "contract/started" "[6]" root "{:actor 5}" 0)]
+        (check-shape start-shape wf)
+        (is (= {:start/outcome :started :workflow/name "contract/started" :workflow/params "[6]"
+                :workflow/state "STARTED" :workflow/parent-invocation-id root :workflow/metadata "{:actor 5}"
+                :workflow/result nil :workflow/expired true}
+               (select-keys wf [:start/outcome :workflow/name :workflow/params :workflow/state
+                                :workflow/parent-invocation-id :workflow/metadata :workflow/result
+                                :workflow/expired])))
+        (is (= (dissoc wf :start/outcome) (db/get-workflow storage (:workflow/invocation-id wf)))
+            "the row get-workflow returns")))
+    (testing "start-workflow! of a running workflow returns it, as running"
+      (let [wf (db/start-workflow! storage "contract/root" "[1]" nil nil nil)]
+        (check-shape start-shape wf)
+        (is (= {:start/outcome :running :workflow/invocation-id root :workflow/state "STARTED"}
+               (select-keys wf [:start/outcome :workflow/invocation-id :workflow/state])))))
     (testing "finish! returns whether it finished the invocation"
       (is (true? (db/finish! storage child "DONE" "42")))
       (is (true? (db/finish! storage failing "ERROR" "{:message \"boom\"}")))
@@ -91,6 +110,11 @@
     (testing "restart! returns the new invocation id, nil unless DONE, ERROR or TIMEOUT"
       (is (int? (db/restart! storage failing "{:actor 2}" nil)))
       (is (nil? (db/restart! storage failing nil nil))))
+    (testing "start-workflow! of a finished workflow reuses it"
+      (let [wf (db/start-workflow! storage "contract/child" "[2]" root "{:actor 4}" nil)]
+        (check-shape start-shape wf)
+        (is (= {:start/outcome :reused :workflow/invocation-id child :workflow/state "DONE" :workflow/result "42"}
+               (select-keys wf [:start/outcome :workflow/invocation-id :workflow/state :workflow/result])))))
     (testing "record-reuse! returns nil"
       (is (nil? (db/record-reuse! storage child root "{:actor 3}")))
       (is (nil? (db/record-reuse! storage child nil nil))))
@@ -137,7 +161,7 @@
   [storage]
   (db/init-db! storage)
   (let [insert! (fn [wf-def parent timeout-ms]
-                  (db/insert-workflow! storage (str "timeouts/" wf-def) "[]" parent
+                  (test-util/insert-workflow! storage (str "timeouts/" wf-def) "[]" parent
                                        (when (= "dead2" wf-def) "{:actor 1}") timeout-ms))
         leased (insert! "leased" nil 60000)
         nested (insert! "nested" leased 60000)
@@ -208,7 +232,7 @@
         ids (reduce
              (fn [ids i]
                (let [parent (when (and (seq ids) (zero? (.nextInt rnd 3))) (pick ids))
-                     id (db/insert-workflow! storage (pick wf-defs) (str "[" i "]") parent nil (pick [nil 60000 0]))]
+                     id (test-util/insert-workflow! storage (pick wf-defs) (str "[" i "]") parent nil (pick [nil 60000 0]))]
                  (case (.nextInt rnd 6)
                    0 (db/finish! storage id "DONE" "1")
                    1 (db/finish! storage id "ERROR" "{:message \"boom\"}")

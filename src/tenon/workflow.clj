@@ -204,46 +204,52 @@
            (recur waits))))))
 
 (defn- await-finished
-  "Polls the workflow invocation-id belongs to until it is DONE, ERROR or
-   TIMEOUT (timing it out if its lease runs out meanwhile), and returns its row.
-   When the invocation is running in this JVM (:tenon/in-flight), waits on
-   its completion promise instead of sleeping so same-JVM callers wake as
-   soon as it finishes."
-  [{ds :tenon/db in-flight :tenon/in-flight :as engine} invocation-id]
-  (with-backoff engine
-    (fn []
-      (let [wf (db/get-workflow ds invocation-id)]
-        (cond
-          (finished? wf) wf
-          (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id))))
-    #(some-> in-flight deref (get (:workflow/invocation-id (db/get-workflow ds invocation-id))))))
+  "Polls the workflow of wf - a row of it, STARTED - until it is DONE, ERROR
+   or TIMEOUT (timing it out if its lease runs out meanwhile), and returns
+   its row. When the invocation is running in this JVM (:tenon/in-flight),
+   waits on its completion promise instead of sleeping so same-JVM callers
+   wake as soon as it finishes."
+  [{ds :tenon/db in-flight :tenon/in-flight :as engine} wf]
+  (let [invocation-id (:workflow/invocation-id wf)
+        check (fn [wf]
+                (cond
+                  (finished? wf) wf
+                  (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id)))]
+    (or (check wf)
+        (with-backoff engine
+          #(check (db/get-workflow ds invocation-id))
+          #(some-> in-flight deref (get (:workflow/invocation-id (db/get-workflow ds invocation-id))))))))
 
-(defn- reuse-existing-result!
-  "Awaits the invocation-id run started by someone else, logs that the
-   current caller - under parent-id with metadata - reused it, then returns
-   its result, or throws describing its failure."
-  [{ds :tenon/db :as engine} invocation-id parent-id metadata]
-  (when (some #{invocation-id} *invocation-stack*)
-    (throw (ex-info "Cycle detected: workflow is already running on the current call stack"
-                    {:type ::cycle-detected
-                     :invocation-id invocation-id
-                     :invocation-stack *invocation-stack*})))
-  (let [wf (await-finished engine invocation-id)]
-    (db/record-reuse! ds (:workflow/invocation-id wf) parent-id (some-> metadata safe-pr-str))
-    (emit! engine :reused {:invocation-id (:workflow/invocation-id wf)
-                           :parent-invocation-id parent-id
-                           :wf-def (:workflow/name wf)
-                           :state (:workflow/state wf)
-                           :metadata metadata})
-    (cond
-      (done? wf) (edn/read-string (:workflow/result wf))
-      (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
-                     (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
-                                          (or (:cause failure) (:message failure)))
-                                     {:type ::previous-failure
-                                      :invocation-id (:workflow/invocation-id wf)
-                                      :state (:workflow/state wf)
-                                      :failure failure}))))))
+(defn- check-no-cycle!
+  "Throws if the invocation of wf is running on the current call stack - it
+   would be awaiting itself."
+  [wf]
+  (let [invocation-id (:workflow/invocation-id wf)]
+    (when (some #{invocation-id} *invocation-stack*)
+      (throw (ex-info "Cycle detected: workflow is already running on the current call stack"
+                      {:type ::cycle-detected
+                       :invocation-id invocation-id
+                       :invocation-stack *invocation-stack*})))))
+
+(defn- reused-result
+  "Emits :reused for wf - a finished row, whose reuse by the current caller
+   (under parent-id, with metadata) is recorded - then returns its result,
+   or throws describing its failure."
+  [engine wf parent-id metadata]
+  (emit! engine :reused {:invocation-id (:workflow/invocation-id wf)
+                         :parent-invocation-id parent-id
+                         :wf-def (:workflow/name wf)
+                         :state (:workflow/state wf)
+                         :metadata metadata})
+  (cond
+    (done? wf) (edn/read-string (:workflow/result wf))
+    (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
+                   (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
+                                        (or (:cause failure) (:message failure)))
+                                   {:type ::previous-failure
+                                    :invocation-id (:workflow/invocation-id wf)
+                                    :state (:workflow/state wf)
+                                    :failure failure})))))
 
 (defn run-invocation
   "Runs raw-fn with args, persisting the invocation.
@@ -255,26 +261,36 @@
      (throw (ex-info "Dynamic var *workflow-engine* is not bound."
                      {:type ::precondition-failed})))
    (let [ds (:tenon/db engine)
-         timeout-ms (:tenon/timeout-ms engine)
          wf-def-str (str (symbol v))
          args-vec (vec args)
          params-str (safe-pr-str args-vec)
          parent-id (first *invocation-stack*)
          metadata (metadata-for engine (symbol v) args-vec)
-         meta-str (some-> metadata safe-pr-str)]
-     (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-       (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-       (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
-         (do (emit! engine :started {:invocation-id invocation-id
-                                     :parent-invocation-id parent-id
-                                     :wf-def wf-def-str
-                                     :args args-vec
-                                     :metadata metadata})
-             (execute-and-record! engine invocation-id wf-def-str raw-fn args))
-         (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-           (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-           (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
-                            {:type ::race-condition :wf-def wf-def-str}))))))))
+         meta-str (some-> metadata safe-pr-str)
+         ;; starts it, or - finished - records this call as a reuse of it
+         wf (db/start-workflow! ds wf-def-str params-str parent-id meta-str (:tenon/timeout-ms engine))]
+     (case (:start/outcome wf)
+       :started
+       (let [invocation-id (:workflow/invocation-id wf)]
+         (emit! engine :started {:invocation-id invocation-id
+                                 :parent-invocation-id parent-id
+                                 :wf-def wf-def-str
+                                 :args args-vec
+                                 :metadata metadata})
+         (execute-and-record! engine invocation-id wf-def-str raw-fn args))
+
+       ;; Only a run timed out while still going (on this very stack) can
+       ;; be finished and on the stack: its reuse is recorded already, but
+       ;; it is a cycle all the same.
+       :reused
+       (do (check-no-cycle! wf)
+           (reused-result engine wf parent-id metadata))
+
+       :running
+       (do (check-no-cycle! wf)
+           (let [wf (await-finished engine wf)]
+             (db/record-reuse! ds (:workflow/invocation-id wf) parent-id meta-str)
+             (reused-result engine wf parent-id metadata)))))))
 
 
 (defn sweep!

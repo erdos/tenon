@@ -35,7 +35,7 @@
                                            WHERE table_schema = current_schema() ORDER BY table_name COLLATE \"C\""])))))
         (with-open [s (db/init-db! (postgres/storage url {:schema "test_other"}))]
           (try
-            (let [id (db/insert-workflow! s "test.ns/a" "[]" nil nil nil)]
+            (let [id (test-util/insert-workflow! s "test.ns/a" "[]" nil nil nil)]
               (is (= 1 (:count (jdbc/execute-one! s ["SELECT count(*) FROM test_other.workflow WHERE id = ?" id])))))
             (finally
               (jdbc/execute! s ["DROP SCHEMA test_other CASCADE"])))))))
@@ -50,7 +50,7 @@
     (fn [url]
       (let [ds (jdbc/get-datasource url)]
         (with-open [s (db/init-db! (postgres/storage ds {:schema (re-find #"test_\d+" url)}))]
-          (let [id (db/insert-workflow! s "test.ns/ds" "[]" nil nil nil)]
+          (let [id (test-util/insert-workflow! s "test.ns/ds" "[]" nil nil nil)]
             (is (true? (db/finish! s id "DONE" "1")))
             (is (= "DONE" (:workflow/state (db/get-workflow s id))))))))))
 
@@ -67,7 +67,7 @@
             (is (every? some? (mapv deref inits))))
           (is (= [] (db/top-level-workflows (first storages) {})))
           (testing "and init-db! of an existing schema changes nothing"
-            (let [id (db/insert-workflow! (first storages) "test.ns/init" "[]" nil nil nil)]
+            (let [id (test-util/insert-workflow! (first storages) "test.ns/init" "[]" nil nil nil)]
               (db/init-db! (second storages))
               (is (= id (:workflow/invocation-id (db/get-workflow (second storages) id))))))
           (finally
@@ -80,12 +80,12 @@
     (fn [ds]
       (db/init-db! ds)
       (with-redefs [postgres/idempotence-key (fn ^long [^String _ ^String _] 42)]
-        (let [a (db/insert-workflow! ds "test.ns/a" "[1]" nil nil nil)
-              b (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)
-              c (db/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)]
+        (let [a (test-util/insert-workflow! ds "test.ns/a" "[1]" nil nil nil)
+              b (test-util/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)
+              c (test-util/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)]
           (is (every? int? [a b c]) "colliding keys don't make them the same workflow")
           (is (= 3 (count (distinct [a b c]))))
-          (is (nil? (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)) "but the same one is still found")
+          (is (nil? (test-util/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)) "but the same one is still found")
           (is (= [a b c] (mapv #(:workflow/invocation-id (db/find-by-wf-def-and-params ds %1 %2))
                                ["test.ns/a" "test.ns/a" "test.ns/c"] ["[1]" "[2]" "[1]"])))
           (is (nil? (db/find-by-wf-def-and-params ds "test.ns/c" "[2]"))))))))
@@ -97,7 +97,7 @@
     (fn [ds]
       (db/init-db! ds)
       (doseq [[i s] (map-indexed vector ["" "\"árvíztűrő tükörfúrógép\"" "\"😀 \\u0000 \\n\"" (pr-str (vec (range 5000)))])]
-        (let [id (db/insert-workflow! ds "test.ns/text" (str "[" i " " s "]") nil s nil)]
+        (let [id (test-util/insert-workflow! ds "test.ns/text" (str "[" i " " s "]") nil s nil)]
           (db/finish! ds id "DONE" s)
           (is (= {:workflow/params (str "[" i " " s "]") :workflow/metadata s :workflow/result s}
                  (select-keys (db/get-workflow ds id) [:workflow/params :workflow/metadata :workflow/result]))))))))
@@ -115,9 +115,9 @@
                (let [rnd (java.util.Random. t)]
                  (vec (for [i (range (quot roots 8))]
                         (let [k (+ (* t 1000000) i)
-                              root (db/insert-workflow! storage (defs (.nextInt rnd 5)) (str "[" k "]") nil "{}" 15000)
+                              root (test-util/insert-workflow! storage (defs (.nextInt rnd 5)) (str "[" k "]") nil "{}" 15000)
                               kids (vec (for [j (range (.nextInt rnd 4))]
-                                          (let [c (db/insert-workflow! storage (defs (+ 5 (.nextInt rnd 15)))
+                                          (let [c (test-util/insert-workflow! storage (defs (+ 5 (.nextInt rnd 15)))
                                                                        (str "[" k " " j "]") root nil 15000)]
                                             (db/finish! storage c (if (zero? (.nextInt rnd 50)) "ERROR" "DONE") "1")
                                             c)))]
@@ -174,9 +174,13 @@
               some-root (nth roots 1000)
               started (first (filter #(= "STARTED" (:workflow/state (db/get-workflow s %))) roots))
               mid (nth (sort roots) (quot (count roots) 2))
+              finished (first (filter #(= "DONE" (:workflow/state %)) (map #(db/get-workflow s %) roots)))
+              start-params (fn [{:workflow/keys [name params]} parent]
+                             [(db/idempotence-key name params) name params parent nil 15000])
               statements (concat
-                          [["insert" (:insert sqls) [12345 "app.ns/wf-7" "[new]" some-root nil 15000]]
-                           ["insert an existing one" (:insert sqls) [(db/idempotence-key "app.ns/wf-0" "[0]") "app.ns/wf-0" "[0]" nil nil 1]]
+                          [["start a new one" (:start sqls) [12345 "app.ns/wf-7" "[new]" some-root nil 15000]]
+                           ["start a finished one: reuse it" (:start sqls) (start-params finished some-root)]
+                           ["start a running one" (:start sqls) (start-params (db/get-workflow s started) nil)]
                            ["finish" (:finish sqls) [1 started true "42"]]
                            ["time-out" (:finish sqls) [3 started false "42"]]
                            ["restart" (:restart sqls) [some-root nil 15000]]
@@ -222,15 +226,15 @@
                           (jdbc/execute-one! s ["SELECT n_tup_upd AS updated, n_tup_hot_upd AS hot
                                                    FROM pg_stat_user_tables WHERE relid = 'workflow'::regclass"]
                                              {:builder-fn rs/as-unqualified-maps}))
-                parent (db/insert-workflow! s "test.ns/parent" "[]" nil nil 60000)
+                parent (test-util/insert-workflow! s "test.ns/parent" "[]" nil nil 60000)
                 children (vec (for [i (range 20)]
-                                (let [c (db/insert-workflow! s "test.ns/child" (str "[" i "]") parent nil nil)]
+                                (let [c (test-util/insert-workflow! s "test.ns/child" (str "[" i "]") parent nil nil)]
                                   (db/finish! s c "DONE" "1")
                                   c)))
                 before (updates)]
             (testing "calls update no workflow row"
               (doseq [c children] (db/record-reuse! s c parent nil))
-              (dotimes [i 20] (db/insert-workflow! s "test.ns/child" (str "[more " i "]") parent nil nil))
+              (dotimes [i 20] (test-util/insert-workflow! s "test.ns/child" (str "[more " i "]") parent nil nil))
               (is (= before (updates))))
             (testing "lease renewals are HOT"
               (dotimes [_ 50] (db/extend-lease! s #{parent} 60000))

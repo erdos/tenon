@@ -188,26 +188,57 @@
    ;; and looks sparse to the planner - this one stays dense.
    "CREATE INDEX IF NOT EXISTS workflow_failed ON {{s}}.workflow (state, id)
       WHERE state IN ({{ERROR}}, {{TIMEOUT}})"
-   ;; insert-workflow!: the key's advisory lock makes the check and the
-   ;; insert atomic. The wf_def is usually there already: then it is
-   ;; looked up, not upserted (an upsert would lock its row, serializing
-   ;; every insert of the wf_def).
-   "CREATE OR REPLACE FUNCTION {{s}}.insert_workflow(p_key bigint, p_wf_def text, p_params text, p_parent bigint,
-                                                     p_metadata text, p_timeout bigint)
-    RETURNS bigint LANGUAGE plpgsql AS $$
+   ;; start-workflow!: an existing workflow - a reuse, the usual case - is
+   ;; found without the key's lock, so callers of a popular workflow don't
+   ;; queue up on it (a workflow, once there, stays). Else the key's
+   ;; advisory lock makes the check and the insert atomic. The wf_def is
+   ;; usually there already: then it is looked up, not upserted (an upsert
+   ;; would lock its row, serializing every insert of the wf_def). Returns
+   ;; the state-columns of the workflow, whether its lease has expired, and
+   ;; the outcome: 0 started, 1 reused, 2 running.
+   "CREATE OR REPLACE FUNCTION {{s}}.start_workflow(p_key bigint, p_wf_def text, p_params text, p_parent bigint,
+                                                    p_metadata text, p_timeout bigint)
+    RETURNS TABLE (o_invocation_id bigint, o_name text, o_params text, o_state smallint, o_state_changed_at bigint,
+                   o_expires_at bigint, o_metadata text, o_result text, o_parent_invocation_id bigint,
+                   o_expired boolean, o_outcome smallint)
+    LANGUAGE plpgsql AS $$
     DECLARE
       v_now    bigint := {{now}};
+      v_wf     bigint;
       v_def    integer;
       v_top    boolean;
       v_caller bigint;
       v_id     bigint;
+      v_row    record;
     BEGIN
-      PERFORM pg_advisory_xact_lock(p_key);
-      PERFORM FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
+      SELECT f.id INTO v_wf FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
        WHERE f.key = p_key AND f.params = p_params AND d.name = p_wf_def;
-      IF FOUND THEN
-        RETURN NULL;
+      IF v_wf IS NULL THEN
+        PERFORM pg_advisory_xact_lock(p_key);
+        SELECT f.id INTO v_wf FROM {{s}}.event f JOIN {{s}}.wf_def d ON d.id = f.wf_def_id
+         WHERE f.key = p_key AND f.params = p_params AND d.name = p_wf_def;
       END IF;
+      SELECT workflow_id INTO v_caller FROM {{s}}.event WHERE id = p_parent;
+
+      IF v_wf IS NOT NULL THEN
+        SELECT {{state-columns}}, coalesce(w.expires_at <= v_now, false) AS expired, f.wf_def_id INTO v_row
+          FROM {{s}}.workflow w {{state-joins}}
+         WHERE w.id = v_wf;
+        IF v_row.state <> {{STARTED}} THEN
+          INSERT INTO {{s}}.event (id, workflow_id, state, occurred_at, data, invocation_id, parent_invocation_id,
+                                   caller_id, wf_def_id)
+          VALUES (nextval('{{s}}.event_id_seq'), v_wf, {{REUSED}}, v_now, p_metadata, v_row.invocation_id, p_parent,
+                  v_caller, v_row.wf_def_id);
+          IF p_parent IS NULL THEN
+            UPDATE {{s}}.wf_def SET top_level = true WHERE id = v_row.wf_def_id AND NOT top_level;
+          END IF;
+        END IF;
+        RETURN QUERY SELECT v_row.invocation_id, v_row.name, v_row.params, v_row.state, v_row.state_changed_at,
+                            v_row.expires_at, v_row.metadata, v_row.result, v_row.parent_invocation_id, v_row.expired,
+                            (CASE WHEN v_row.state = {{STARTED}} THEN 2 ELSE 1 END)::smallint;
+        RETURN;
+      END IF;
+
       SELECT id, top_level INTO v_def, v_top FROM {{s}}.wf_def WHERE name = p_wf_def;
       IF NOT FOUND THEN
         INSERT INTO {{s}}.wf_def (name, top_level) VALUES (p_wf_def, p_parent IS NULL)
@@ -220,7 +251,6 @@
       IF p_parent IS NULL AND NOT v_top THEN
         UPDATE {{s}}.wf_def SET top_level = true WHERE id = v_def AND NOT top_level;
       END IF;
-      SELECT workflow_id INTO v_caller FROM {{s}}.event WHERE id = p_parent;
       v_id := nextval('{{s}}.event_id_seq');
       INSERT INTO {{s}}.event (id, workflow_id, state, occurred_at, data, key, params, expires_at,
                                parent_invocation_id, caller_id, wf_def_id)
@@ -228,7 +258,8 @@
               p_parent, v_caller, v_def);
       INSERT INTO {{s}}.workflow (id, invocation_id, state, state_id, expires_at)
       VALUES (v_id, v_id, {{STARTED}}, v_id, v_now + p_timeout);
-      RETURN v_id;
+      RETURN QUERY SELECT v_id, p_wf_def, p_params, {{STARTED}}::smallint, v_now, v_now + p_timeout, p_metadata,
+                          NULL::text, p_parent, coalesce(p_timeout <= 0, false), 0::smallint;
     END
     $$"
    ;; restart!: locking the row re-checks that the invocation is still the
@@ -291,6 +322,11 @@
 (def ^:private read-get-workflow
   (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
                   :workflow/expired (.getBoolean %)))
+
+(def ^:private read-start
+  (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
+                  :workflow/expired (.getBoolean %)
+                  :start/outcome ([:started :reused :running] (.getInt %))))
 
 (def ^:private read-expired
   (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
@@ -506,7 +542,7 @@
 ;; The statements
 
 (def ^:private statements
-  {:insert "SELECT {{s}}.insert_workflow(?::bigint, ?::text, ?::text, ?::bigint, ?::text, ?::bigint)"
+  {:start "SELECT * FROM {{s}}.start_workflow(?::bigint, ?::text, ?::text, ?::bigint, ?::text, ?::bigint)"
 
    :finish
    ;; Compare-and-set on the workflow row: Postgres re-checks the WHERE on
@@ -698,12 +734,12 @@
     (init-schema! (ds-of this) (.-schema this))
     this)
 
-  (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    (first (query (ds-of this) (:insert (sqls-of this))
+  (start-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    (first (query (ds-of this) (:start (sqls-of this))
                   [(idempotence-key wf-def params-edn-str) wf-def params-edn-str parent-invocation-id
                    metadata-edn-str timeout-ms]
                   #{5}
-                  read-nilable-id)))
+                  read-start)))
 
   (finish! [this invocation-id state result-edn-str]
     (finish! (ds-of this) (sqls-of this) invocation-id state result-edn-str false))

@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [next.jdbc :as jdbc]
             [tenon.workflow.db :as db]
+            [tenon.workflow.test-util :as test-util]
             [tenon.workflow.sqlite :as sqlite]
             [tenon.workflow.storage-contract :as contract]))
 
@@ -59,7 +60,7 @@
       (with-open [ds (sqlite/datasource path)]
         (db/init-db! ds)
         (dotimes [i 1500]
-          (db/finish! ds (db/insert-workflow! ds "test.ns/wal" (pr-str [i]) nil nil nil) "DONE" "1"))
+          (db/finish! ds (test-util/insert-workflow! ds "test.ns/wal" (pr-str [i]) nil nil nil) "DONE" "1"))
         (let [page-size (:page_size (jdbc/execute-one! ds ["PRAGMA page_size"]))
               wal-pages (quot (.length (java.io.File. (str path "-wal"))) (+ 24 page-size))]
           (is (< wal-pages 1100) (str "the WAL has " wal-pages " pages")))))))
@@ -72,12 +73,12 @@
       (with-open [ds (sqlite/datasource path)]
         (db/init-db! ds)
         (with-redefs [sqlite/idempotence-key (fn ^long [^String _ ^String _] 42)]
-          (let [a (db/insert-workflow! ds "test.ns/a" "[1]" nil nil nil)
-                b (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)
-                c (db/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)]
+          (let [a (test-util/insert-workflow! ds "test.ns/a" "[1]" nil nil nil)
+                b (test-util/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)
+                c (test-util/insert-workflow! ds "test.ns/c" "[1]" nil nil nil)]
             (is (every? int? [a b c]) "colliding keys don't make them the same workflow")
             (is (= 3 (count (distinct [a b c]))))
-            (is (nil? (db/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)) "but the same one is still found")
+            (is (nil? (test-util/insert-workflow! ds "test.ns/a" "[2]" nil nil nil)) "but the same one is still found")
             (is (= [a b c] (mapv #(:workflow/invocation-id (db/find-by-wf-def-and-params ds %1 %2))
                                  ["test.ns/a" "test.ns/a" "test.ns/c"] ["[1]" "[2]" "[1]"])))
             (is (nil? (db/find-by-wf-def-and-params ds "test.ns/c" "[2]")))))))))

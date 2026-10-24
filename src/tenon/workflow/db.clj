@@ -7,7 +7,7 @@
    every restart - and triggers log each state into workflow_history as it
    is entered, so history ids order every state of every workflow. The
    only history row written directly is REUSED
-   (record-reuse!): a caller got an earlier invocation's result instead of
+   (start-workflow!, record-reuse!): a caller got an earlier invocation's result instead of
    running it. Every history row carries the parent_invocation_id it was
    recorded under - for REUSED rows, the reusing caller's.
 
@@ -44,12 +44,19 @@
   (init-db! [this]
     "Ensures the required schema and tables exist in the storage. Returns this.")
 
-  (insert-workflow!
+  (start-workflow!
     [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
-    "Inserts a STARTED workflow row, unless one already exists for this exact
-     (wf_def, params) pair, in which case nothing is inserted. Its lease
-     expires timeout-ms after now (nil: never). Returns the new row's
-     invocation_id, or nil if nothing was inserted.")
+    "A call of the workflow of this exact (wf_def, params) pair, by a caller
+     running under parent-invocation-id (nil: top-level), described by
+     metadata-edn-str - in one step, atomic with respect to other calls:
+     - no such workflow yet: inserts it STARTED, its lease expiring
+       timeout-ms after now (nil: never);
+     - it is DONE, ERROR or TIMEOUT: records the call as a reuse of its
+       current invocation, as record-reuse! would;
+     - it is STARTED: changes nothing - the caller is to await it, then
+       record-reuse!.
+     Returns the workflow's row, with the keys of get-workflow, plus
+     :start/outcome - :started, :reused or :running, respectively.")
 
   (finish! [this invocation-id state result-edn-str]
     "Moves invocation-id from STARTED to state (DONE or ERROR) with
