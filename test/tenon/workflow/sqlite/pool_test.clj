@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [next.jdbc :as jdbc]
             [tenon.workflow.sqlite :as sqlite]
+            [tenon.workflow.sqlite.next-jdbc]
             [tenon.workflow.sqlite.pool :as pool]))
 
 (defn- with-pool [f]

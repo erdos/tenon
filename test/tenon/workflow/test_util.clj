@@ -3,7 +3,8 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [tenon.workflow :as engine]
-            [tenon.workflow.db :as db]))
+            [tenon.workflow.db :as db]
+            [tenon.workflow.sqlite.next-jdbc]))
 
 (def ^:dynamic *db-path*
   "Absolute path of the current test's temp SQLite file, bound by

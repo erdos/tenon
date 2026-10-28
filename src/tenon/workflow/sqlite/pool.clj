@@ -1,7 +1,5 @@
 (ns tenon.workflow.sqlite.pool
   "A small SQLite connection pool whose connections keep their prepared statements."
-  (:require [next.jdbc.prepare :as prepare]
-            [next.jdbc.protocols :as p])
   (:import [java.io Closeable]
            [java.sql Connection DriverManager PreparedStatement]
            [java.util HashMap Map]
@@ -15,12 +13,19 @@
 
 (deftype Conn [^Connection conn ^Map stmts]) ; a connection and its prepared statements, by SQL
 
+(defn- set-params ^PreparedStatement [^PreparedStatement ps params]
+  (loop [i 1 params (seq params)]
+    (when params
+      (.setObject ps i (first params))
+      (recur (inc i) (next params))))
+  ps)
+
 (defn- with-statement [^Conn c ^String sql params f]
   (let [^Map stmts (.-stmts c)
         ^PreparedStatement ps (or (.get stmts sql)
                                   (let [ps (.prepareStatement ^Connection (.-conn c) sql)] (.put stmts sql ps) ps))]
     (try
-      (f (prepare/set-parameters ps params))
+      (f (set-params ps params))
       (catch Throwable e
         (.remove stmts sql)
         (close-quietly ps)
@@ -39,15 +44,6 @@
 (deftype Pool [^String url ^LinkedBlockingDeque idle ^Semaphore permits ^AtomicBoolean closed
                ^ReentrantLock write-lock ^Condition batch-done ^AtomicBoolean leading
                ^ConcurrentLinkedQueue writes]
-  ;; next.jdbc can run statements on the pool, each on a connection of it
-  ;; (the storage itself uses query and execute!)
-  p/Executable
-  (-execute [_ _ _]
-    (throw (UnsupportedOperationException. "plan needs a connection")))
-  (-execute-one [this sql-params opts]
-    (with-borrowed [^Conn c this] (p/-execute-one (.-conn c) sql-params opts)))
-  (-execute-all [this sql-params opts]
-    (with-borrowed [^Conn c this] (p/-execute-all (.-conn c) sql-params opts)))
   Closeable
   (close [_this]
     (.set closed true)
@@ -60,6 +56,12 @@
   (let [lock (ReentrantLock.)]
     (Pool. url (LinkedBlockingDeque.) (Semaphore. size) (AtomicBoolean. false) lock (.newCondition lock)
            (AtomicBoolean. false) (ConcurrentLinkedQueue.))))
+
+(defn with-connection
+  "Calls (f connection) with the java.sql.Connection of a connection
+   borrowed from pool, giving it back after."
+  [pool f]
+  (with-borrowed [^Conn c pool] (f (.-conn c))))
 
 (defn execute!
   "Runs sql - a statement without a result - with params on c, a

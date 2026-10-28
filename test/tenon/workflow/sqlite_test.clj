@@ -3,6 +3,7 @@
             [next.jdbc :as jdbc]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
+            [tenon.workflow.sqlite.next-jdbc]
             [tenon.workflow.storage-contract :as contract]))
 
 (defn- with-temp-db [f]
