@@ -43,7 +43,6 @@
             [tenon.workflow.sqlite.jdbc :refer [int-at int-or-nil-at row-fn text-at]]
             [tenon.workflow.sqlite.pool :as pool])
   (:import [java.sql ResultSet]
-           [java.util.concurrent ConcurrentHashMap]
            [tenon.workflow.sqlite.pool Pool]))
 
 (def ^:private states
@@ -81,10 +80,16 @@
    ;; the states' codes: {{STARTED}}, {{DONE}}, ...
    (map-indexed (fn [code state] [(str "{{" state "}}") (str code)]) states)))
 
+(defn- fill
+  ^String [^String template replacements]
+  (reduce (fn [^String s [^String k ^String v]] (.replace s k v)) template replacements))
+
 (defn- sql
-  "The SQL of template, its placeholders filled in (see placeholders)."
-  ^String [^String template]
-  (reduce (fn [^String s [^String k ^String v]] (.replace s k v)) template placeholders))
+  "The SQL of template, its placeholders filled in: first those of
+   replacements, a map from placeholder to its value, then those of
+   placeholders."
+  (^String [template] (fill template placeholders))
+  (^String [template replacements] (sql (fill template replacements))))
 
 (defn- hash-chars
   "h folded with the chars of s, FNV-1a style (64-bit)."
@@ -250,9 +255,27 @@
                   :workflow/parent-invocation-id (int-or-nil-at %)
                   :event/reused (= "REUSED" (state-at %))))
 
-(defn- calls-sql
-  "A fn building the SQL, and the params, for top-level-workflows. Calls
-   are found
+(def ^:private not-done-states
+  "The states whose workflows top-level-workflows finds through
+   workflow_not_done."
+  #{"STARTED" "ERROR" "TIMEOUT"})
+
+(defn- calls-shape
+  "Which of the filters of top-level-workflows are given - and the state
+   itself if it is one of not-done-states: the SQL depends on these only."
+  [{:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
+  {:state (if (not-done-states state) state (some? state))
+   :wf-def? (some? wf-def)
+   :top-level-only? (boolean top-level-only?)
+   :limit? (some? limit)
+   :before? (some? before)})
+
+(defn- and-all ^String [& conditions]
+  (apply str (map #(str " AND " %) (remove nil? conditions))))
+
+(def ^:private calls-sql
+  "The SQL of top-level-workflows for a calls-shape, and the filters its
+   params are, in order (see calls-params). Calls are found
    - STARTED, ERROR or TIMEOUT: through the few workflows in that state
      (workflow_not_done) - each one's first call, and its reuses from its
      own event list;
@@ -260,124 +283,97 @@
      two merged otherwise (the ids first, so only the page is joined);
    - else: from event_top_call for top-level calls only, else walking the
      log newest first."
-  [{:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
-  (let [limit (when limit (inc limit))
-        code (some-> state state-code)
-        and-all (fn ^String [& conditions] (apply str (interleave (repeat " AND ") (remove nil? conditions))))
-        ^String limit-sql (if limit " LIMIT ?" "")
-        def-filter "c.wf_def_id = (SELECT id FROM wf_def WHERE name = ?)"]
-    (cond
-      (#{"STARTED" "ERROR" "TIMEOUT"} state)
-      ;; A first call of a workflow in the state is in workflow_not_done's
-      ;; order, so a page of them is a range of it. Its reuses are in its
-      ;; reuse list, newest first - and only those newer than the page's
-      ;; oldest first call can make it onto the page, so each list is cut
-      ;; there.
-      (let [filters (fn ^String [^String id]
-                      ^String (and-all (when top-level-only? "c.parent_invocation_id IS NULL")
-                               (when wf-def def-filter)
-                               (when before (.replace "{{id}} < ?" "{{id}}" id))))
-            filter-params (cond-> [] wf-def (conj wf-def) before (conj before))]
-        [#(-> "WITH RECURSIVE
-                 first(id) AS (
-                   SELECT r.id FROM workflow r INDEXED BY workflow_not_done CROSS JOIN event c ON c.id = r.id
-                    WHERE r.state = {{state}} AND r.state <> {{DONE}}{{first-filters}}
-                    ORDER BY r.id DESC{{limit}}),
-                 bound(id) AS ({{bound}}),
-                 reuse(id) AS (
-                   SELECT w.last_reuse_id FROM bound CROSS JOIN workflow w INDEXED BY workflow_not_done
-                    WHERE w.state = {{state}} AND w.state <> {{DONE}} AND w.last_reuse_id >= bound.id
-                   UNION ALL
-                   SELECT e.prev_id FROM reuse r CROSS JOIN event e ON e.id = r.id CROSS JOIN bound
-                    WHERE e.prev_id >= bound.id)
-               SELECT * FROM (
-                 SELECT {{call-columns}}
-                   FROM first x
-                   CROSS JOIN event c ON c.id = x.id
-                   CROSS JOIN workflow w ON w.id = x.id {{state-joins}}
-                 UNION ALL
-                 SELECT {{call-columns}}
-                   FROM reuse x
-                   CROSS JOIN event c ON c.id = x.id
-                   CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
-                  WHERE c.state = {{REUSED}}{{reuse-filters}})
-               ORDER BY call_id DESC{{limit}}"
-              (.replace "{{state}}" ^String (str code))
-              (.replace "{{first-filters}}" ^String (filters "r.id"))
-              (.replace "{{reuse-filters}}" ^String (filters "c.id"))
-              (.replace "{{bound}}" ^String (if limit "SELECT iif(count(*) < ?, 0, min(id)) FROM first" "SELECT 0"))
-              (.replace "{{limit}}" limit-sql)
-              sql)
-         (cond-> filter-params
-           limit (conj limit limit)
-           true (into filter-params)
-           limit (conj limit))])
+  (memoize
+   (fn [{:keys [state wf-def? top-level-only? limit? before?]}]
+     (let [limit-sql (if limit? " LIMIT ?" "")
+           def-filter "c.wf_def_id = (SELECT id FROM wf_def WHERE name = ?)"
+           params (fn [& ks] (vec (keep (fn [[k given?]] (when given? k)) (partition 2 ks))))]
+       (cond
+         (not-done-states state)
+         ;; A first call of a workflow in the state is in workflow_not_done's
+         ;; order, so a page of them is a range of it. Its reuses are in its
+         ;; reuse list, newest first - and only those newer than the page's
+         ;; oldest first call can make it onto the page, so each list is cut
+         ;; there.
+         (let [filters #(and-all (when top-level-only? "c.parent_invocation_id IS NULL")
+                                 (when wf-def? def-filter)
+                                 (when before? (str % " < ?")))
+               filter-params (params :wf-def wf-def? :before before?)]
+           [(sql "WITH RECURSIVE
+                    first(id) AS (
+                      SELECT r.id FROM workflow r INDEXED BY workflow_not_done CROSS JOIN event c ON c.id = r.id
+                       WHERE r.state = {{state}} AND r.state <> {{DONE}}{{first-filters}}
+                       ORDER BY r.id DESC{{limit}}),
+                    bound(id) AS ({{bound}}),
+                    reuse(id) AS (
+                      SELECT w.last_reuse_id FROM bound CROSS JOIN workflow w INDEXED BY workflow_not_done
+                       WHERE w.state = {{state}} AND w.state <> {{DONE}} AND w.last_reuse_id >= bound.id
+                      UNION ALL
+                      SELECT e.prev_id FROM reuse r CROSS JOIN event e ON e.id = r.id CROSS JOIN bound
+                       WHERE e.prev_id >= bound.id)
+                  SELECT * FROM (
+                    SELECT {{call-columns}}
+                      FROM first x
+                      CROSS JOIN event c ON c.id = x.id
+                      CROSS JOIN workflow w ON w.id = x.id {{state-joins}}
+                    UNION ALL
+                    SELECT {{call-columns}}
+                      FROM reuse x
+                      CROSS JOIN event c ON c.id = x.id
+                      CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
+                     WHERE c.state = {{REUSED}}{{reuse-filters}})
+                  ORDER BY call_id DESC{{limit}}"
+                 {"{{state}}" (str (state-code state))
+                  "{{first-filters}}" (filters "r.id")
+                  "{{reuse-filters}}" (filters "c.id")
+                  "{{bound}}" (if limit? "SELECT iif(count(*) < ?, 0, min(id)) FROM first" "SELECT 0")
+                  "{{limit}}" limit-sql})
+            (vec (concat filter-params (params :limit limit? :limit limit?) filter-params (params :limit limit?)))])
 
-      wf-def
-      (let [conditions (fn ^String [top-level]
-                         (-> "{{def-filter}} AND (c.parent_invocation_id IS NULL) = {{top-level}}{{filters}}"
-                             (.replace "{{def-filter}}" def-filter)
-                             (.replace "{{top-level}}" ^String (str top-level))
-                             (.replace "{{filters}}" ^String (and-all (when state "w.state = ?") (when before "c.id < ?")))))
-            params (cond-> [wf-def] state (conj code) before (conj before) limit (conj limit))]
-        (if top-level-only?
-          [#(-> "SELECT {{call-columns}}
-                   FROM event c INDEXED BY event_call
-                   CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
-                  WHERE {{conditions}}
-                  ORDER BY c.id DESC{{limit}}"
-                (.replace "{{conditions}}" ^String (conditions 1))
-                (.replace "{{limit}}" limit-sql)
-                sql)
-           params]
-          (let [ids (fn ^String [top-level]
-                      (-> "SELECT c.id FROM event c INDEXED BY event_call{{workflow}}
-                            WHERE {{conditions}}
-                            ORDER BY c.id DESC{{limit}}"
-                          (.replace "{{workflow}}" ^String (if state " CROSS JOIN workflow w ON w.id = c.workflow_id" ""))
-                          (.replace "{{conditions}}" ^String (conditions top-level))
-                          (.replace "{{limit}}" limit-sql)))]
-            [#(-> "SELECT {{call-columns}}
-                     FROM (SELECT id FROM (SELECT * FROM ({{top-level-ids}}) UNION ALL SELECT * FROM ({{nested-ids}}))
-                            ORDER BY id DESC{{limit}}) x
-                     CROSS JOIN event c ON c.id = x.id
-                     CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
-                    ORDER BY c.id DESC"
-                  (.replace "{{top-level-ids}}" ^String (ids 1))
-                  (.replace "{{nested-ids}}" ^String (ids 0))
-                  (.replace "{{limit}}" limit-sql)
-                  sql)
-             (cond-> (into params params) limit (conj limit))])))
+         wf-def?
+         (let [conditions #(str def-filter " AND (c.parent_invocation_id IS NULL) = " %
+                                (and-all (when state "w.state = ?") (when before? "c.id < ?")))
+               condition-params (params :wf-def true :state state :before before? :limit limit?)]
+           (if top-level-only?
+             [(sql "SELECT {{call-columns}}
+                      FROM event c INDEXED BY event_call
+                      CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
+                     WHERE {{conditions}}
+                     ORDER BY c.id DESC{{limit}}"
+                   {"{{conditions}}" (conditions 1) "{{limit}}" limit-sql})
+              condition-params]
+             (let [ids #(fill "SELECT c.id FROM event c INDEXED BY event_call{{workflow}}
+                                WHERE {{conditions}}
+                                ORDER BY c.id DESC{{limit}}"
+                              {"{{workflow}}" (if state " CROSS JOIN workflow w ON w.id = c.workflow_id" "")
+                               "{{conditions}}" (conditions %)
+                               "{{limit}}" limit-sql})]
+               [(sql "SELECT {{call-columns}}
+                        FROM (SELECT id FROM (SELECT * FROM ({{top-level-ids}}) UNION ALL SELECT * FROM ({{nested-ids}}))
+                               ORDER BY id DESC{{limit}}) x
+                        CROSS JOIN event c ON c.id = x.id
+                        CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
+                       ORDER BY c.id DESC"
+                     {"{{top-level-ids}}" (ids 1) "{{nested-ids}}" (ids 0) "{{limit}}" limit-sql})
+                (vec (concat condition-params condition-params (params :limit limit?)))])))
 
-      :else
-      [#(-> "SELECT {{call-columns}}
-               FROM event c {{index}}
-               CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
-              WHERE c.wf_def_id IS NOT NULL{{filters}}
-              ORDER BY c.id DESC{{limit}}"
-            (.replace "{{index}}" ^String (if top-level-only? "INDEXED BY event_top_call" "NOT INDEXED"))
-            (.replace "{{filters}}" ^String (and-all (when top-level-only? "c.parent_invocation_id IS NULL")
-                                             (when state "w.state = ?")
-                                             (when before "c.id < ?")))
-            (.replace "{{limit}}" limit-sql)
-            sql)
-       (cond-> [] state (conj code) before (conj before) limit (conj limit))])))
+         :else
+         [(sql "SELECT {{call-columns}}
+                  FROM event c {{index}}
+                  CROSS JOIN workflow w ON w.id = c.workflow_id {{state-joins}}
+                 WHERE c.wf_def_id IS NOT NULL{{filters}}
+                 ORDER BY c.id DESC{{limit}}"
+               {"{{index}}" (if top-level-only? "INDEXED BY event_top_call" "NOT INDEXED")
+                "{{filters}}" (and-all (when top-level-only? "c.parent_invocation_id IS NULL")
+                                       (when state "w.state = ?")
+                                       (when before? "c.id < ?"))
+                "{{limit}}" limit-sql})
+          (params :state state :before before? :limit limit?)])))))
 
-(def ^:private calls-sql-cache
-  "The SQL of top-level-workflows by the shape of its filters."
-  (ConcurrentHashMap.))
-
-(defn- calls-query
-  "SQL and params for top-level-workflows - the SQL built once per shape
-   of filters (which of them are given, and the state if it is one of
-   those found through workflow_not_done)."
-  [{:keys [state wf-def top-level-only? limit before] :or {top-level-only? true} :as filters}]
-  (let [[sql params] (calls-sql filters)
-        shape [(if (#{"STARTED" "ERROR" "TIMEOUT"} state) state (some? state))
-               (some? wf-def) (boolean top-level-only?) (some? limit) (some? before)]]
-    [(or (.get ^ConcurrentHashMap calls-sql-cache shape)
-         (let [sql (sql)] (.put ^ConcurrentHashMap calls-sql-cache shape sql) sql))
-     params]))
+(defn- calls-params
+  "The values of the filters param-keys names, as the SQL takes them."
+  [{:keys [state wf-def limit before]} param-keys]
+  (mapv #(case % :state (state-code state) :wf-def wf-def :limit (inc limit) :before before) param-keys))
 
 (defn- init-schema!
   "Creates the schema in a single transaction that takes the write lock up
@@ -528,8 +524,8 @@
     ([this]
      (db/top-level-workflows this nil))
     ([this filters]
-     (let [[sql params] (calls-query filters)]
-       (pool/query this sql params read-call))))
+     (let [[sql param-keys] (calls-sql (calls-shape filters))]
+       (pool/query this sql (calls-params filters param-keys) read-call))))
 
   (top-level-wf-defs [this top-level-only?]
     (pool/query this "SELECT name FROM wf_def WHERE top_level OR NOT ? ORDER BY name" [(boolean top-level-only?)]
