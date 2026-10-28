@@ -634,6 +634,24 @@
     (is (match? {:workflow/state "DONE"} (@#'engine/await-finished engine id)))
     (is (< (/ (- (System/nanoTime) t0) 1e6) 1000) "it did not wait out the 10 s")))
 
+(deftest background-task-errors-are-emitted-and-do-not-stop-it-test
+  (let [events (atom [])
+        sweeps (atom 0)
+        list-expired db/list-expired]
+    (with-redefs [db/list-expired (fn [ds]
+                                    (when (<= (swap! sweeps inc) 2) (throw (ex-info "sweep failed" {})))
+                                    (list-expired ds))]
+      (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms 10
+                                 :tenon/on-event #(swap! events conj [%1 %2]))]
+        (try
+          (is (wait-for #(< 3 @sweeps) 2000) "it keeps sweeping after it failed")
+          (finally
+            (engine/close! engine1)))))
+    (is (match? [[:sweep-error {:error {:message "sweep failed"}}]
+                 [:sweep-error {:error {:message "sweep failed"}}]]
+                (mapv (fn [[event {:keys [error]}]] [event {:error {:message (ex-message error)}}])
+                      (filter (comp #{:sweep-error} first) @events))))))
+
 (deftest engine-on-event-is-never-nil-test
   (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil)]
     (try

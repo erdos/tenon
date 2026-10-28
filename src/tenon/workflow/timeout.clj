@@ -12,7 +12,7 @@
    it."
   (:require [tenon.workflow.common :refer [emit! exception-str]]
             [tenon.workflow.db :as db])
-  (:import [java.util.concurrent Executors RejectedExecutionException ScheduledExecutorService ThreadFactory TimeUnit]))
+  (:import [java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit]))
 
 (defn time-out-if-expired!
   "Moves wf - a row of the storage - to TIMEOUT if it is STARTED past its
@@ -71,23 +71,22 @@
   (let [executor (Executors/newScheduledThreadPool
                   2 (reify ThreadFactory
                       (newThread [_ r] (doto (Thread. ^Runnable r "tenon-background") (.setDaemon true)))))
-        ;; Runs (step state) after delay-ms, then again after period-ms with the
-        ;; state it returned (or the same, if it threw).
-        schedule! (fn schedule! [error-event delay-ms period-ms step state]
-                    (.schedule executor
-                               ^Runnable (fn []
-                                           (let [state (try (step state)
-                                                            (catch Throwable e
-                                                              (try (emit! engine error-event {:error e})
-                                                                   (catch Throwable _))
-                                                              state))]
-                                             (try (schedule! error-event period-ms period-ms step state)
-                                                  (catch RejectedExecutionException _))))
-                               (long delay-ms) TimeUnit/MILLISECONDS))]
+        ;; Runs task after delay-ms, then period-ms after each run ends. What it
+        ;; throws is emitted as error-event, never let through - that would
+        ;; cancel the schedule.
+        every! (fn [delay-ms period-ms error-event task]
+                 (.scheduleWithFixedDelay executor
+                                          ^Runnable (fn []
+                                                      (try (task)
+                                                           (catch Throwable e
+                                                             (try (emit! engine error-event {:error e})
+                                                                  (catch Throwable _)))))
+                                          (long delay-ms) (long period-ms) TimeUnit/MILLISECONDS))]
     (when heartbeat-ms
-      (schedule! :heartbeat-error heartbeat-ms heartbeat-ms #(heartbeat! engine %) #{}))
+      (let [lost (volatile! #{})]
+        (every! heartbeat-ms heartbeat-ms :heartbeat-error #(vswap! lost (partial heartbeat! engine)))))
     (when sweep-ms
-      (schedule! :sweep-error 0 sweep-ms (fn [_] (sweep! engine) nil) nil))
+      (every! 0 sweep-ms :sweep-error #(sweep! engine)))
     executor))
 
 (defn start!
@@ -106,10 +105,8 @@
      out, whichever process ran them - see sweep!. It does not restart
      them."
   [{:tenon/keys [timeout-ms] :as engine}]
-  (let [default-ms (fn [k default]
-                     (if (contains? engine k) (get engine k) default))
-        heartbeat-ms (default-ms :tenon/heartbeat-ms (some-> timeout-ms (quot 3) (max 1)))
-        sweep-ms (default-ms :tenon/sweep-ms timeout-ms)
+  (let [heartbeat-ms (get engine :tenon/heartbeat-ms (some-> timeout-ms (quot 3) (max 1)))
+        sweep-ms (get engine :tenon/sweep-ms timeout-ms)
         engine (assoc engine :tenon/heartbeat-ms heartbeat-ms :tenon/sweep-ms sweep-ms)
         heartbeat-ms (when timeout-ms heartbeat-ms)]
     (cond-> engine
