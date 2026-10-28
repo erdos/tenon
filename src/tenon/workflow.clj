@@ -97,6 +97,13 @@
    what makes them work at all. nil until then."
   nil)
 
+(defn- current-engine
+  "*workflow-engine*, which must be bound."
+  []
+  (or *workflow-engine*
+      (throw (ex-info "Dynamic var *workflow-engine* is not bound."
+                      {:type ::precondition-failed}))))
+
 (def ^:dynamic *invocation-stack*
   "Invocation ids of the #workflow invocations currently running on this
    thread, innermost (most recently started) first. Bound by
@@ -205,11 +212,8 @@
   "Runs raw-fn with args, persisting the invocation.
    Returns raw-fn's result, or rethrows any exception."
   ([v raw-fn args]
-   (run-invocation *workflow-engine* v raw-fn args))
+   (run-invocation (current-engine) v raw-fn args))
   ([engine v raw-fn args]
-   (when-not engine
-     (throw (ex-info "Dynamic var *workflow-engine* is not bound."
-                     {:type ::precondition-failed})))
    (let [ds (:tenon/db engine)
          wf-def-str (str (symbol v))
          args-vec (vec args)
@@ -231,11 +235,11 @@
                                      {:type ::race-condition :wf-def wf-def-str})))))))))
 
 (defn sweep!
-  ([] (sweep! *workflow-engine*))
+  ([] (sweep! (current-engine)))
   ([engine] (timeout/sweep! engine)))
 
 (defn list-pending
-  ([] (list-pending *workflow-engine*))
+  ([] (list-pending (current-engine)))
   ([engine] (->> (db/list-calls (:tenon/db engine) {:state "STARTED" :top-level-only? false})
                  (remove :event/reused)
                  (vec))))
@@ -264,7 +268,7 @@
                                     nil while STARTED
      :workflow/expired              boolean - whether the STARTED lease has
                                     run out"
-  ([invocation-id] (get-invocation *workflow-engine* invocation-id))
+  ([invocation-id] (get-invocation (current-engine) invocation-id))
   ([engine invocation-id] (db/get-workflow (:tenon/db engine) invocation-id)))
 
 (defn list-invocations
@@ -278,13 +282,13 @@
      :event/call-id    long - identifies the call, the :before cursor
      :event/created-at long - epoch ms of the call
      :event/reused     boolean - whether the call reused a stored result"
-  ([filters] (list-invocations *workflow-engine* filters))
+  ([filters] (list-invocations (current-engine) filters))
   ([engine filters] (db/list-calls (:tenon/db engine) filters)))
 
 (defn list-wf-defs
   "Vector of the distinct wf_def strings (qualified fn symbols),
    alphabetical - only those of top-level workflows if top-level-only?."
-  ([top-level-only?] (list-wf-defs *workflow-engine* top-level-only?))
+  ([top-level-only?] (list-wf-defs (current-engine) top-level-only?))
   ([engine top-level-only?] (db/list-wf-defs (:tenon/db engine) top-level-only?)))
 
 (defn full-timeline
@@ -309,7 +313,7 @@
                                      or nil
      :workflow/depth                 long - 0 for the workflow itself, 1 for a
                                      direct sub-workflow, and so on"
-  ([invocation-id] (full-timeline *workflow-engine* invocation-id))
+  ([invocation-id] (full-timeline (current-engine) invocation-id))
   ([engine invocation-id] (db/full-timeline (:tenon/db engine) invocation-id)))
 
 
@@ -321,7 +325,7 @@
    in this process. engine defaults to *workflow-engine*, same as
    run-invocation."
   ([invocation-id]
-   (restart-invocation *workflow-engine* invocation-id))
+   (restart-invocation (current-engine) invocation-id))
   ([engine invocation-id]
    (let [ds (:tenon/db engine)
          wf (let [wf (or (db/get-workflow ds invocation-id)
@@ -359,7 +363,7 @@
 
 (defn restart-invocation-recursively
   ([invocation-id]
-   (restart-invocation-recursively *workflow-engine* invocation-id))
+   (restart-invocation-recursively (current-engine) invocation-id))
   ([{ds :tenon/db :as engine} invocation-id]
    ;; A failed (or timed out) workflow stopped at its first failing call, so at most one
    ;; callee - a reused one included - is failed, and only one path of the

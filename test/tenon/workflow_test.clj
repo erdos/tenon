@@ -652,6 +652,18 @@
                 (mapv (fn [[event {:keys [error]}]] [event {:error {:message (ex-message error)}}])
                       (filter (comp #{:sweep-error} first) @events))))))
 
+(deftest implicit-engine-arities-need-a-bound-engine-test
+  (binding [engine/*workflow-engine* nil]
+    (doseq [[label call] {"sweep!" #(engine/sweep!)
+                          "list-pending" #(engine/list-pending)
+                          "get-invocation" #(engine/get-invocation 1)
+                          "list-invocations" #(engine/list-invocations {})
+                          "list-wf-defs" #(engine/list-wf-defs true)
+                          "full-timeline" #(engine/full-timeline 1)
+                          "restart-invocation" #(engine/restart-invocation 1)
+                          "restart-invocation-recursively" #(engine/restart-invocation-recursively 1)}]
+      (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/precondition-failed} (call)) label))))
+
 (deftest engine-on-event-is-never-nil-test
   (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil)]
     (try
