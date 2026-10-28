@@ -114,13 +114,13 @@
      nil: no sweep) the sweep times out the invocations whose lease ran
      out, whichever process ran them - see sweep!. It does not restart
      them."
-  [{:tenon/keys [timeout-ms in-flight] :as engine}]
+  [{:tenon/keys [timeout-ms] :as engine}]
   (let [default-ms (fn [k default]
                      (if (contains? engine k) (get engine k) default))
         heartbeat-ms (default-ms :tenon/heartbeat-ms (some-> timeout-ms (quot 3) (max 1)))
         sweep-ms (default-ms :tenon/sweep-ms timeout-ms)
         engine (assoc engine :tenon/heartbeat-ms heartbeat-ms :tenon/sweep-ms sweep-ms)
-        heartbeat-ms (when (and timeout-ms in-flight) heartbeat-ms)]
+        heartbeat-ms (when timeout-ms heartbeat-ms)]
     (cond-> engine
       (or heartbeat-ms sweep-ms)
       (assoc :tenon/background (start-background! engine heartbeat-ms sweep-ms)))))

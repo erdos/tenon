@@ -141,7 +141,7 @@
   (let [done (promise)
         parent-id (first *invocation-stack*)
         args-vec (vec args)]
-    (when in-flight (swap! in-flight assoc invocation-id done))
+    (swap! in-flight assoc invocation-id done)
     (try
       (let [result (try
                      (binding [*invocation-stack* (conj *invocation-stack* invocation-id)]
@@ -162,9 +162,8 @@
                              :result result})
         result)
       (finally
-        (when in-flight
-          (swap! in-flight dissoc invocation-id)
-          (deliver done true))))))
+        (swap! in-flight dissoc invocation-id)
+        (deliver done true)))))
 
 (defn started? [wf] (= "STARTED" (:workflow/state wf)))
 (defn done? [wf] (= "DONE" (:workflow/state wf)))
@@ -191,7 +190,7 @@
       (cond
         (finished? wf) wf
         (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id)
-        :else (do (if-let [done (some-> in-flight deref (get (:workflow/invocation-id wf)))]
+        :else (do (if-let [done (get @in-flight (:workflow/invocation-id wf))]
                     (deref done wait-ms nil)
                     (Thread/sleep (long wait-ms)))
                   (recur waits))))))
