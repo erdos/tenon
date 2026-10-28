@@ -383,17 +383,7 @@
    once on a new database one does the work and the others, having waited
    for the lock, find it done."
   [pool]
-  (pool/write!
-   pool
-   (fn [c]
-     (pool/execute! c "BEGIN IMMEDIATE")
-     (try
-       (doseq [ddl schema]
-         (pool/execute! c ddl))
-       (pool/execute! c "COMMIT")
-       (catch Throwable e
-         (try (pool/execute! c "ROLLBACK") (catch Throwable _))
-         (throw e))))))
+  (pool/transact! pool (fn [c] (run! #(pool/execute! c %) schema))))
 
 (def ^:private insert-sql
   (sql "INSERT INTO new_workflow (key, id, wf_def, params, parent_invocation_id, metadata, occurred_at, expires_at)

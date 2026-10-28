@@ -70,6 +70,22 @@
   [c sql & params]
   (with-statement c sql params (fn [^PreparedStatement ps] (.executeUpdate ps))))
 
+(defn transact!
+  "Calls (f c) with c a connection of the pool, in a transaction of its own
+   that takes the write lock up front (BEGIN IMMEDIATE) - committed if f
+   returns, rolled back if it throws. Unlike write!, it is not grouped
+   with other writes."
+  [pool f]
+  (with-borrowed [c pool]
+    (execute! c "BEGIN IMMEDIATE")
+    (try
+      (let [result (f c)]
+        (execute! c "COMMIT")
+        result)
+      (catch Throwable e
+        (try (execute! c "ROLLBACK") (catch Throwable _))
+        (throw e)))))
+
 (defn- run-each
   "Runs each write of batch on c in a transaction of its own."
   [c batch]
