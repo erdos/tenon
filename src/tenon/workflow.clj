@@ -179,17 +179,6 @@
   (->> (iterate #(min backoff-max-ms (* backoff-multiplier %)) backoff-base-ms)
        (map #(+ % (long (rand (* backoff-jitter %)))))))
 
-(defn- with-backoff
-  ([engine f] (with-backoff engine f nil))
-  ([engine f wake]
-   (loop [[wait-ms & waits] (backoff-waits engine)]
-     (if-some [result (f)]
-       result
-       (do (if-let [p (and wake (wake))]
-             (deref p wait-ms nil)
-             (Thread/sleep (long wait-ms)))
-           (recur waits))))))
-
 (defn- await-finished
   "Polls the workflow invocation-id belongs to until it is DONE, ERROR or
    TIMEOUT (timing it out if its lease runs out meanwhile), and returns its row.
@@ -197,13 +186,15 @@
    its completion promise instead of sleeping so same-JVM callers wake as
    soon as it finishes."
   [{ds :tenon/db in-flight :tenon/in-flight :as engine} invocation-id]
-  (with-backoff engine
-    (fn []
-      (let [wf (db/get-workflow ds invocation-id)]
-        (cond
-          (finished? wf) wf
-          (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id))))
-    #(some-> in-flight deref (get (:workflow/invocation-id (db/get-workflow ds invocation-id))))))
+  (loop [[wait-ms & waits] (backoff-waits engine)]
+    (let [wf (db/get-workflow ds invocation-id)]
+      (cond
+        (finished? wf) wf
+        (timeout/time-out-if-expired! engine wf) (db/get-workflow ds invocation-id)
+        :else (do (if-let [done (some-> in-flight deref (get (:workflow/invocation-id wf)))]
+                    (deref done wait-ms nil)
+                    (Thread/sleep (long wait-ms)))
+                  (recur waits))))))
 
 (defn- reuse-existing-result!
   "Awaits the invocation-id run started by someone else, logs that the

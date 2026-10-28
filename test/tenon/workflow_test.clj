@@ -610,32 +610,29 @@
     (is (every? #(<= 100 % 124) waits) "never shorter, and by less than a quarter longer")
     (is (> (count (distinct waits)) 10) "and not all the same")))
 
-(deftest with-backoff-calls-until-something-but-nil-test
-  (let [calls (atom 0)
-        engine {:tenon/backoff-base-ms 1 :tenon/backoff-multiplier 2 :tenon/backoff-max-ms 4 :tenon/backoff-jitter 0}]
-    (is (= :found (@#'engine/with-backoff engine #(when (= 3 (swap! calls inc)) :found))))
-    (is (= 3 @calls))
-    (is (false? (@#'engine/with-backoff engine (constantly false))) "only nil means try again")))
+(deftest await-finished-polls-until-finished-reading-once-per-poll-test
+  (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [:polled]))
+        engine (assoc engine/*workflow-engine* :tenon/backoff-base-ms 50 :tenon/backoff-multiplier 1
+                      :tenon/backoff-max-ms 50 :tenon/backoff-jitter 0)
+        get-workflow db/get-workflow
+        reads (atom 0)]
+    (with-redefs [db/get-workflow (fn [ds id]
+                                    (when (= 3 (swap! reads inc)) (test-util/finish! id "DONE" ":ok"))
+                                    (get-workflow ds id))]
+      (let [t0 (System/nanoTime)]
+        (is (match? {:workflow/state "DONE"} (@#'engine/await-finished engine id)))
+        (is (<= 100 (/ (- (System/nanoTime) t0) 1e6)) "two waits of 50 ms")))
+    (is (= 3 @reads) "one read per poll")))
 
-(deftest with-backoff-waits-in-between-test
-  (let [engine {:tenon/backoff-base-ms 50 :tenon/backoff-multiplier 1 :tenon/backoff-max-ms 50 :tenon/backoff-jitter 0}
-        calls (atom 0)
+(deftest await-finished-wakes-on-the-in-flight-promise-instead-of-sleeping-test
+  (let [id (test-util/insert! "tenon.workflow-test/echo-fn" :params (pr-str [:woken]))
+        done (promise)
+        engine (assoc engine/*workflow-engine* :tenon/backoff-base-ms 10000 :tenon/backoff-max-ms 20000
+                      :tenon/in-flight (atom {id done}))
         t0 (System/nanoTime)]
-    (@#'engine/with-backoff engine #(when (= 3 (swap! calls inc)) :done))
-    (is (<= 100 (/ (- (System/nanoTime) t0) 1e6)) "two waits of 50 ms")))
-
-(deftest with-backoff-waits-on-the-promise-it-is-given-instead-of-sleeping-test
-  (let [engine {:tenon/backoff-base-ms 10000 :tenon/backoff-multiplier 2 :tenon/backoff-max-ms 20000 :tenon/backoff-jitter 0}
-        calls (atom 0)
-        woken (doto (promise) (deliver true))
-        t0 (System/nanoTime)]
-    (is (= :done (@#'engine/with-backoff engine #(when (= 2 (swap! calls inc)) :done) (constantly woken))))
-    (is (< (/ (- (System/nanoTime) t0) 1e6) 1000) "it did not wait out the 10 s")
-    (reset! calls 0)
-    (is (= :done (@#'engine/with-backoff (assoc engine :tenon/backoff-base-ms 1)
-                                         #(when (= 2 (swap! calls inc)) :done)
-                                         (constantly nil)))
-        "with nothing to wait on it sleeps")))
+    (future (Thread/sleep 50) (test-util/finish! id "DONE" ":ok") (deliver done true))
+    (is (match? {:workflow/state "DONE"} (@#'engine/await-finished engine id)))
+    (is (< (/ (- (System/nanoTime) t0) 1e6) 1000) "it did not wait out the 10 s")))
 
 (deftest engine-on-event-is-never-nil-test
   (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil)]
