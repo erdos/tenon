@@ -664,6 +664,17 @@
                           "restart-invocation-recursively" #(engine/restart-invocation-recursively 1)}]
       (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/precondition-failed} (call)) label))))
 
+(deftest engine-pool-size-and-sqlite-params-are-configurable-test
+  (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil
+                             :tenon/pool-size 3 :tenon/sqlite-params {:cache_size -2000})
+        ds (:tenon/db engine1)]
+    (try
+      (is (= 3 (.availablePermits ^java.util.concurrent.Semaphore (.-permits ^tenon.workflow.sqlite.pool.Pool ds))))
+      (is (= -2000 (:cache_size (jdbc/execute-one! ds ["PRAGMA cache_size"]))) "overridden")
+      (is (= "wal" (:journal_mode (jdbc/execute-one! ds ["PRAGMA journal_mode"]))) "the other defaults kept")
+      (finally
+        (engine/close! engine1)))))
+
 (deftest engine-on-event-is-never-nil-test
   (let [engine1 (engine/init test-util/*db-path* :tenon/sweep-ms nil)]
     (try

@@ -66,20 +66,28 @@
    to :tenon/backoff-jitter (0.1) of it, so callers polling together
    drift apart.
 
+   The database connections: :tenon/pool-size (10) is the most it opens,
+   and :tenon/sqlite-params a map of SQLite connection settings (pragmas,
+   e.g. {:busy_timeout 10000}) overriding
+   tenon.workflow.sqlite/default-connection-params.
+
    Stop the threads with close!."
   [db-path & {:as opts}]
-  (-> {:tenon/db (db/init-db! (sqlite/datasource db-path))
-       :tenon/timeout-ms 15000
-       :tenon/lease-batch-size 500
-       :tenon/backoff-base-ms 5
-       :tenon/backoff-multiplier 2
-       :tenon/backoff-max-ms 200
-       :tenon/backoff-jitter 0.1
-       :tenon/in-flight (atom {})
-       :tenon/on-event (fn [_event _data])
-       :tenon/metadata-fn empty-metadata-fn}
-      (merge opts)
-      (timeout/start!)))
+  (let [{:tenon/keys [pool-size sqlite-params] :as engine}
+        (merge {:tenon/timeout-ms 15000
+                :tenon/lease-batch-size 500
+                :tenon/backoff-base-ms 5
+                :tenon/backoff-multiplier 2
+                :tenon/backoff-max-ms 200
+                :tenon/backoff-jitter 0.1
+                :tenon/in-flight (atom {})
+                :tenon/on-event (fn [_event _data])
+                :tenon/metadata-fn empty-metadata-fn
+                :tenon/pool-size 10
+                :tenon/sqlite-params {}}
+               opts)
+        ds (sqlite/datasource db-path {:pool-size pool-size :connection-params sqlite-params})]
+    (timeout/start! (assoc engine :tenon/db (db/init-db! ds)))))
 
 (defn close!
   "Stops the background threads of engine, as built by init, and closes its

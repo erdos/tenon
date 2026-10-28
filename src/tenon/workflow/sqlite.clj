@@ -566,21 +566,32 @@
                 (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
                                 :workflow/expired Boolean/TRUE))))
 
+(def default-connection-params
+  "The SQLite connection settings of datasource. Every connection waits up
+   to 5s for a concurrent writer's lock, and maps the file into memory:
+   reads are primary key lookups scattered over the event table, so they
+   are served from a memory map (shared by every connection, through the OS
+   page cache) rather than copied into each connection's small default page
+   cache. The file is in WAL mode so readers don't block writers. Commits
+   are durable (synchronous stays FULL)."
+  {:journal_mode "WAL"
+   :busy_timeout 5000
+   :mmap_size 1073741824
+   :cache_size -16384
+   :temp_store "MEMORY"})
+
 (defn datasource
   "A connection pool (tenon.workflow.sqlite.pool) for the SQLite file at
    db-path (creating it if needed) - just the connections, no schema. Pass
-   it to tenon.workflow.db/init-db! to also ensure the schema exists (a
-   plain Storage method now - dispatches on this being a pool, same as
-   every other Storage method). Every connection waits up to 5s for a
-   concurrent writer's lock, keeps its prepared statements and maps the
-   file into memory, and the file is in WAL mode so readers don't block
-   writers. Commits are durable (synchronous stays FULL). The pool is Closeable:
-   close it (e.g. with-open or .close) once it's no longer needed."
-  ^java.io.Closeable [db-path]
-  ;; Reads are primary key lookups scattered over the event table, so
-  ;; they are served from a memory map of the file (shared by every
-  ;; connection, through the OS page cache) rather than copied into each
-  ;; connection's small default page cache.
-  (pool/open (str "jdbc:sqlite:" db-path "?journal_mode=WAL&busy_timeout=5000"
-                  "&mmap_size=1073741824&cache_size=-16384&temp_store=MEMORY")
-             10))
+   it to tenon.workflow.db/init-db! to also ensure the schema exists.
+   Options: :pool-size, the most connections it opens (10), and
+   :connection-params, SQLite connection settings (pragmas) overriding
+   default-connection-params. Every connection keeps its prepared
+   statements. The pool is Closeable: close it (e.g. with-open or .close)
+   once it's no longer needed."
+  (^java.io.Closeable [db-path] (datasource db-path {}))
+  (^java.io.Closeable [db-path {:keys [pool-size connection-params] :or {pool-size 10}}]
+   (pool/open (str "jdbc:sqlite:" db-path "?"
+                   (str/join "&" (for [[k v] (merge default-connection-params connection-params)]
+                                   (str (name k) "=" v))))
+              pool-size)))
