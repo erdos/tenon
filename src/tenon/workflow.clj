@@ -1,6 +1,6 @@
 (ns tenon.workflow
   (:require [clojure.edn :as edn]
-            [clojure.walk :as walk]
+            [tenon.workflow.common :refer [edn-str emit! exception-str]]
             [tenon.workflow.db :as db]
             [tenon.workflow.sqlite :as sqlite]
             [tenon.workflow.timeout :as timeout])
@@ -22,9 +22,6 @@
             (find-var sym))]
     (when (and v (raw-fn v))
       v)))
-
-(defmacro ^:private emit! [engine event data]
-  `((:tenon/on-event ~engine) ~event ~data))
 
 (def ^:private local-host-name
   (delay (.getHostName (java.net.InetAddress/getLocalHost))))
@@ -100,25 +97,6 @@
    what makes them work at all. nil until then."
   nil)
 
-(defn- canonical-compare [a b]
-  (if (= a b) 0 (compare (pr-str a) (pr-str b))))
-
-(defn- safe-pr-str
-  "Like pr-str, but ignores any caller-bound *print-length*/*print-level*
-   and canonicalizes maps and sets into a deterministic order."
-  [x]
-  (binding [*print-length* nil *print-level* nil]
-    (pr-str (walk/postwalk
-             (fn [v]
-               (cond
-                 (and (map? v) (not (record? v))) (into (sorted-map-by canonical-compare) v)
-                 (set? v) (into (sorted-set-by canonical-compare) v)
-                 :else v))
-             x))))
-
-(defn- serialize-exception [e]
-  (safe-pr-str (Throwable->map e)))
-
 (def ^:dynamic *invocation-stack*
   "Invocation ids of the #workflow invocations currently running on this
    thread, innermost (most recently started) first. Bound by
@@ -139,31 +117,32 @@
    and only this caller gets the result (or exception)."
   [{ds :tenon/db in-flight :tenon/in-flight :as engine} invocation-id wf-def-str raw-fn args]
   (let [done (promise)
-        parent-id (first *invocation-stack*)
-        args-vec (vec args)]
+        event {:invocation-id invocation-id
+               :parent-invocation-id (first *invocation-stack*)
+               :wf-def wf-def-str
+               :args (vec args)}]
     (swap! in-flight assoc invocation-id done)
     (try
       (let [result (try
                      (binding [*invocation-stack* (conj *invocation-stack* invocation-id)]
                        (apply raw-fn args))
                      (catch Throwable e
-                       (db/finish! ds invocation-id "ERROR" (serialize-exception e))
-                       (emit! engine :error {:invocation-id invocation-id
-                                             :parent-invocation-id parent-id
-                                             :wf-def wf-def-str
-                                             :args args-vec
-                                             :error e})
+                       (db/finish! ds invocation-id "ERROR" (exception-str e))
+                       (emit! engine :error (assoc event :error e))
                        (throw e)))]
-        (db/finish! ds invocation-id "DONE" (safe-pr-str result))
-        (emit! engine :done {:invocation-id invocation-id
-                             :parent-invocation-id parent-id
-                             :wf-def wf-def-str
-                             :args args-vec
-                             :result result})
+        (db/finish! ds invocation-id "DONE" (edn-str result))
+        (emit! engine :done (assoc event :result result))
         result)
       (finally
         (swap! in-flight dissoc invocation-id)
         (deliver done true)))))
+
+(defn- start-and-run!
+  "Emits event (:started or :restarted) with data for invocation-id, just
+   recorded as STARTED, then runs it - see execute-and-record!."
+  [engine invocation-id event data raw-fn args]
+  (emit! engine event (assoc data :invocation-id invocation-id :args (vec args)))
+  (execute-and-record! engine invocation-id (:wf-def data) raw-fn args))
 
 (defn started? [wf] (= "STARTED" (:workflow/state wf)))
 (defn done? [wf] (= "DONE" (:workflow/state wf)))
@@ -197,16 +176,16 @@
 
 (defn- reuse-existing-result!
   "Awaits the invocation-id run started by someone else, logs that the
-   current caller - under parent-id with metadata - reused it, then returns
-   its result, or throws describing its failure."
-  [{ds :tenon/db :as engine} invocation-id parent-id metadata]
+   current caller - under parent-id with metadata, printed as meta-str -
+   reused it, then returns its result, or throws describing its failure."
+  [{ds :tenon/db :as engine} invocation-id parent-id metadata meta-str]
   (when (some #{invocation-id} *invocation-stack*)
     (throw (ex-info "Cycle detected: workflow is already running on the current call stack"
                     {:type ::cycle-detected
                      :invocation-id invocation-id
                      :invocation-stack *invocation-stack*})))
   (let [wf (await-finished engine invocation-id)]
-    (db/record-reuse! ds (:workflow/invocation-id wf) parent-id (some-> metadata safe-pr-str))
+    (db/record-reuse! ds (:workflow/invocation-id wf) parent-id meta-str)
     (emit! engine :reused {:invocation-id (:workflow/invocation-id wf)
                            :parent-invocation-id parent-id
                            :wf-def (:workflow/name wf)
@@ -232,27 +211,24 @@
      (throw (ex-info "Dynamic var *workflow-engine* is not bound."
                      {:type ::precondition-failed})))
    (let [ds (:tenon/db engine)
-         timeout-ms (:tenon/timeout-ms engine)
          wf-def-str (str (symbol v))
          args-vec (vec args)
-         params-str (safe-pr-str args-vec)
+         params-str (edn-str args-vec)
          parent-id (first *invocation-stack*)
          metadata (metadata-for engine (symbol v) args-vec)
-         meta-str (some-> metadata safe-pr-str)]
-     (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-       (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-       (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str timeout-ms)]
-         (do (emit! engine :started {:invocation-id invocation-id
-                                     :parent-invocation-id parent-id
-                                     :wf-def wf-def-str
-                                     :args args-vec
-                                     :metadata metadata})
-             (execute-and-record! engine invocation-id wf-def-str raw-fn args))
-         (if-let [existing (db/find-by-wf-def-and-params ds wf-def-str params-str)]
-           (reuse-existing-result! engine (:workflow/invocation-id existing) parent-id metadata)
-           (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
-                            {:type ::race-condition :wf-def wf-def-str}))))))))
-
+         meta-str (some-> metadata edn-str)
+         find-existing #(db/find-by-wf-def-and-params ds wf-def-str params-str)
+         reuse! #(reuse-existing-result! engine (:workflow/invocation-id %) parent-id metadata meta-str)]
+     (if-let [existing (find-existing)]
+       (reuse! existing)
+       (if-let [invocation-id (db/insert-workflow! ds wf-def-str params-str parent-id meta-str
+                                                   (:tenon/timeout-ms engine))]
+         (start-and-run! engine invocation-id :started
+                         {:parent-invocation-id parent-id :wf-def wf-def-str :metadata metadata}
+                         raw-fn args)
+         (reuse! (or (find-existing)
+                     (throw (ex-info "Lost the race to insert this workflow's row, but no winning row was found"
+                                     {:type ::race-condition :wf-def wf-def-str})))))))))
 
 (defn sweep!
   ([] (sweep! *workflow-engine*))
@@ -366,22 +342,19 @@
                  (throw (ex-info "wf_def not registered in this process"
                                   {:type ::precondition-failed
                                    :wf-def (str wf-def-sym)})))
-           impl (raw-fn v)
            args (edn/read-string (:workflow/params wf))
-           metadata (metadata-for engine wf-def-sym args)
-           meta-str (some-> metadata safe-pr-str)]
+           metadata (metadata-for engine wf-def-sym args)]
        ;; A concurrent restart may have restarted it since wf was read -
        ;; restarting only if it is still DONE/ERROR/TIMEOUT under the same
        ;; invocation id lets only one of them through.
-       (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) meta-str
+       (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) (some-> metadata edn-str)
                                               (:tenon/timeout-ms engine))]
-         (do (emit! engine :restarted {:invocation-id new-invocation-id
-                                       :previous-invocation-id (:workflow/invocation-id wf)
-                                       :parent-invocation-id (:workflow/parent-invocation-id wf)
-                                       :wf-def (:workflow/name wf)
-                                       :args args
-                                       :metadata metadata})
-             (execute-and-record! engine new-invocation-id (:workflow/name wf) impl args))
+         (start-and-run! engine new-invocation-id :restarted
+                         {:previous-invocation-id (:workflow/invocation-id wf)
+                          :parent-invocation-id (:workflow/parent-invocation-id wf)
+                          :wf-def (:workflow/name wf)
+                          :metadata metadata}
+                         (raw-fn v) args)
          (throw (not-restartable (:workflow/state (db/get-workflow ds (:workflow/invocation-id wf))))))))))
 
 (defn restart-invocation-recursively

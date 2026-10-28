@@ -10,17 +10,9 @@
 
    Depends on the storage only - tenon.workflow, which this serves, requires
    it."
-  (:require [tenon.workflow.db :as db])
+  (:require [tenon.workflow.common :refer [emit! exception-str]]
+            [tenon.workflow.db :as db])
   (:import [java.util.concurrent Executors RejectedExecutionException ScheduledExecutorService ThreadFactory TimeUnit]))
-
-(defn- emit! [engine event data]
-  ((:tenon/on-event engine) event data))
-
-(defn- pr-str-whole
-  "pr-str, ignoring any caller-bound *print-length*/*print-level*."
-  [x]
-  (binding [*print-length* nil *print-level* nil]
-    (pr-str x)))
 
 (defn time-out-if-expired!
   "Moves wf - a row of the storage - to TIMEOUT if it is STARTED past its
@@ -31,12 +23,11 @@
   (when (and (= "STARTED" state) expired)
     (let [timeout-ms (- expires-at state-changed-at)]
       (when (db/time-out! ds invocation-id
-                          (pr-str-whole (Throwable->map
-                                         (doto (ex-info (str "Timed out: still running " timeout-ms
-                                                             " ms after it started")
-                                                        {:type ::timed-out :timeout-ms timeout-ms})
-                                           ;; where the sweep found it says nothing about the run
-                                           (.setStackTrace (make-array StackTraceElement 0))))))
+                          (exception-str
+                           (doto (ex-info (str "Timed out: still running " timeout-ms " ms after it started")
+                                          {:type ::timed-out :timeout-ms timeout-ms})
+                             ;; where the sweep found it says nothing about the run
+                             (.setStackTrace (make-array StackTraceElement 0)))))
         (emit! engine :timed-out {:invocation-id invocation-id
                                   :parent-invocation-id parent-invocation-id
                                   :wf-def wf-name})
