@@ -242,7 +242,7 @@
         WHERE i.id = ? AND w.state_id = i.id AND (? OR w.expires_at <= {{now}})
        RETURNING id"))
 
-(defn- finish!
+(defn- end-state!
   "Appends a state-ended event for invocation-id - if it is still the
    current state of its workflow (so STARTED, and neither finished,
    timed out nor restarted) and, when expired-only?, its lease is over."
@@ -256,12 +256,12 @@
                   :event/reused (= "REUSED" (state-at %))))
 
 (def ^:private not-done-states
-  "The states whose workflows top-level-workflows finds through
+  "The states whose workflows list-calls finds through
    workflow_not_done."
   #{"STARTED" "ERROR" "TIMEOUT"})
 
 (defn- calls-shape
-  "Which of the filters of top-level-workflows are given - and the state
+  "Which of the filters of list-calls are given - and the state
    itself if it is one of not-done-states: the SQL depends on these only."
   [{:keys [state wf-def top-level-only? limit before] :or {top-level-only? true}}]
   {:state (if (not-done-states state) state (some? state))
@@ -274,7 +274,7 @@
   (apply str (map #(str " AND " %) (remove nil? conditions))))
 
 (def ^:private calls-sql
-  "The SQL of top-level-workflows for a calls-shape, and the filters its
+  "The SQL of list-calls for a calls-shape, and the filters its
    params are, in order (see calls-params). Calls are found
    - STARTED, ERROR or TIMEOUT: through the few workflows in that state
      (workflow_not_done) - each one's first call, and its reuses from its
@@ -482,6 +482,16 @@
         CROSS JOIN wf_def d ON d.id = w.wf_def_id
        ORDER BY x.id"))
 
+(def ^:private extend-lease-sql
+  ;; The ids go in as a JSON array, twice: the workflows they belong to are
+  ;; looked up by them, and then only those whose current invocation is
+  ;; one of them are extended.
+  (sql "UPDATE workflow SET expires_at = {{now}} + ?
+        WHERE id IN (SELECT e.workflow_id FROM json_each(?) j CROSS JOIN event e ON e.id = j.value)
+          AND invocation_id IN (SELECT value FROM json_each(?))
+          AND state = {{STARTED}} AND expires_at IS NOT NULL
+       RETURNING invocation_id"))
+
 (extend-protocol db/Storage
   Pool
   (init-db! [this]
@@ -494,10 +504,10 @@
                     parent-invocation-id metadata-edn-str timeout-ms])))
 
   (finish! [this invocation-id state result-edn-str]
-    (finish! this invocation-id state result-edn-str false))
+    (end-state! this invocation-id state result-edn-str false))
 
   (time-out! [this invocation-id result-edn-str]
-    (finish! this invocation-id "TIMEOUT" result-edn-str true))
+    (end-state! this invocation-id "TIMEOUT" result-edn-str true))
 
   (restart! [this invocation-id metadata-edn-str timeout-ms]
     (first (write! this restart-sql
@@ -520,14 +530,11 @@
     (some #(when (and (= params-edn-str (:workflow/params %)) (= wf-def (:workflow/name %))) %)
           (pool/query this find-sql [(idempotence-key wf-def params-edn-str)] read-state)))
 
-  (top-level-workflows
-    ([this]
-     (db/top-level-workflows this nil))
-    ([this filters]
-     (let [[sql param-keys] (calls-sql (calls-shape filters))]
-       (pool/query this sql (calls-params filters param-keys) read-call))))
+  (list-calls [this filters]
+    (let [[sql param-keys] (calls-sql (calls-shape filters))]
+      (pool/query this sql (calls-params filters param-keys) read-call)))
 
-  (top-level-wf-defs [this top-level-only?]
+  (list-wf-defs [this top-level-only?]
     (pool/query this "SELECT name FROM wf_def WHERE top_level OR NOT ? ORDER BY name" [(boolean top-level-only?)]
                 #(text-at % 1)))
 
@@ -551,7 +558,23 @@
               :workflow/state (state-at %)
               :workflow/state-changed-at (int-at %)
               :event/data (text-at %)
-              :workflow/depth (int-at %)))))
+              :workflow/depth (int-at %))))
+
+  (extend-lease! [this invocation-ids timeout-ms]
+    (if (empty? invocation-ids)
+      #{}
+      ;; The ids go in as JSON arrays, so that the statement is the same
+      ;; for any number of them (and cached once, whatever the batch size).
+      (->> (pool/write! this #(pool/query % extend-lease-sql
+                                          (let [ids (str "[" (str/join "," (map long invocation-ids)) "]")]
+                                            [timeout-ms ids ids])
+                                          read-id))
+           (into #{}))))
+
+  (list-expired [this]
+    (pool/query this list-expired-sql []
+                (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
+                                :workflow/expired Boolean/TRUE))))
 
 (defn datasource
   "A connection pool (tenon.workflow.sqlite.pool) for the SQLite file at
@@ -571,31 +594,3 @@
   (pool/open (str "jdbc:sqlite:" db-path "?journal_mode=WAL&busy_timeout=5000"
                   "&mmap_size=1073741824&cache_size=-16384&temp_store=MEMORY")
              10))
-
-(def ^:private extend-lease-sql
-  ;; The ids go in as a JSON array, twice: the workflows they belong to are
-  ;; looked up by them, and then only those whose current invocation is
-  ;; one of them are extended.
-  (sql "UPDATE workflow SET expires_at = {{now}} + ?
-        WHERE id IN (SELECT e.workflow_id FROM json_each(?) j CROSS JOIN event e ON e.id = j.value)
-          AND invocation_id IN (SELECT value FROM json_each(?))
-          AND state = {{STARTED}} AND expires_at IS NOT NULL
-       RETURNING invocation_id"))
-
-(extend-protocol db/Timeouts
-  Pool
-  (extend-lease! [this invocation-ids timeout-ms]
-    (if (empty? invocation-ids)
-      #{}
-      ;; The ids go in as JSON arrays, so that the statement is the same
-      ;; for any number of them (and cached once, whatever the batch size).
-      (->> (pool/write! this #(pool/query % extend-lease-sql
-                                          (let [ids (str "[" (str/join "," (map long invocation-ids)) "]")]
-                                            [timeout-ms ids ids])
-                                          read-id))
-           (into #{}))))
-
-  (list-expired [this]
-    (pool/query this list-expired-sql []
-                (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
-                                :workflow/expired Boolean/TRUE))))

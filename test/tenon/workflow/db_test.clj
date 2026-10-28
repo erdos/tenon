@@ -108,7 +108,7 @@
     (is (thrown? Exception
           (jdbc/execute! (test-util/ds) ["UPDATE event SET expires_at = 1 WHERE state = 1"])))))
 
-(deftest top-level-workflows-seek-pagination-test
+(deftest list-calls-seek-pagination-test
   ;; 10 rows, paged 4 at a time via :limit/:before - every page after the
   ;; first must be requested with :before set to the previous page's last
   ;; row, and the pages together must cover every row exactly once (no
@@ -116,11 +116,11 @@
   ;; the caller can tell whether a further page exists.
   (dotimes [n 10]
     (test-util/insert! (str "test.ns/seek" n) :params (pr-str [n])))
-  (let [page1 (db/top-level-workflows (test-util/ds) {:limit 4})
+  (let [page1 (db/list-calls (test-util/ds) {:limit 4})
         trimmed1 (vec (take 4 page1))
-        page2 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:event/call-id (last trimmed1))})
+        page2 (db/list-calls (test-util/ds) {:limit 4 :before (:event/call-id (last trimmed1))})
         trimmed2 (vec (take 4 page2))
-        page3 (db/top-level-workflows (test-util/ds) {:limit 4 :before (:event/call-id (last trimmed2))})]
+        page3 (db/list-calls (test-util/ds) {:limit 4 :before (:event/call-id (last trimmed2))})]
     (is (= 5 (count page1)) "limit+1, so the caller can detect there's a next page")
     (is (= 5 (count page2)) "still more after page 2")
     (is (<= (count page3) 4) "nothing left beyond page 3")
@@ -129,14 +129,14 @@
       (is (= 10 (count (distinct all-ids))) "no row repeated across page boundaries")
       (is (= all-ids (sort > all-ids)) "newest first"))))
 
-(deftest top-level-workflows-created-at-survives-restart-test
+(deftest list-calls-created-at-survives-restart-test
   (let [id (test-util/insert! "test.ns/created")
-        created-at (:event/created-at (first (db/top-level-workflows (test-util/ds))))]
+        created-at (:event/created-at (first (db/list-calls (test-util/ds) nil)))]
     (is (= created-at (:workflow/state-changed-at (db/get-workflow (test-util/ds) id))))
     (db/finish! (test-util/ds) id "DONE" "1")
     (Thread/sleep 5)
     (db/restart! (test-util/ds) id nil nil)
-    (is (= created-at (:event/created-at (first (db/top-level-workflows (test-util/ds)))))
+    (is (= created-at (:event/created-at (first (db/list-calls (test-util/ds) nil))))
         "created_at is the start of the first invocation")))
 
 (deftest full-timeline-follows-children-of-past-invocations-test
@@ -228,7 +228,7 @@
               (db/full-timeline (test-util/ds) (db/restart! (test-util/ds) parent2 nil nil)))
         "still reached via the parent's past invocation")))
 
-(deftest top-level-workflows-lists-calls-test
+(deftest list-calls-lists-calls-test
   ;; One call per workflow (its first start - restarts aren't new calls)
   ;; plus one per reuse of its result, newest first.
   (let [a (test-util/insert! "test.ns/calls-a")
@@ -242,28 +242,28 @@
                    {:workflow/invocation-id a' :workflow/name "test.ns/calls-a" :workflow/parent-invocation-id nil? :workflow/state "STARTED" :event/reused true}
                    {:workflow/invocation-id b :workflow/name "test.ns/calls-b" :workflow/parent-invocation-id a :workflow/state "DONE" :event/reused false}
                    {:workflow/invocation-id a' :workflow/name "test.ns/calls-a" :workflow/parent-invocation-id nil? :workflow/state "STARTED" :event/reused false}]
-                  (db/top-level-workflows (test-util/ds) {:top-level-only? false})))
+                  (db/list-calls (test-util/ds) {:top-level-only? false})))
       (is (match? [{:workflow/invocation-id a' :workflow/name "test.ns/calls-a" :workflow/parent-invocation-id nil? :workflow/state "STARTED" :event/reused true}
                    {:workflow/invocation-id a' :workflow/name "test.ns/calls-a" :workflow/parent-invocation-id nil? :workflow/state "STARTED" :event/reused false}]
-                  (db/top-level-workflows (test-util/ds) {})))
+                  (db/list-calls (test-util/ds) {})))
       (let [expected-done [{:workflow/invocation-id b :workflow/name "test.ns/calls-b" :workflow/parent-invocation-id a :workflow/state "DONE" :event/reused true}
                            {:workflow/invocation-id b :workflow/name "test.ns/calls-b" :workflow/parent-invocation-id a :workflow/state "DONE" :event/reused false}]]
         (is (match? expected-done
-                    (db/top-level-workflows (test-util/ds) {:top-level-only? false :state "DONE"})))
+                    (db/list-calls (test-util/ds) {:top-level-only? false :state "DONE"})))
         (is (match? expected-done
-                    (db/top-level-workflows (test-util/ds) {:top-level-only? false :wf-def "test.ns/calls-b"}))))
-      (let [[c1 c2 c3 c4] (db/top-level-workflows (test-util/ds) {:top-level-only? false})]
-        (is (= [c3 c4] (db/top-level-workflows (test-util/ds) {:top-level-only? false :before (:event/call-id c2)})))
-        (is (= [c1 c2 c3] (db/top-level-workflows (test-util/ds) {:top-level-only? false :limit 2}))
+                    (db/list-calls (test-util/ds) {:top-level-only? false :wf-def "test.ns/calls-b"}))))
+      (let [[c1 c2 c3 c4] (db/list-calls (test-util/ds) {:top-level-only? false})]
+        (is (= [c3 c4] (db/list-calls (test-util/ds) {:top-level-only? false :before (:event/call-id c2)})))
+        (is (= [c1 c2 c3] (db/list-calls (test-util/ds) {:top-level-only? false :limit 2}))
             "limit+1, so the caller can detect there's a next page")))))
 
-(deftest top-level-wf-defs-include-top-level-reuses-test
+(deftest list-wf-defs-include-top-level-reuses-test
   (let [parent (test-util/insert! "test.ns/defs-parent")
         child (test-util/insert! "test.ns/defs-child" :parent parent)]
-    (is (= ["test.ns/defs-parent"] (db/top-level-wf-defs (test-util/ds) true)))
+    (is (= ["test.ns/defs-parent"] (db/list-wf-defs (test-util/ds) true)))
     (test-util/finish! child "DONE" "1")
     (test-util/record-reuse! child nil)
-    (is (= ["test.ns/defs-child" "test.ns/defs-parent"] (db/top-level-wf-defs (test-util/ds) true)))))
+    (is (= ["test.ns/defs-child" "test.ns/defs-parent"] (db/list-wf-defs (test-util/ds) true)))))
 
 (deftest concurrent-inserts-of-one-workflow-insert-once-test
   (let [results (->> (range 8)
@@ -311,12 +311,12 @@
           (when (= "STARTED" (:workflow/state wf)) (db/finish! ds (:workflow/invocation-id wf) "ERROR" "{}")
                 (db/restart! ds (:workflow/invocation-id wf) nil nil)))))))
 
-(deftest top-level-workflows-filters-agree-with-unfiltered-listing-test
+(deftest list-calls-filters-agree-with-unfiltered-listing-test
   ;; Every filter combination - whichever index it is answered from - must
   ;; equal filtering the unfiltered listing, which is the plain history walk.
   (populate!)
   (let [ds (test-util/ds)
-        all (db/top-level-workflows ds {:top-level-only? false})
+        all (db/list-calls ds {:top-level-only? false})
         matches? (fn [{:keys [state wf-def top-level-only? before]} row]
                    (and (or (not top-level-only?) (nil? (:workflow/parent-invocation-id row)))
                         (or (nil? state) (= state (:workflow/state row)))
@@ -333,21 +333,21 @@
       (let [filters {:state state :wf-def wf-def :top-level-only? top-level-only? :before before :limit limit}
             expected (cond->> (filter #(matches? filters %) all)
                        limit (take (inc limit)))
-            actual (db/top-level-workflows ds (into {} (remove (comp nil? val)) filters))]
+            actual (db/list-calls ds (into {} (remove (comp nil? val)) filters))]
         (is (= expected actual) (pr-str filters))))))
 
-(deftest top-level-wf-defs-agree-with-calls-test
+(deftest list-wf-defs-agree-with-calls-test
   (populate!)
   (let [ds (test-util/ds)
-        all (db/top-level-workflows ds {:top-level-only? false})]
-    (is (= (vec (sort (distinct (map :workflow/name all)))) (db/top-level-wf-defs ds false)))
+        all (db/list-calls ds {:top-level-only? false})]
+    (is (= (vec (sort (distinct (map :workflow/name all)))) (db/list-wf-defs ds false)))
     (is (= (vec (sort (distinct (map :workflow/name (filter (comp nil? :workflow/parent-invocation-id) all)))))
-           (db/top-level-wf-defs ds true)))))
+           (db/list-wf-defs ds true)))))
 
 (deftest full-timeline-covers-the-history-of-the-tree-test
   (populate!)
   (let [ds (test-util/ds)
-        roots (->> (db/top-level-workflows ds {:top-level-only? false})
+        roots (->> (db/list-calls ds {:top-level-only? false})
                    (remove :event/reused)
                    (map :workflow/invocation-id))
         shape (juxt :workflow/invocation-id :workflow/state :workflow/state-changed-at :event/data)]

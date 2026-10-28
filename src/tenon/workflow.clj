@@ -236,7 +236,7 @@
 
 (defn list-pending
   ([] (list-pending *workflow-engine*))
-  ([engine] (->> (db/top-level-workflows (:tenon/db engine) {:state "STARTED" :top-level-only? false})
+  ([engine] (->> (db/list-calls (:tenon/db engine) {:state "STARTED" :top-level-only? false})
                  (remove :event/reused)
                  (vec))))
 
@@ -271,7 +271,7 @@
   "Calls of workflows matching filters, newest first - each workflow's
    first run plus every later call that reused its stored result. filters
    is a map of {:state s :wf-def w :top-level-only? t :limit n :before call-id}
-   - see tenon.workflow.db/top-level-workflows. Returns a vector of maps
+   - see tenon.workflow.db/list-calls. Returns a vector of maps
    with the keys of get-invocation except :workflow/expired
    (:workflow/parent-invocation-id being the caller's), plus:
 
@@ -279,13 +279,13 @@
      :event/created-at long - epoch ms of the call
      :event/reused     boolean - whether the call reused a stored result"
   ([filters] (list-invocations *workflow-engine* filters))
-  ([engine filters] (db/top-level-workflows (:tenon/db engine) filters)))
+  ([engine filters] (db/list-calls (:tenon/db engine) filters)))
 
 (defn list-wf-defs
   "Vector of the distinct wf_def strings (qualified fn symbols),
    alphabetical - only those of top-level workflows if top-level-only?."
   ([top-level-only?] (list-wf-defs *workflow-engine* top-level-only?))
-  ([engine top-level-only?] (db/top-level-wf-defs (:tenon/db engine) top-level-only?)))
+  ([engine top-level-only?] (db/list-wf-defs (:tenon/db engine) top-level-only?)))
 
 (defn full-timeline
   "Every state - past and current - of the workflow invocation-id belongs

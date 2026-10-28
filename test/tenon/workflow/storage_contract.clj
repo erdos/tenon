@@ -3,7 +3,7 @@
    every method's return value has the documented shape - each required
    key present, each value of the documented type. Call check-storage
    from a deftest with a fresh, empty storage of the implementation under
-   test - and check-timeouts, for the db/Timeouts methods, with another."
+   test - and check-timeouts, for the lease methods, with another."
   (:require [clojure.test :refer [is testing]]
             [tenon.workflow.db :as db]))
 
@@ -28,7 +28,7 @@
   (assoc workflow-shape :workflow/expired boolean?))
 
 (def call-shape
-  "top-level-workflows rows."
+  "list-calls rows."
   (assoc workflow-shape
          :event/call-id    int?
          :event/created-at int?
@@ -105,35 +105,35 @@
         (is (nil? (db/get-workflow storage Long/MAX_VALUE)))
         (is (nil? (db/find-by-wf-def-and-params storage "contract/none" "[]")))))
 
-    (let [calls (db/top-level-workflows storage {:top-level-only? false})]
-      (check-rows "top-level-workflows" call-shape calls)
+    (let [calls (db/list-calls storage {:top-level-only? false})]
+      (check-rows "list-calls" call-shape calls)
       (doseq [filters [nil {} {:state "STARTED"} {:state "ERROR"} {:state "TIMEOUT"} {:state "ERROR" :top-level-only? false}
                        {:state "DONE" :top-level-only? false} {:wf-def "contract/child"}
                        {:wf-def "contract/child" :top-level-only? false} {:limit 1}
                        {:before (:event/call-id (first calls)) :top-level-only? false}]]
-        (testing (str "top-level-workflows " filters)
-          (let [rows (if (nil? filters) (db/top-level-workflows storage) (db/top-level-workflows storage filters))]
+        (testing (str "list-calls " filters)
+          (let [rows (db/list-calls storage filters)]
             (is (seq rows))
             (doseq [row rows] (check-shape call-shape row)))))
       (testing "filtering by TIMEOUT only matches workflows whose latest run timed out"
         (is (= ["contract/expiring"]
-               (mapv :workflow/name (db/top-level-workflows storage {:state "TIMEOUT" :top-level-only? false})))))
+               (mapv :workflow/name (db/list-calls storage {:state "TIMEOUT" :top-level-only? false})))))
       (testing "filtering by ERROR only matches workflows whose latest run is in ERROR"
         (is (= ["contract/failed"]
-               (mapv :workflow/name (db/top-level-workflows storage {:state "ERROR" :top-level-only? false}))))))
+               (mapv :workflow/name (db/list-calls storage {:state "ERROR" :top-level-only? false}))))))
 
     (check-rows "full-timeline" timeline-shape (db/full-timeline storage root))
 
-    (testing "top-level-wf-defs"
+    (testing "list-wf-defs"
       (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/failing" "contract/root"]
-             (db/top-level-wf-defs storage false)))
+             (db/list-wf-defs storage false)))
       (is (= ["contract/child" "contract/expiring" "contract/failed" "contract/root"]
-             (db/top-level-wf-defs storage true))
+             (db/list-wf-defs storage true))
           "child was reused at the top level"))))
 
 (defn check-timeouts
-  "Runs the suite of the tenon.workflow.db/Timeouts methods against storage,
-   a fresh and empty implementation of both Storage and Timeouts."
+  "Runs the suite of the lease methods (extend-lease!, list-expired)
+   against storage, a fresh and empty Storage."
   [storage]
   (db/init-db! storage)
   (let [insert! (fn [wf-def parent timeout-ms]
@@ -195,7 +195,7 @@
           (is (= #{again} (db/extend-lease! storage #{dead2 again} 60000))))))))
 
 (defn check-listing
-  "Runs the suite of top-level-workflows' filters against storage, a fresh
+  "Runs the suite of list-calls' filters against storage, a fresh
    and empty Storage: whatever the combination of filters, it lists the
    calls of the unfiltered listing that match them, in the same order -
    over a randomly (but always the same way) built history of nested,
@@ -222,7 +222,7 @@
     (dotimes [_ 120]
       (db/record-reuse! storage (pick ids) (when (zero? (.nextInt rnd 2)) (pick ids)) nil))
     (let [call-ids #(mapv :event/call-id %)
-          everything (db/top-level-workflows storage {:top-level-only? false})]
+          everything (db/list-calls storage {:top-level-only? false})]
       (testing "the history has calls in every state, reused ones too"
         (doseq [state ["STARTED" "DONE" "ERROR" "TIMEOUT"]]
           (is (some #(= state (:workflow/state %)) everything) state)
@@ -231,7 +231,7 @@
               wf-def [nil "listing/a"]
               top-level-only? [true false]
               limit [nil 4]
-              :let [baseline (db/top-level-workflows storage (cond-> {:top-level-only? top-level-only?}
+              :let [baseline (db/list-calls storage (cond-> {:top-level-only? top-level-only?}
                                                                wf-def (assoc :wf-def wf-def)))
                     matching (filter #(or (nil? state) (= state (:workflow/state %))) baseline)]
               before [nil (:event/call-id (nth matching (quot (count matching) 2) nil))]]
@@ -242,5 +242,5 @@
                         before (assoc :before before))
               expected (cond->> (filter #(or (nil? before) (< (:event/call-id %) before)) matching)
                          limit (take (inc limit)))]
-          (is (= (call-ids expected) (call-ids (db/top-level-workflows storage filters)))
+          (is (= (call-ids expected) (call-ids (db/list-calls storage filters)))
               (pr-str filters)))))))

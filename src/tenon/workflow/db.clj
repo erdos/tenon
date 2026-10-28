@@ -62,11 +62,11 @@
      row also carries :workflow/expired true if its lease has run out (by the storage's
      clock), so time-out! would succeed.")
 
-  (find-by-wf-def-and-params [this wf-def params-edn-str])
+  (find-by-wf-def-and-params [this wf-def params-edn-str]
+    "The workflow row of exactly this (wf_def, params) pair - the one
+     insert-workflow! would not insert again - or nil.")
 
-  (top-level-workflows
-    [this]
-    [this filters]
+  (list-calls [this filters]
     "One row per call of a workflow fn, newest first: a workflow's first
      start (restarts are not new calls), plus one for each later call that
      reused its stored result. Each row is the called workflow's row
@@ -74,7 +74,7 @@
      :workflow/parent-invocation-id is the caller's, plus :event/call-id
      (identifies the call), :event/created-at (when the call happened)
      and :event/reused (true for a reuse). filters is an
-     optional map of {:state s :wf-def w :top-level-only? t :limit n
+     map (or nil) of {:state s :wf-def w :top-level-only? t :limit n
      :before call-id}.
 
      :state and :wf-def, when given, restrict to calls of workflows
@@ -92,7 +92,7 @@
      whether a further page exists should request :limit (inc n) and check
      whether they got more than n back, trimming to n before display.")
 
-  (top-level-wf-defs [this top-level-only?]
+  (list-wf-defs [this top-level-only?]
     "Distinct wf_def values, alphabetical - the option list for a
      workflow-name filter dropdown. top-level-only? true restricts to
      wf_defs called at the top level (reuses included); false includes every
@@ -112,13 +112,10 @@
      didn't run under it, so it isn't part of the tree: only the REUSED
      row is, a level below the reusing invocation. The workflow's own
      REUSED rows are part of its history wherever the reuse came from,
-     at depth 0."))
+     at depth 0.")
 
-(defprotocol Timeouts
-  "The part of a storage concerned with invocations that stop making
-   progress: the leases that tell a running invocation from one whose
-   process died, and finding the latter. Which they time out with
-   Storage's time-out!."
+  ;; Leases: they tell a running invocation from one whose process died,
+  ;; which time-out! then times out.
 
   (extend-lease! [this invocation-ids timeout-ms]
     "Heartbeat: moves the lease end of every invocation in invocation-ids (a

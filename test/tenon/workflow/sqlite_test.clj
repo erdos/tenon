@@ -47,7 +47,7 @@
                 inits (mapv #(future @started (db/init-db! %)) pools)]
             (deliver started true)
             (is (every? some? (mapv deref inits))))
-          (is (= [] (db/top-level-workflows (first pools) {})))
+          (is (= [] (db/list-calls (first pools) {})))
           (finally
             (run! #(.close ^java.io.Closeable %) pools)))))))
 

@@ -66,7 +66,7 @@
     (let [response (request :get "/workflows/pending")]
       (is (match? {:status 500} response)))))
 
-(deftest dashboard-lists-top-level-workflows-test
+(deftest dashboard-lists-list-calls-test
   (let [id (test-util/insert! "test.ns/top" :params (pr-str [1]))]
     (test-util/finish! id "DONE" (pr-str :ok))
     (let [state (-> (visit "/")
