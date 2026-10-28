@@ -209,7 +209,7 @@
   ;; the card counts the attempts and reuses, and opening a
   ;; past invocation's id says it shows the current one.
   (let [id (test-util/insert! "test.ns/summary")]
-    (test-util/finish! id "ERROR" (pr-str {:message "first" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (ex-info "first" {}))))
     (let [current (test-util/restart! id)
           child (test-util/insert! "test.ns/summary-child" :parent current)]
       (test-util/finish! child "DONE" (pr-str :ok))
@@ -247,7 +247,7 @@
 
 (deftest workflow-detail-page-shows-error-test
   (let [id (test-util/insert! "test.ns/failed")]
-    (test-util/finish! id "ERROR" (pr-str {:message "boom" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (ex-info "boom" {}))))
     (-> (visit (href id))
         (has (status? 200))
         (has (attr? [:section.wf-summary] :class "wf-summary state-ERROR"))
@@ -257,7 +257,7 @@
   ;; A restarted workflow keeps the states of its earlier invocations -
   ;; the timeline must show every one of them, in order, not just the latest.
   (let [id (test-util/insert! "test.ns/timeline")]
-    (test-util/finish! id "ERROR" (pr-str {:message "first failure" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (ex-info "first failure" {}))))
     (test-util/finish! (test-util/restart! id) "DONE" (pr-str :recovered))
     (is (= 4 (count (test-util/timeline id))))
     (-> (visit (href id))
@@ -322,7 +322,7 @@
   ;; Started -> Error -> Started -> Done: the first start is the call, the
   ;; second one a restart.
   (let [id (test-util/insert! "test.ns/tree-restarted")]
-    (test-util/finish! id "ERROR" (pr-str {:message "x" :class "java.lang.Exception" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (Exception. "x"))))
     (test-util/finish! (test-util/restart! id) "DONE" (pr-str :ok))
     (-> (visit (href id))
         (has (texts? [:ul.tree :span.tree-verb] ["Invoked" "Called" "Failed" "Restarted" "Completed"])))))
@@ -400,7 +400,7 @@
         sibling (test-util/insert! "test.ns/tree-sibling" :parent parent)]
     (test-util/finish! ok "DONE" (pr-str :ok))
     (test-util/finish! sibling "DONE" (pr-str :ok))
-    (test-util/finish! failing "ERROR" (pr-str {:message "kaboom" :class "clojure.lang.ExceptionInfo" :data nil}))
+    (test-util/finish! failing "ERROR" (pr-str (Throwable->map (ex-info "kaboom" {}))))
     (-> (visit (href parent))
         (within [:ul.tree]
           (has (texts? [:summary :b] ["tree-p" "tree-failing" "tree-ok" "tree-sibling"]))
@@ -567,7 +567,7 @@
   ;; Started at 0, Error at 10s, restarted at 60s, Done at 61.5s: the card
   ;; shows the last attempt's 1.5s, the tree's node the whole run's 61.5s.
   (let [id (test-util/insert! "test.ns/attempts")]
-    (test-util/finish! id "ERROR" (pr-str {:message "x" :class "java.lang.Exception" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (Exception. "x"))))
     (test-util/finish! (test-util/restart! id) "DONE" (pr-str :ok))
     (let [ids (map :id (jdbc/execute! (test-util/ds) ["SELECT id FROM event ORDER BY id"]
                                       {:builder-fn rs/as-unqualified-lower-maps}))]
@@ -580,7 +580,7 @@
 
 (deftest workflow-detail-page-tab-title-test
   (let [id (test-util/insert! "test.ns/tab")]
-    (test-util/finish! id "ERROR" (pr-str {:message "x" :class "java.lang.Exception" :data nil}))
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (Exception. "x"))))
     (-> (visit (href id))
         (has (texts? [:head :title] [(str "\u2717 test.ns/tab \u00B7 " id)])))))
 

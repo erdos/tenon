@@ -218,12 +218,25 @@
    (for [[k v] entries]
      [:div [:dt k] [:dd v]])])
 
+(defn error-summary
+  "The :class (the outermost exception's), :message (the root cause's) and
+   :data (ex-data) of a failure saved as a Throwable->map - nil if error
+   isn't a map."
+  [error]
+  (when (map? error)
+    (let [{:keys [type message data]} (first (:via error))]
+      {:class type
+       :message (or (:cause error) message)
+       :data (or (:data error) data)})))
+
 (defn error-details
-  "An exception: its class, its message prominently, then any extra content."
-  [class message & extra]
+  "An exception's error-summary: its class, its message prominently, its
+   ex-data if any, then any extra content."
+  [{:keys [class message data]} & extra]
   (into [:div
          [:div.error-class [:code (str class)]]
-         [:p.error-message message]]
+         [:p.error-message message]
+         (when data [:div (muted "ex-data") (folded-pre (pretty data))])]
         extra))
 
 (defn frame-str

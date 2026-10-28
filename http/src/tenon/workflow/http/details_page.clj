@@ -34,17 +34,11 @@
 (defmethod result-panel "DONE" [wf]
   (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:workflow/result wf))))
 
-(defn- failure-panel [title wf]
-  (let [error (ui/read-edn (:workflow/result wf))]
-    (ui/panel {:title title}
-              (if (map? error)
-                (let [{:keys [type message data]} (first (:via error))
-                      class (or (:class error) type)
-                      msg (or (:message error) (:cause error) message)
-                      ex-data (or (:data error) data)]
-                  (ui/error-details class msg
-                                    (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])))
-                (ui/edn-block (:workflow/result wf))))))
+(defn- failure-panel [title {result :workflow/result}]
+  (ui/panel {:title title}
+            (if-let [summary (ui/error-summary (ui/read-edn result))]
+              (ui/error-details summary)
+              (ui/edn-block result))))
 
 (defmethod result-panel "ERROR" [wf] (failure-panel "Error" wf))
 
@@ -106,22 +100,17 @@
 (defn- error-title
   "\"class: message\" of an ERROR or TIMEOUT event, for a chip's tooltip."
   [ev]
-  (let [error (ui/read-edn (:event/data ev))
-        {:keys [type message]} (first (:via error))]
-    (str (or (:class error) type) ": " (or (:message error) (:cause error) message))))
+  (let [{:keys [class message]} (ui/error-summary (ui/read-edn (:event/data ev)))]
+    (str class ": " message)))
 
 (defn- error-class-html
   "The exception class of an ERROR or TIMEOUT event, its package muted so the class
    name stands out - nil if the saved error has none."
   [ev]
-  (let [error (ui/read-edn (:event/data ev))
-        cls (when (map? error) (or (:class error) (:type (first (:via error)))))]
-    (when cls
-      (let [cls (str cls)
-            i (str/last-index-of cls ".")]
-        (if i
-          [:code.err-class [:span.wf-ns (subs cls 0 (inc i))] [:span.err-name (subs cls (inc i))]]
-          [:code.err-class [:span.err-name cls]])))))
+  (when-let [cls (some-> (ui/error-summary (ui/read-edn (:event/data ev))) :class str)]
+    (if-let [i (str/last-index-of cls ".")]
+      [:code.err-class [:span.wf-ns (subs cls 0 (inc i))] [:span.err-name (subs cls (inc i))]]
+      [:code.err-class [:span.err-name cls]])))
 
 (defn- problem?
   "Whether node k's subtree has a workflow that failed or is still running."
@@ -157,26 +146,21 @@
    message, ex-data, the chain of causes (via) and the stack trace. Not a
    map - shown as the raw EDN."
   [data-str]
-  (let [error (ui/read-edn data-str)]
-    (if-not (map? error)
-      (ui/edn-block data-str)
-      (let [{:keys [via trace phase data]} error
-            {:keys [type message]} (first via)
-            ex-data (or data (:data (last via)))]
-        [:div.event-error-body
-         (ui/error-details (or (:class error) type)
-                           (or (:message error) (:cause error) message)
-                           (when ex-data [:div (ui/muted "ex-data") (ui/folded-pre (ui/pretty ex-data))])
-                           (when phase [:div (ui/muted "phase") [:code (pr-str phase)]])
-                           (when (next via)
-                             [:div (ui/muted "caused by")
-                              [:ol.error-via
-                               (for [{:keys [type message at]} via]
-                                 [:li [:code (str type)] (when message (str ": " message))
-                                  (when at [:div.error-at (ui/frame-str at)])])]])
-                           (when (seq trace)
-                             [:div (ui/muted "stack trace")
-                              (ui/stack-trace trace)]))]))))
+  (let [{:keys [via trace phase] :as error} (ui/read-edn data-str)]
+    (if-let [summary (ui/error-summary error)]
+      [:div.event-error-body
+       (ui/error-details summary
+                         (when phase [:div (ui/muted "phase") [:code (pr-str phase)]])
+                         (when (next via)
+                           [:div (ui/muted "caused by")
+                            [:ol.error-via
+                             (for [{:keys [type message at]} via]
+                               [:li [:code (str type)] (when message (str ": " message))
+                                (when at [:div.error-at (ui/frame-str at)])])]])
+                         (when (seq trace)
+                           [:div (ui/muted "stack trace")
+                            (ui/stack-trace trace)]))]
+      (ui/edn-block data-str))))
 
 (defmulti ^:private event-fold-body :workflow/state)
 

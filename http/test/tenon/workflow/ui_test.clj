@@ -91,7 +91,7 @@
       (has (texts? (ku/dd-of "b") ["2"]))))
 
 (deftest error-details-test
-  (-> (render (ui/error-details "java.lang.Exception" "boom" [:pre "extra"]))
+  (-> (render (ui/error-details {:class "java.lang.Exception" :message "boom"} [:pre "extra"]))
       (has (texts? [:div.error-class :code] ["java.lang.Exception"]))
       (has (texts? [:p.error-message] ["boom"]))
       (has (texts? [:pre] ["extra"]))))

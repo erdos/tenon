@@ -226,7 +226,7 @@
       (done? wf) (edn/read-string (:workflow/result wf))
       (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
                      (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
-                                          (or (:cause failure) (:message failure)))
+                                          (:cause failure))
                                      {:type ::previous-failure
                                       :invocation-id (:workflow/invocation-id wf)
                                       :state (:workflow/state wf)

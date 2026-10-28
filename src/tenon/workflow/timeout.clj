@@ -31,10 +31,12 @@
   (when (and (= "STARTED" state) expired)
     (let [timeout-ms (- expires-at state-changed-at)]
       (when (db/time-out! ds invocation-id
-                          (pr-str-whole {:message (str "Timed out: still running " timeout-ms
-                                                       " ms after it started")
-                                         :class (str `timed-out)
-                                         :data {:type ::timed-out :timeout-ms timeout-ms}}))
+                          (pr-str-whole (Throwable->map
+                                         (doto (ex-info (str "Timed out: still running " timeout-ms
+                                                             " ms after it started")
+                                                        {:type ::timed-out :timeout-ms timeout-ms})
+                                           ;; where the sweep found it says nothing about the run
+                                           (.setStackTrace (make-array StackTraceElement 0))))))
         (emit! engine :timed-out {:invocation-id invocation-id
                                   :parent-invocation-id parent-invocation-id
                                   :wf-def wf-name})
