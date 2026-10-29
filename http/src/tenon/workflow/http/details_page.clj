@@ -48,54 +48,99 @@
   (ui/panel {:title "Result"}
             (ui/muted "Pending \u2014 no result yet.")))
 
-(defn- timeline-tree
-  "Groups full-timeline events (in chronological order) into a tree of
-   workflow nodes, as a map from node key to {:events [[index event] ...]}.
-   A node key is the path of current invocation ids from the root down:
-   [:root] for the workflow itself (every depth 0 event, its own REUSED
-   rows included), the parent's key plus the workflow's id below it. A
-   REUSED row hangs under the reusing invocation's node, as a node of its
-   own - the reused workflow didn't run there."
+(defn- node-keys
+  "The tree node key of each of events: the path of current invocation ids
+   from the root down - [:root] for the workflow itself (every depth 0
+   event, its own REUSED rows included), the parent's key plus the
+   workflow's id below it. A REUSED row hangs under the reusing
+   invocation's node, as a node of its own - the reused workflow didn't
+   run there."
   [events]
-  (let [indexed (map-indexed vector events)
-        by-invocation (->> indexed
-                           (remove (comp engine/reused? second))
-                           (reduce (fn [m [_ ev]] (update m (:workflow/invocation-id ev) #(or % ev))) {}))
-        node-key (fn node-key [{:workflow/keys [depth current-invocation-id parent-invocation-id]}]
-                   (if (zero? depth)
-                     [:root]
-                     (conj (if-let [parent (by-invocation parent-invocation-id)]
-                             (node-key parent)
-                             [:root])
-                           current-invocation-id)))]
-    (reduce (fn [nodes [i ev]] (update-in nodes [(node-key ev) :events] (fnil conj []) [i ev]))
-            {} indexed)))
+  (let [first-run (reduce (fn [m ev]
+                            (cond-> m
+                              (not (or (engine/reused? ev) (m (:workflow/invocation-id ev))))
+                              (assoc (:workflow/invocation-id ev) ev)))
+                          {} events)
+        node-key (memoize
+                  (fn node-key [{:workflow/keys [depth current-invocation-id parent-invocation-id]}]
+                    (if (zero? depth)
+                      [:root]
+                      (conj (if-let [parent (first-run parent-invocation-id)]
+                              (node-key parent)
+                              [:root])
+                            current-invocation-id))))]
+    (mapv node-key events)))
 
+(defn timeline-tree
+  "full-timeline events (in chronological order) as a tree of nodes, the
+   root being the workflow itself - nil if there are none. A node is
+   either a reuse within the tree, {:kind :reuse :index i :event ev} - a
+   leaf - or a workflow's run:
 
-(defn- run-event-outcome
+     :kind            :run
+     :index           position of its first event in events
+     :root?           whether it is the root
+     :name, :invocation-id  the workflow's name and current invocation id
+     :outcome         its latest event that is no REUSED one
+     :state           the state of :outcome
+     :problem?        whether it or a node below failed or still runs
+     :attempts        its number of STARTED events
+     :reuses          its number of REUSED events
+     :started-at, :last-started-at  epoch ms of its first and latest start
+     :ended-at        epoch ms of :outcome, nil while still running
+     :items           its events {:kind :event :index i :event ev
+                      :restart? r :attempt-started-at t} (r: a STARTED one
+                      that is not its first event, t: the latest start
+                      before it) and the nodes below it, by :index"
   [events]
-  (->> events (map second) (remove engine/reused?) last))
+  (when (seq events)
+    (let [entries (map vector (node-keys events) (range) events)
+          by-key (group-by first entries)
+          children (group-by pop (remove #{[:root]} (keys by-key)))
+          event-items (fn [entries]
+                        (let [first-index (second (first entries))]
+                          (first (reduce (fn [[items started] [_ i ev]]
+                                           [(conj items {:kind :event :index i :event ev
+                                                         :restart? (and (engine/started? ev) (not= i first-index))
+                                                         :attempt-started-at (:workflow/state-changed-at started)})
+                                            (if (engine/started? ev) ev started)])
+                                         [[] nil] entries))))
+          node (fn node [k]
+                 (let [entries (by-key k)
+                       [_ index ev] (first entries)
+                       evs (map #(nth % 2) entries)
+                       run (remove engine/reused? evs)
+                       outcome (last run)]
+                   (if-not outcome
+                     {:kind :reuse :index index :event ev}
+                     (let [below (mapv node (children k))
+                           starts (filter engine/started? run)]
+                       {:kind :run
+                        :index index
+                        :root? (= [:root] k)
+                        :name (:workflow/name ev)
+                        :invocation-id (:workflow/current-invocation-id ev)
+                        :outcome outcome
+                        :state (:workflow/state outcome)
+                        :problem? (boolean (or (engine/failed? outcome) (engine/started? outcome)
+                                               (some :problem? below)))
+                        :attempts (count starts)
+                        :reuses (count (filter engine/reused? evs))
+                        :started-at (:workflow/state-changed-at (first starts))
+                        :last-started-at (:workflow/state-changed-at (last starts))
+                        :ended-at (when-not (engine/started? outcome) (:workflow/state-changed-at outcome))
+                        :items (vec (sort-by :index (concat (event-items entries) below)))}))))]
+      (node [:root]))))
 
-(defn- run-state
-  "The state of a node's run: that of its run-event-outcome, REUSED for a reuse
-   within the tree."
-  [events]
-  (or (:workflow/state (run-event-outcome events)) "REUSED"))
-
-(defn- run-duration
-  "The node's run from its first STARTED (or, with :last-attempt, its
-   latest one - leaving out the time earlier attempts took before a
-   restart) to its outcome - or, while still STARTED, how long it has
-   been running (saying so in its tooltip). nil for a reuse-only node."
-  ([events] (run-duration events :whole-run))
-  ([events from]
-   (let [run (remove engine/reused? (map second events))
-         starts (filter engine/started? run)]
-     (when-let [start (:workflow/state-changed-at (if (= :last-attempt from) (last starts) (first starts)))]
-       (if (engine/started? (last run))
-         (let [d (ui/format-duration start (System/currentTimeMillis))]
-           [:span {:title (str "running for " d)} d])
-         (ui/format-duration start (:workflow/state-changed-at (last run))))))))
+(defn- duration-html
+  "How long a run took from from to to - or, with no to, how long it has
+   been running (saying so in its tooltip). nil without from."
+  [from to]
+  (when from
+    (if to
+      (ui/format-duration from to)
+      (let [d (ui/format-duration from (System/currentTimeMillis))]
+        [:span {:title (str "running for " d)} d]))))
 
 (defn- error-title
   "\"class: message\" of an ERROR or TIMEOUT event, for a chip's tooltip."
@@ -111,13 +156,6 @@
     (if-let [i (str/last-index-of cls ".")]
       [:code.err-class [:span.wf-ns (subs cls 0 (inc i))] [:span.err-name (subs cls (inc i))]]
       [:code.err-class [:span.err-name cls]])))
-
-(defn- problem?
-  "Whether node k's subtree has a workflow that failed or is still running."
-  [nodes children k]
-  (or (let [ev (run-event-outcome (get-in nodes [k :events]))]
-        (and ev (or (engine/failed? ev) (engine/started? ev))))
-      (some #(problem? nodes children %) (children k))))
 
 (defn- tree-columns
   "The tabular right side of a tree row: a node's duration, reuse count and
@@ -189,7 +227,7 @@
    one shows how long the attempt took, from its started event (the latest
    before it). One with something to show folds (closed) to it, see
    event-fold-body."
-  [start ev root? restart? started]
+  [start root? {ev :event :keys [restart? attempt-started-at]}]
   (let [row (list
              (tree-offset start ev (when restart? "Restarted"))
              (when (engine/failed? ev) (error-class-html ev))
@@ -198,8 +236,8 @@
                 "from " (ui/workflow-link (:workflow/invocation-id ev))
                 " for " (ui/workflow-link caller)])
              (tree-columns
-              (when (and started (engine/done? ev))
-                (ui/format-duration (:workflow/state-changed-at started) (:workflow/state-changed-at ev)))
+              (when (and attempt-started-at (engine/done? ev))
+                (ui/format-duration attempt-started-at (:workflow/state-changed-at ev)))
               nil
               (ui/state-with-tooltip (:workflow/state ev) (when (engine/failed? ev) (error-title ev)))))]
     (if-let [body (event-fold-body ev)]
@@ -232,54 +270,38 @@
         [:div.event-error-body (ui/muted "Metadata") (metadata-body data)]]]
       (into [:li.tree-leaf.state-REUSED [:span.tree-bullet "\u2022"]] row))))
 
-(defn- timeline-tree-node [nodes children start k]
-  (let [events (get-in nodes [k :events])
-        {wf-name :workflow/name :workflow/keys [current-invocation-id]} (second (first events))
-        run-ev (run-event-outcome events)
-        state (run-state events)
-        reuses (count (filter (comp engine/reused? second) events))
-        duration (run-duration events)
-        last-error (->> events (map second) (filter engine/failed?) last)
-        items (->> (concat (for [[i ev] events] [i :event ev])
-                           (for [ck (children k)] [(ffirst (get-in nodes [ck :events])) :node ck]))
-                   (sort-by first))]
-    (if (= "REUSED" state)
-      (timeline-tree-reuse start (second (first events)))
+(defn- timeline-tree-node
+  [start {:keys [kind root? name invocation-id outcome state problem? reuses started-at ended-at items] :as node}]
+  (if (= :reuse kind)
+    (timeline-tree-reuse start (:event node))
     [:li
-     [:details (when (or (= [:root] k) (problem? nodes children k)) {:open true})
+     [:details (when (or root? problem?) {:open true})
       [:summary {:class (str "state-" state)}
        [:span.tree-verb "Invoked"]
-       (ui/workflow-name wf-name)
-       (when-not (= [:root] k)
-         (ui/workflow-link current-invocation-id))
+       (ui/workflow-name name)
+       (when-not root?
+         (ui/workflow-link invocation-id))
        (tree-columns
-        duration
+        (duration-html started-at ended-at)
         (when (pos? reuses)
           [:span {:title (str "result reused " (ui/pluralize reuses "time"))}
            (str "\u21BA " reuses)])
-        (ui/state-with-tooltip state (when (some-> run-ev engine/failed?) (some-> last-error error-title))))]
+        (ui/state-with-tooltip state (when (engine/failed? outcome) (error-title outcome))))]
       [:ul
-       (for [[i kind x] items]
-         (case kind
-           :event (timeline-tree-event start x (= [:root] k)
-                                       (and (engine/started? x) (not= i (ffirst events)))
-                                       (->> events (filter (fn [[j e]] (and (< j i) (engine/started? e)))) last second))
-           :node (timeline-tree-node nodes children start x)))]]])))
+       (for [item items]
+         (if (= :event (:kind item))
+           (timeline-tree-event start root? item)
+           (timeline-tree-node start item)))]]]))
 
 (defn- full-timeline-tree
-  "The timeline as a foldable tree. Nodes whose subtree has a failed or
+  "The timeline tree as a foldable one. Nodes whose subtree has a failed or
    still running workflow start open, finished ones folded (the root is
    always open). Event times are offsets from the timeline's start, the
    absolute time in their tooltip."
-  [events]
-  (if (empty? events)
-    [:p "none"]
-    (let [nodes (timeline-tree events)
-          children (->> (keys nodes)
-                        (remove #{[:root]})
-                        (group-by pop))
-          start (reduce min (map :workflow/state-changed-at events))]
-      [:ul.tree (timeline-tree-node nodes children start [:root])])))
+  [tree events]
+  (if tree
+    [:ul.tree (timeline-tree-node (reduce min (map :workflow/state-changed-at events)) tree)]
+    [:p "none"]))
 
 (defn- can-restart? [wf registered?]
   (and (or (engine/finished? wf) (engine/expired? wf)) registered?))
@@ -288,15 +310,13 @@
   "The card at the top of the detail page: the workflow's state, how it ran
    and how it relates to other workflows. requested-id is the id in the
    URL - a past invocation of a since restarted workflow shows the current
-   one, saying so. events is its full-timeline."
-  [{wf :workflow :keys [requested-id events restart-error registered?]}]
+   one, saying so. Its numbers are those of the timeline tree's root -
+   leaving out, as its duration, the time attempts before its latest
+   restart took."
+  [{wf :workflow {:keys [started-at last-started-at ended-at attempts reuses] :or {attempts 0 reuses 0}} :tree
+    :keys [requested-id restart-error registered?]}]
   (let [id (:workflow/invocation-id wf)
-        own (filter (comp zero? :workflow/depth) events)
-        runs (remove engine/reused? own)
-        started-at (:workflow/state-changed-at (first (filter engine/started? runs)))
-        attempts (count (filter engine/started? runs))
-        reuses (count (filter engine/reused? own))
-        duration (run-duration (map vector (range) own) :last-attempt)
+        duration (duration-html last-started-at ended-at)
         now (System/currentTimeMillis)]
     (ui/summary-card
      {:state (:workflow/state wf)
@@ -352,14 +372,16 @@
 (defmethod endpoint/model :view/details
   [_ {{requested-id :id} :path-params :keys [query-params]}]
   (when-let [wf (engine/get-invocation requested-id)]
-    {:workflow wf
-     :requested-id requested-id
-     :restart-error (not-empty (get query-params "restart_error"))
-     :events (vec (engine/full-timeline (:workflow/invocation-id wf)))
-     :ancestors (vec (ancestors-of wf))
-     :registered? (some? (engine/lookup (symbol (:workflow/name wf))))}))
+    (let [events (vec (engine/full-timeline (:workflow/invocation-id wf)))]
+      {:workflow wf
+       :requested-id requested-id
+       :restart-error (not-empty (get query-params "restart_error"))
+       :events events
+       :tree (timeline-tree events)
+       :ancestors (vec (ancestors-of wf))
+       :registered? (some? (engine/lookup (symbol (:workflow/name wf))))})))
 
-(defmethod endpoint/view :view/details [_ {wf :workflow :keys [events ancestors] :as m}]
+(defmethod endpoint/view :view/details [_ {wf :workflow :keys [events tree ancestors] :as m}]
   (let [id (:workflow/invocation-id wf)]
     (ui/layout (:workflow/name wf)
                {:back [(ui/uri) "Workflows"]
@@ -380,4 +402,4 @@
                  (when (seq events)
                    [:div.head-actions
                     [:button.btn {:type "button" :onclick expand-all-js} "Expand all"]])]
-                (full-timeline-tree events)])))
+                (full-timeline-tree tree events)])))

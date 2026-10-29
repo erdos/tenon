@@ -872,6 +872,36 @@
                  :registered? false}
                 (edn/read-string (:body response))))))
 
+;; Started -> Error, restarted, with a failed child and a sibling reusing a
+;; stored result: the tree comes with the details as data.
+(deftest detail-page-as-edn-has-the-timeline-tree-test
+  (let [produced (test-util/insert! "test.ns/produced")
+        _ (test-util/finish! produced "DONE" (pr-str :ok))
+        id (test-util/insert! "test.ns/tree-root")
+        child (test-util/insert! "test.ns/tree-child" :parent id)]
+    (test-util/finish! child "ERROR" (pr-str (Throwable->map (ex-info "down" {}))))
+    (test-util/record-reuse! produced id)
+    (test-util/finish! id "ERROR" (pr-str (Throwable->map (ex-info "root down" {}))))
+    (let [current (test-util/restart! id)]
+      (is (match? {:tree {:kind :run :root? true :name "test.ns/tree-root" :invocation-id current
+                          :state "STARTED" :problem? true :attempts 2 :reuses 0 :ended-at nil
+                          :items [{:kind :event :event {:workflow/state "STARTED"} :restart? false}
+                                  {:kind :run :name "test.ns/tree-child" :invocation-id child
+                                   :state "ERROR" :problem? true :attempts 1
+                                   :items [{:kind :event :event {:workflow/state "STARTED"}}
+                                           {:kind :event :event {:workflow/state "ERROR"}}]}
+                                  {:kind :reuse :event {:workflow/state "REUSED" :workflow/invocation-id produced}}
+                                  {:kind :event :event {:workflow/state "ERROR"}}
+                                  {:kind :event :event {:workflow/state "STARTED"} :restart? true}]}}
+                  (edn/read-string (:body (edn-request (href id)))))))))
+
+(deftest detail-page-tree-of-a-done-run-is-no-problem-test
+  (let [id (test-util/insert! "test.ns/tree-done")]
+    (test-util/finish! id "DONE" (pr-str :ok))
+    (is (match? {:tree {:state "DONE" :problem? false :attempts 1
+                        :items [{:attempt-started-at nil} {:restart? false :attempt-started-at int?}]}}
+                (edn/read-string (:body (edn-request (href id))))))))
+
 (deftest detail-page-as-edn-404-for-unknown-id-test
   (is (match? {:status 404} (edn-request "/workflows/999999"))))
 
