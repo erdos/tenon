@@ -269,6 +269,33 @@
                        (engine/run-invocation #'dedup-error-fn (fn [msg] (swap! calls inc) msg) ["boom"])))
     (is (zero? @calls) "must not have re-executed - the ERROR row was replayed as a failure")))
 
+(deftest previous-failure-carries-the-original-failure-test
+  ;; A reused failure carries the failure saved on the failed run's row,
+  ;; trace included.
+  (is (thrown? clojure.lang.ExceptionInfo
+        (engine/run-invocation #'dedup-error-fn dedup-error-fn ["deep"])))
+  (let [e (try (engine/run-invocation #'dedup-error-fn dedup-error-fn ["deep"])
+               (catch clojure.lang.ExceptionInfo e e))
+        row (first (test-util/find-by-wf-def "tenon.workflow-test/dedup-error-fn"))]
+    (is (match? {:type ::engine/previous-failure :invocation-id (:workflow/invocation-id row) :state "ERROR"}
+                (ex-data e)))
+    (is (= (edn/read-string (:workflow/result row)) (:failure (ex-data e))))
+    (is (seq (:trace (:failure (ex-data e)))))
+    (is (re-find #"deep$" (ex-message e)))))
+
+(deftest previous-failure-of-a-caller-carries-the-original-failure-test
+  ;; A caller failing on a reused failure, reused in turn, passes on the
+  ;; original failure - not the caller's own, which nests it.
+  (let [outer (fn [_] (engine/run-invocation #'dedup-error-fn dedup-error-fn ["nested"]))]
+    (is (thrown? clojure.lang.ExceptionInfo (engine/run-invocation #'dedup-error-fn dedup-error-fn ["nested"])))
+    (is (thrown? clojure.lang.ExceptionInfo (engine/run-invocation #'echo-fn outer [:caller])))
+    (let [e (try (engine/run-invocation #'echo-fn outer [:caller])
+                 (catch clojure.lang.ExceptionInfo e e))
+          original (edn/read-string (:workflow/result (first (test-util/find-by-wf-def "tenon.workflow-test/dedup-error-fn"))))]
+      (is (match? {:type ::engine/previous-failure :state "ERROR"} (ex-data e)))
+      (is (= "nested" (:cause original)))
+      (is (= original (:failure (ex-data e))) "the failure of dedup-error-fn, not of its caller"))))
+
 (deftest run-invocation-dedups-started-invocation-by-polling-test
   ;; A concurrent call already at STARTED must be waited out (polled) rather
   ;; than re-executed; once it reaches DONE, the waiter returns that result.

@@ -208,7 +208,13 @@
                            :metadata metadata})
     (cond
       (done? wf) (edn/read-string (:workflow/result wf))
-      (failed? wf) (let [failure (edn/read-string (:workflow/result wf))]
+      (failed? wf) (let [failure (edn/read-string (:workflow/result wf))
+                         ;; A caller failing on this saves it as its own failure,
+                         ;; so failing on a reused failure in turn saves the one
+                         ;; it carries: the original one, not nested ever deeper.
+                         failure (if (= ::previous-failure (:type (:data failure)))
+                                   (:failure (:data failure))
+                                   failure)]
                      (throw (ex-info (str "Workflow previously " (if (timeout? wf) "timed out" "failed") ": "
                                           (:cause failure))
                                      {:type ::previous-failure
