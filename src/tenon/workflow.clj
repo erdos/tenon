@@ -325,69 +325,112 @@
   ([engine invocation-id] (db/full-timeline (:tenon/db engine) invocation-id)))
 
 
+(defn- claim-restart!
+  "Restarts the workflow invocation-id belongs to in storage - see
+   restart-invocation - without running it yet. Returns [new-invocation-id
+   run], run being the 0-arg fn that runs it."
+  [engine invocation-id]
+  (let [ds (:tenon/db engine)
+        wf (let [wf (or (db/get-workflow ds invocation-id)
+                        (throw (ex-info "No such workflow"
+                                         {:type ::precondition-failed :invocation-id invocation-id})))]
+             (if (timeout/time-out-if-expired! engine wf)
+               (db/get-workflow ds (:workflow/invocation-id wf))
+               wf))
+        not-restartable (fn [state]
+                          (ex-info "Cannot restart: workflow is not DONE, ERROR or TIMEOUT"
+                                   {:type ::precondition-failed
+                                    :invocation-id invocation-id
+                                    :state state}))]
+    (when-not (finished? wf)
+      (throw (not-restartable (:workflow/state wf))))
+    (let [wf-def-sym (symbol (:workflow/name wf))
+          v (or (lookup wf-def-sym)
+                (throw (ex-info "wf_def not registered in this process"
+                                 {:type ::precondition-failed
+                                  :wf-def (str wf-def-sym)})))
+          args (edn/read-string (:workflow/params wf))
+          metadata (metadata-for engine wf-def-sym args)]
+      ;; A concurrent restart may have restarted it since wf was read -
+      ;; restarting only if it is still DONE/ERROR/TIMEOUT under the same
+      ;; invocation id lets only one of them through.
+      (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) (some-> metadata edn-str)
+                                             (:tenon/timeout-ms engine))]
+        [new-invocation-id
+         #(start-and-run! engine new-invocation-id :restarted
+                          {:previous-invocation-id (:workflow/invocation-id wf)
+                           :parent-invocation-id (:workflow/parent-invocation-id wf)
+                           :wf-def (:workflow/name wf)
+                           :metadata metadata}
+                          (raw-fn v) args)]
+        (throw (not-restartable (:workflow/state (db/get-workflow ds (:workflow/invocation-id wf)))))))))
+
 (defn restart-invocation
   "Restarts the workflow invocation-id belongs to (any of its current or
-   past invocation ids) under a new invocation id, keeping its history.
+   past invocation ids) under a new invocation id, keeping its history, and
+   runs it: returns its result, or rethrows its exception.
    Requires it to be DONE, ERROR or TIMEOUT (or STARTED past its lease - see
    :tenon/timeout-ms in init), and its wf_def to currently be registered
-   in this process. engine defaults to *workflow-engine*, same as
-   run-invocation."
+   in this process - else throws ex-info of :type ::precondition-failed.
+   engine defaults to *workflow-engine*, same as run-invocation."
   ([invocation-id]
    (restart-invocation (current-engine) invocation-id))
   ([engine invocation-id]
-   (let [ds (:tenon/db engine)
-         wf (let [wf (or (db/get-workflow ds invocation-id)
-                         (throw (ex-info "No such workflow"
-                                          {:type ::precondition-failed :invocation-id invocation-id})))]
-              (if (timeout/time-out-if-expired! engine wf)
-                (db/get-workflow ds (:workflow/invocation-id wf))
-                wf))
-         not-restartable (fn [state]
-                           (ex-info "Cannot restart: workflow is not DONE, ERROR or TIMEOUT"
-                                    {:type ::precondition-failed
-                                     :invocation-id invocation-id
-                                     :state state}))]
-     (when-not (finished? wf)
-       (throw (not-restartable (:workflow/state wf))))
-     (let [wf-def-sym (symbol (:workflow/name wf))
-           v (or (lookup wf-def-sym)
-                 (throw (ex-info "wf_def not registered in this process"
-                                  {:type ::precondition-failed
-                                   :wf-def (str wf-def-sym)})))
-           args (edn/read-string (:workflow/params wf))
-           metadata (metadata-for engine wf-def-sym args)]
-       ;; A concurrent restart may have restarted it since wf was read -
-       ;; restarting only if it is still DONE/ERROR/TIMEOUT under the same
-       ;; invocation id lets only one of them through.
-       (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) (some-> metadata edn-str)
-                                              (:tenon/timeout-ms engine))]
-         (start-and-run! engine new-invocation-id :restarted
-                         {:previous-invocation-id (:workflow/invocation-id wf)
-                          :parent-invocation-id (:workflow/parent-invocation-id wf)
-                          :wf-def (:workflow/name wf)
-                          :metadata metadata}
-                         (raw-fn v) args)
-         (throw (not-restartable (:workflow/state (db/get-workflow ds (:workflow/invocation-id wf))))))))))
+   (let [[_ run] (claim-restart! engine invocation-id)]
+     (run))))
+
+(defn- failed-callee
+  "The current invocation id of the workflow invocation-id called directly
+   that failed or timed out, or nil. A failed (or timed out) workflow
+   stopped at its first failing call, so at most one callee - a reused one
+   included - is failed, and only one path of the hierarchy leads to it."
+  [{ds :tenon/db :as engine} invocation-id]
+  (->> (db/full-timeline ds invocation-id)
+       (filter (comp #{1} :workflow/depth))
+       (map :workflow/current-invocation-id)
+       distinct
+       (map (partial db/get-workflow ds))
+       (some (fn [callee-wf]
+               (when (or (failed? callee-wf)
+                         (timeout/time-out-if-expired! engine callee-wf))
+                 (:workflow/invocation-id callee-wf))))))
 
 (defn restart-invocation-recursively
+  "Like restart-invocation, but first restarts - recursively, innermost
+   first - the failed or timed out workflow invocation-id called, if any,
+   so the restarted run does not reuse its failure. A callee failing again
+   aborts the restart with its exception."
   ([invocation-id]
    (restart-invocation-recursively (current-engine) invocation-id))
-  ([{ds :tenon/db :as engine} invocation-id]
-   ;; A failed (or timed out) workflow stopped at its first failing call, so at most one
-   ;; callee - a reused one included - is failed, and only one path of the
-   ;; hierarchy leads to it.
-   (some->> (db/full-timeline ds invocation-id)
-            (filter (comp #{1} :workflow/depth))
-            (map :workflow/current-invocation-id)
-            distinct
-            (map (partial db/get-workflow ds))
-            (some (fn [callee-wf]
-                    (when (or (failed? callee-wf)
-                              (timeout/time-out-if-expired! engine callee-wf))
-                      (:workflow/invocation-id callee-wf))))
+  ([engine invocation-id]
+   (some->> (failed-callee engine invocation-id)
             (restart-invocation-recursively engine))
    (restart-invocation engine invocation-id)))
 
+(defn start-restart
+  "Like restart-invocation - or restart-invocation-recursively if
+   recursive? - but returns once the restarts are recorded, with the new
+   invocation id of the workflow invocation-id belongs to, while the
+   restarted workflows run on background threads, their outcomes recorded
+   as usual. Throws, as restart-invocation does, if the workflow cannot be
+   restarted. Recursively, every failed workflow on the path to the
+   innermost failure is restarted at once, innermost first, each run
+   awaiting the restarted run of its callee - a callee failing again fails
+   its callers too, rather than leaving them as they were."
+  ([invocation-id recursive?]
+   (start-restart (current-engine) invocation-id recursive?))
+  ([engine invocation-id recursive?]
+   (let [path (if recursive?
+                (take-while some? (iterate #(failed-callee engine %) invocation-id))
+                [invocation-id])]
+     ;; Each callee is claimed before its caller, and started right away,
+     ;; so a caller failing to restart leaves no claimed callee unrun.
+     (reduce (fn [_ id]
+               (let [[new-id run] (claim-restart! engine id)]
+                 (future (run))
+                 new-id))
+             nil
+             (reverse (vec path))))))
 
 (defn workflow
   "Tag reader for #workflow to be placed in front of (defn) forms.

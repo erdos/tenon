@@ -86,6 +86,19 @@
   ([invocation-id parent-invocation-id metadata]
    (db/record-reuse! (ds) invocation-id parent-invocation-id metadata)))
 
+(defn await-finished
+  "Polls the workflow invocation-id belongs to until it is no longer
+   STARTED - e.g. one engine/start-restart runs in the background - and
+   returns it. Throws after 10 s."
+  [invocation-id]
+  (let [deadline (+ (System/currentTimeMillis) 10000)]
+    (loop []
+      (let [wf (engine/get-invocation invocation-id)]
+        (cond
+          (not (engine/started? wf)) wf
+          (< (System/currentTimeMillis) deadline) (do (Thread/sleep 5) (recur))
+          :else (throw (ex-info "Still STARTED" {:invocation-id invocation-id})))))))
+
 (defn expire!
   "Moves the lease end of STARTED invocation-id into the past, so it looks
    like it started long ago and timed out."

@@ -491,7 +491,7 @@
         state (-> (visit (href id))
                   (k/press "Restart")
                   (has (status? 303)))
-        current (:workflow/invocation-id (engine/get-invocation id))]
+        current (:workflow/invocation-id (test-util/await-finished id))]
     (is (not= id current) "restarted under a new invocation id")
     (is (= (href current) (get-in state [:response :headers "Location"])))
     (-> state
@@ -499,6 +499,21 @@
         (has (status? 200))
         (has (attr? [:section.wf-summary] :class "wf-summary state-DONE"))
         (has (texts? (dd-of "Id") [(str "\u29C9 " current)])))))
+
+(deftest restart-form-run-failing-is-no-failed-restart-test
+  ;; The restart worked - only the restarted run failed (again): no
+  ;; restart error, and the run's outcome is the workflow's state.
+  (let [id (flaky-invocation!)
+        state (-> (visit (href id))
+                  (k/press "Restart")
+                  (has (status? 303)))
+        current (:workflow/invocation-id (test-util/await-finished id))]
+    (is (not= id current))
+    (is (= (href current) (get-in state [:response :headers "Location"])))
+    (-> state
+        k/follow-redirect
+        (has (missing? [:p.wf-summary-note.wf-summary-error]))
+        (has (attr? [:section.wf-summary] :class "wf-summary state-ERROR")))))
 
 (deftest restart-form-failure-is-shown-on-the-detail-page-test
   (let [id (test-util/insert! "test.ns/still-running-restart")
@@ -827,7 +842,7 @@
         state (-> (visit (href id))
                   (k/press "Restart recursively")
                   (has (status? 303)))
-        current (:workflow/invocation-id (engine/get-invocation id))]
+        current (:workflow/invocation-id (test-util/await-finished id))]
     (is (not= id current))
     (-> state
         k/follow-redirect
@@ -895,7 +910,7 @@
   (let [id (flaky-invocation!)
         _ (engine/register! #'http-flaky-fn (fn [] :ok))
         response (edn-request :post (str (href id) "/restart"))
-        current (:workflow/invocation-id (engine/get-invocation id))]
+        current (:workflow/invocation-id (test-util/await-finished id))]
     (is (not= id current))
     (is (match? {:status 200} response))
     (is (= {:requested-id id :invocation-id current :restart-error nil}

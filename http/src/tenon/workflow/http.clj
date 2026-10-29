@@ -13,15 +13,17 @@
 
 (defmethod endpoint/model :view/restart
   [_ {{:keys [id]} :path-params :keys [query-params]}]
-  (let [error (try
-                (if (= "true" (get query-params "recursive"))
-                  (engine/restart-invocation-recursively id)
-                  (engine/restart-invocation id))
-                nil
-                (catch Throwable e (or (ex-message e) (str (class e)))))]
-    {:requested-id id
-     :invocation-id (or (some-> id engine/get-invocation :workflow/invocation-id) id)
-     :restart-error error}))
+  ;; Returns once the restart is recorded: the workflow runs in the
+  ;; background, so its own failure is not a failed restart.
+  (assoc (try
+           {:invocation-id (engine/start-restart id (= "true" (get query-params "recursive")))
+            :restart-error nil}
+           (catch clojure.lang.ExceptionInfo e
+             (when-not (= ::engine/precondition-failed (:type (ex-data e)))
+               (throw e))
+             {:invocation-id (or (some-> id engine/get-invocation :workflow/invocation-id) id)
+              :restart-error (ex-message e)}))
+         :requested-id id))
 
 (defmethod endpoint/status :view/restart [_ {:keys [restart-error]}]
   (if restart-error 409 200))

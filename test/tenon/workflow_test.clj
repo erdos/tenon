@@ -945,3 +945,43 @@
     (engine/register! #'timeout-inner (fn [n] (* n 2)))
     (is (= 15 (engine/restart-invocation-recursively (:workflow/invocation-id outer))))
     (is (= "DONE" (:workflow/state (engine/get-invocation (:workflow/invocation-id inner)))))))
+
+#workflow
+(defn background-callee [n]
+  (throw (ex-info "callee down" {:n n})))
+
+#workflow
+(defn background-caller [n]
+  (inc (background-callee n)))
+
+(defn- background-caller-id []
+  (is (thrown? Exception (background-caller 3)))
+  (:workflow/invocation-id (first (test-util/find-by-wf-def "tenon.workflow-test/background-caller"))))
+
+(deftest start-restart-returns-before-the-run-ends-test
+  (let [id (background-caller-id)
+        release (promise)]
+    (engine/register! #'background-callee (fn [n] @release n))
+    (try
+      (let [new-id (engine/start-restart id true)]
+        (is (not= id new-id))
+        (is (= "STARTED" (:workflow/state (engine/get-invocation new-id))) "the run is still going")
+        (deliver release true)
+        (is (match? {:workflow/state "DONE" :workflow/result "4"} (test-util/await-finished new-id)))
+        (is (= "DONE" (:workflow/state (first (test-util/find-by-wf-def "tenon.workflow-test/background-callee"))))
+            "recursively, the failed callee was restarted too"))
+      (finally
+        (deliver release true)
+        (engine/register! #'background-callee (fn [n] (throw (ex-info "callee down" {:n n}))))))))
+
+(deftest start-restart-records-the-run-failing-as-its-outcome-test
+  (let [new-id (engine/start-restart (background-caller-id) false)]
+    (is (= "ERROR" (:workflow/state (test-util/await-finished new-id)))
+        "the cached failure of its callee fails it again - the restart itself worked")))
+
+(deftest start-restart-throws-when-not-restartable-test
+  (let [id (test-util/insert! "test.ns/still-running" :timeout-ms 60000)]
+    (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/precondition-failed :state "STARTED"}
+                       (engine/start-restart id false)))
+    (is (thrown-match? clojure.lang.ExceptionInfo {:type ::engine/precondition-failed}
+                       (engine/start-restart 123456 true)))))
