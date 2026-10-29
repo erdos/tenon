@@ -94,22 +94,22 @@
      [:span.btn.disabled "Next page →"])])
 
 (defmethod endpoint/model :view/listing
-  [_ {:keys [query-params]}]
+  [_ {:keys [query-params] :tenon/keys [engine]}]
   (let [{:keys [page-size page_cursor]} (ui/parse-pagination query-params [:before_id])
         {:keys [state wf-def show-all?] :as f} {:state (not-empty (get query-params "state"))
                                                 :wf-def (not-empty (get query-params "wf_def"))
                                                 :show-all? (some? (get query-params "all"))
                                                 :page-size page-size
                                                 :refresh? (some? (get query-params "refresh"))}
-        rows (engine/list-invocations {:state state :wf-def wf-def
-                                       :top-level-only? (not show-all?)
-                                       :limit page-size
-                                       :before (some-> page_cursor first parse-long)})
+        rows (engine/list-invocations engine {:state state :wf-def wf-def
+                                              :top-level-only? (not show-all?)
+                                              :limit page-size
+                                              :before (some-> page_cursor first parse-long)})
         page-rows (vec (take page-size rows))]
     {:filters f
      :rows page-rows
      :next-cursor (when (> (count rows) page-size) (:event/call-id (last page-rows)))
-     :wf-defs (engine/list-wf-defs (not show-all?))}))
+     :wf-defs (engine/list-wf-defs engine (not show-all?))}))
 
 (defmethod endpoint/view :view/listing [_ {:keys [filters rows next-cursor wf-defs]}]
   (ui/layout "Workflows"

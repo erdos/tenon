@@ -359,10 +359,10 @@
 
 (defn- ancestors-of
   "The workflows wf runs nested under, top-level first."
-  [wf]
+  [engine wf]
   (loop [parent-id (:workflow/parent-invocation-id wf) acc ()]
     (if-let [parent (when (and parent-id (< (count acc) 100))
-                      (engine/get-invocation parent-id))]
+                      (engine/get-invocation engine parent-id))]
       (recur (:workflow/parent-invocation-id parent) (cons parent acc))
       acc)))
 
@@ -370,15 +370,15 @@
   "let d=[...document.querySelectorAll('ul.tree details')],o=d.every(x=>x.open);d.forEach(x=>x.open=!o);this.textContent=o?'Expand all':'Collapse all'")
 
 (defmethod endpoint/model :view/details
-  [_ {{requested-id :id} :path-params :keys [query-params]}]
-  (when-let [wf (engine/get-invocation requested-id)]
-    (let [events (vec (engine/full-timeline (:workflow/invocation-id wf)))]
+  [_ {{requested-id :id} :path-params :keys [query-params] :tenon/keys [engine]}]
+  (when-let [wf (engine/get-invocation engine requested-id)]
+    (let [events (vec (engine/full-timeline engine (:workflow/invocation-id wf)))]
       {:workflow wf
        :requested-id requested-id
        :restart-error (not-empty (get query-params "restart_error"))
        :events events
        :tree (timeline-tree events)
-       :ancestors (vec (ancestors-of wf))
+       :ancestors (vec (ancestors-of engine wf))
        :registered? (some? (engine/lookup (symbol (:workflow/name wf))))})))
 
 (defmethod endpoint/view :view/details [_ {wf :workflow :keys [events tree ancestors] :as m}]

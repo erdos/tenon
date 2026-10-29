@@ -8,20 +8,20 @@
             [tenon.workflow.http.listing-page]
             [tenon.workflow.ui :as ui]))
 
-(defmethod endpoint/model :view/pending [_ _]
-  {:rows (engine/list-pending)})
+(defmethod endpoint/model :view/pending [_ {:tenon/keys [engine]}]
+  {:rows (engine/list-pending engine)})
 
 (defmethod endpoint/model :view/restart
-  [_ {{:keys [id]} :path-params :keys [query-params]}]
+  [_ {{:keys [id]} :path-params :keys [query-params] :tenon/keys [engine]}]
   ;; Returns once the restart is recorded: the workflow runs in the
   ;; background, so its own failure is not a failed restart.
   (assoc (try
-           {:invocation-id (engine/start-restart id (= "true" (get query-params "recursive")))
+           {:invocation-id (engine/start-restart engine id (= "true" (get query-params "recursive")))
             :restart-error nil}
            (catch clojure.lang.ExceptionInfo e
              (when-not (= ::engine/precondition-failed (:type (ex-data e)))
                (throw e))
-             {:invocation-id (or (some-> id engine/get-invocation :workflow/invocation-id) id)
+             {:invocation-id (or (some->> id (engine/get-invocation engine) :workflow/invocation-id) id)
               :restart-error (ex-message e)}))
          :requested-id id))
 
@@ -43,21 +43,18 @@
 
 (defn handler
   "Ring handler for tenon's dashboard/detail pages, restart form and
-   pending-workflows JSON endpoint. engine is
-   an application-state map as built by tenon.workflow/init -
-   bound to engine/*workflow-engine* for the duration of the request, so
-   the tenon.workflow functions called here reach it without engine
-   threaded through every helper's argument list. prefix is the URI prefix tenon is
+   pending-workflows JSON endpoint. engine is an application-state map as
+   built by tenon.workflow/init - the endpoints find it under
+   :tenon/engine of the request. prefix is the URI prefix tenon is
    mounted under - request's :uri is expected to already be relative to
    it (i.e. with prefix stripped, as wrap-handler does), and every
    link/URL this handler's HTML generates gets prefix prepended back on
-   via ui/*uri-prefix*, also bound here. Pass \"\" to mount unprefixed at the
+   via ui/*uri-prefix*, bound here. Pass \"\" to mount unprefixed at the
    app's own root."
   [engine prefix request]
-  (binding [ui/*uri-prefix* prefix
-            engine/*workflow-engine* engine]
+  (binding [ui/*uri-prefix* prefix]
     (let [[endpoint path-params] (route request)]
-      (endpoint/respond endpoint (assoc request :path-params path-params)))))
+      (endpoint/respond endpoint (assoc request :path-params path-params :tenon/engine engine)))))
 
 (defn- strip-prefix
   "request-uri relative to prefix, or nil if request-uri isn't actually

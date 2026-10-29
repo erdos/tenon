@@ -97,12 +97,12 @@
   (.close ^Closeable (:tenon/db engine)))
 
 (def ^:dynamic *workflow-engine*
-  "The current application-state map (as built by init), read by
-   run-invocation/restart-invocation/list-pending when not given one
-   explicitly. #workflow-tagged fns always call the implicit-engine
-   arity, so binding this - typically once, via (alter-var-root!
-   #'*workflow-engine* (constantly (init \"app.db\"))) at startup - is
-   what makes them work at all. nil until then."
+  "The engine (as built by init) #workflow-tagged fns run on: they call
+   run-invocation without one. Bind it - typically once, via
+   (alter-var-root! #'*workflow-engine* (constantly (init \"app.db\"))) at
+   startup - before calling them from outside a workflow; inside one, it is
+   bound to the engine that runs it. Every other fn takes the engine as its
+   first argument. nil until then."
   nil)
 
 (defn- current-engine
@@ -139,7 +139,8 @@
     (swap! in-flight assoc invocation-id done)
     (try
       (let [result (try
-                     (binding [*invocation-stack* (conj *invocation-stack* invocation-id)]
+                     (binding [*workflow-engine* engine
+                               *invocation-stack* (conj *invocation-stack* invocation-id)]
                        (apply raw-fn args))
                      (catch Throwable e
                        (db/finish! ds invocation-id "ERROR" (exception-str e))
@@ -249,14 +250,14 @@
                                      {:type ::race-condition :wf-def wf-def-str})))))))))
 
 (defn sweep!
-  ([] (sweep! (current-engine)))
-  ([engine] (timeout/sweep! engine)))
+  [engine]
+  (timeout/sweep! engine))
 
 (defn list-pending
-  ([] (list-pending (current-engine)))
-  ([engine] (->> (db/list-calls (:tenon/db engine) {:state "STARTED" :top-level-only? false})
-                 (remove :event/reused)
-                 (vec))))
+  [engine]
+  (->> (db/list-calls (:tenon/db engine) {:state "STARTED" :top-level-only? false})
+       (remove :event/reused)
+       (vec)))
 
 (defn get-invocation
   "The workflow invocation-id belongs to, or nil. invocation-id may also
@@ -282,8 +283,8 @@
                                     nil while STARTED
      :workflow/expired              boolean - whether the STARTED lease has
                                     run out"
-  ([invocation-id] (get-invocation (current-engine) invocation-id))
-  ([engine invocation-id] (db/get-workflow (:tenon/db engine) invocation-id)))
+  [engine invocation-id]
+  (db/get-workflow (:tenon/db engine) invocation-id))
 
 (defn list-invocations
   "Calls of workflows matching filters, newest first - each workflow's
@@ -296,14 +297,14 @@
      :event/call-id    long - identifies the call, the :before cursor
      :event/created-at long - epoch ms of the call
      :event/reused     boolean - whether the call reused a stored result"
-  ([filters] (list-invocations (current-engine) filters))
-  ([engine filters] (db/list-calls (:tenon/db engine) filters)))
+  [engine filters]
+  (db/list-calls (:tenon/db engine) filters))
 
 (defn list-wf-defs
   "Vector of the distinct wf_def strings (qualified fn symbols),
    alphabetical - only those of top-level workflows if top-level-only?."
-  ([top-level-only?] (list-wf-defs (current-engine) top-level-only?))
-  ([engine top-level-only?] (db/list-wf-defs (:tenon/db engine) top-level-only?)))
+  [engine top-level-only?]
+  (db/list-wf-defs (:tenon/db engine) top-level-only?))
 
 (defn full-timeline
   "Every state - past and current - of the workflow invocation-id belongs
@@ -327,8 +328,8 @@
                                      or nil
      :workflow/depth                 long - 0 for the workflow itself, 1 for a
                                      direct sub-workflow, and so on"
-  ([invocation-id] (full-timeline (current-engine) invocation-id))
-  ([engine invocation-id] (db/full-timeline (:tenon/db engine) invocation-id)))
+  [engine invocation-id]
+  (db/full-timeline (:tenon/db engine) invocation-id))
 
 
 (defn- claim-restart!
@@ -377,13 +378,10 @@
    runs it: returns its result, or rethrows its exception.
    Requires it to be DONE, ERROR or TIMEOUT (or STARTED past its lease - see
    :tenon/timeout-ms in init), and its wf_def to currently be registered
-   in this process - else throws ex-info of :type ::precondition-failed.
-   engine defaults to *workflow-engine*, same as run-invocation."
-  ([invocation-id]
-   (restart-invocation (current-engine) invocation-id))
-  ([engine invocation-id]
-   (let [[_ run] (claim-restart! engine invocation-id)]
-     (run))))
+   in this process - else throws ex-info of :type ::precondition-failed."
+  [engine invocation-id]
+  (let [[_ run] (claim-restart! engine invocation-id)]
+    (run)))
 
 (defn- failed-callee
   "The current invocation id of the workflow invocation-id called directly
@@ -406,12 +404,10 @@
    first - the failed or timed out workflow invocation-id called, if any,
    so the restarted run does not reuse its failure. A callee failing again
    aborts the restart with its exception."
-  ([invocation-id]
-   (restart-invocation-recursively (current-engine) invocation-id))
-  ([engine invocation-id]
-   (some->> (failed-callee engine invocation-id)
-            (restart-invocation-recursively engine))
-   (restart-invocation engine invocation-id)))
+  [engine invocation-id]
+  (some->> (failed-callee engine invocation-id)
+           (restart-invocation-recursively engine))
+  (restart-invocation engine invocation-id))
 
 (defn start-restart
   "Like restart-invocation - or restart-invocation-recursively if
@@ -423,20 +419,18 @@
    innermost failure is restarted at once, innermost first, each run
    awaiting the restarted run of its callee - a callee failing again fails
    its callers too, rather than leaving them as they were."
-  ([invocation-id recursive?]
-   (start-restart (current-engine) invocation-id recursive?))
-  ([engine invocation-id recursive?]
-   (let [path (if recursive?
-                (take-while some? (iterate #(failed-callee engine %) invocation-id))
-                [invocation-id])]
-     ;; Each callee is claimed before its caller, and started right away,
-     ;; so a caller failing to restart leaves no claimed callee unrun.
-     (reduce (fn [_ id]
-               (let [[new-id run] (claim-restart! engine id)]
-                 (future (run))
-                 new-id))
-             nil
-             (reverse (vec path))))))
+  [engine invocation-id recursive?]
+  (let [path (if recursive?
+               (take-while some? (iterate #(failed-callee engine %) invocation-id))
+               [invocation-id])]
+    ;; Each callee is claimed before its caller, and started right away,
+    ;; so a caller failing to restart leaves no claimed callee unrun.
+    (reduce (fn [_ id]
+              (let [[new-id run] (claim-restart! engine id)]
+                (future (run))
+                new-id))
+            nil
+            (reverse (vec path)))))
 
 (defn workflow
   "Tag reader for #workflow to be placed in front of (defn) forms.

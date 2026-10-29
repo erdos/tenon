@@ -45,13 +45,13 @@
   "The states of the workflow invocation-id belongs to - not those of its
    sub-workflows - oldest first, via the public tenon.workflow/full-timeline."
   [invocation-id]
-  (filterv #(zero? (:workflow/depth %)) (engine/full-timeline invocation-id)))
+  (filterv #(zero? (:workflow/depth %)) (engine/full-timeline engine/*workflow-engine* invocation-id)))
 
 (defn find-by-wf-def
   "Workflows (of any nesting) whose wf_def is exactly wf-def, newest
    first, via the public tenon.workflow/list-invocations - reuses left out."
   [wf-def]
-  (remove :event/reused (engine/list-invocations {:wf-def wf-def :top-level-only? false})))
+  (remove :event/reused (engine/list-invocations engine/*workflow-engine* {:wf-def wf-def :top-level-only? false})))
 
 (defn find-by-wf-def-and-params
   "The workflow run with exactly this wf-def and params (an edn string), or
@@ -93,7 +93,7 @@
   [invocation-id]
   (let [deadline (+ (System/currentTimeMillis) 10000)]
     (loop []
-      (let [wf (engine/get-invocation invocation-id)]
+      (let [wf (engine/get-invocation engine/*workflow-engine* invocation-id)]
         (cond
           (not (engine/started? wf)) wf
           (< (System/currentTimeMillis) deadline) (do (Thread/sleep 5) (recur))

@@ -62,7 +62,7 @@
     (is (match? {:rows [{:workflow/invocation-id id :workflow/params "[1 2]"}]} body))))
 
 (deftest pending-endpoint-returns-500-on-unexpected-error-test
-  (with-redefs [engine/list-pending (fn [] (throw (ex-info "kaboom" {})))]
+  (with-redefs [engine/list-pending (fn [_engine] (throw (ex-info "kaboom" {})))]
     (let [response (request :get "/workflows/pending")]
       (is (match? {:status 500} response)))))
 
@@ -279,7 +279,7 @@
     (test-util/finish! grandchild-id "DONE" (pr-str :ok))
     (test-util/finish! child-id "DONE" (pr-str :ok))
     (test-util/finish! parent-id "DONE" (pr-str :ok))
-    (is (= 6 (count (engine/full-timeline parent-id)))
+    (is (= 6 (count (engine/full-timeline engine/*workflow-engine* parent-id)))
         "parent's own 2 events + child's 2 + grandchild's 2")
     (-> (visit (href parent-id))
         (has (link? :href (href child-id)))
@@ -546,7 +546,7 @@
                     (has (texts? [:details.panel-toggle :> :summary.btn] ["\u21BB Restart"]))
                     (k/press "Restart")
                     (has (status? 303)))
-          current (:workflow/invocation-id (engine/get-invocation id))]
+          current (:workflow/invocation-id (engine/get-invocation engine/*workflow-engine* id))]
       (is (not= id current))
       (-> state
           k/follow-redirect
@@ -783,7 +783,7 @@
         threw (test-util/insert! "test.ns/threw")
         done (test-util/insert! "test.ns/finished")]
     (test-util/expire! (test-util/ds) dead)
-    (engine/sweep!)
+    (engine/sweep! engine/*workflow-engine*)
     (test-util/finish! threw "ERROR" (pr-str {:message "boom"}))
     (test-util/finish! done "DONE" (pr-str :ok))
     (-> (visit "/")
@@ -961,7 +961,7 @@
 (deftest not-found-and-error-are-not-html-test
   (is (match? {:status 404 :headers {"Content-Type" #"^application/json"}}
               (call (-> (mock/request :get "/no/such/route") (mock/header "Accept" "text/html")))))
-  (with-redefs [engine/list-pending (fn [] (throw (ex-info "kaboom" {})))]
+  (with-redefs [engine/list-pending (fn [_engine] (throw (ex-info "kaboom" {})))]
     (let [response (call (-> (mock/request :get "/workflows/pending") (mock/header "Accept" "application/edn")))]
       (is (match? {:status 500 :headers {"Content-Type" #"^application/edn"}} response))
       (is (= {:error "kaboom"} (edn/read-string (:body response)))))))
