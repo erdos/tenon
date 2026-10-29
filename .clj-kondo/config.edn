@@ -1,0 +1,4 @@
+{:lint-as {tenon.workflow.sqlite.pool/with-borrowed clojure.core/let}
+ :hooks {:macroexpand {kerodon.core/within hooks.kerodon/within
+                       tenon.workflow.sqlite.jdbc/row-fn hooks.tenon/row-fn
+                       tenon.workflow.sqlite/current-row-fn hooks.tenon/current-row-fn}}}

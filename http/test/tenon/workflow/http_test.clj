@@ -4,7 +4,7 @@
             [ring.mock.request :as mock]
             [cheshire.core :as json]
             [clojure.edn :as edn]
-            [matcher-combinators.test :refer [match? thrown-match?]]
+            [matcher-combinators.test :refer [match?]]
             [kerodon.core :as k :refer [within]]
             [kerodon.test :refer [has status? some-text? regex?
                                   attr? value? missing? heading? link?]]

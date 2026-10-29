@@ -32,7 +32,7 @@
 (def ^:private nested-inner-fn (fn [n] (* n 2)))
 (def ^:private nested-outer-fn (fn [n] (+ 1 (engine/run-invocation #'nested-inner-fn nested-inner-fn [n]))))
 (def ^:private echo-fn (fn [x] x))
-(def ^:private unregistered-fn (fn [x] x))
+(def unregistered-fn (fn [x] x)) ; looked up by name only
 (def ^:private transactional-fn (fn [a b] (+ a b)))
 (def ^:private dedup-fn (fn [x] (* x 10)))
 (def ^:private dedup-error-fn (fn [msg] (throw (ex-info msg {}))))

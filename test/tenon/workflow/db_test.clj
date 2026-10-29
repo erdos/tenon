@@ -1,7 +1,6 @@
 (ns tenon.workflow.db-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
-            [clojure.edn :as edn]
-            [matcher-combinators.test :refer [match? thrown-match?]]
+            [matcher-combinators.test :refer [match?]]
             [matcher-combinators.matchers :as m]
             [next.jdbc :as jdbc]
             [tenon.workflow.db :as db]
