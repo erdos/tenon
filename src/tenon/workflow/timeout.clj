@@ -10,7 +10,7 @@
 
    Depends on the storage only - tenon.workflow, which this serves, requires
    it."
-  (:require [tenon.workflow.common :refer [emit! exception-str]]
+  (:require [tenon.workflow.common :refer [emit! serialize-failure]]
             [tenon.workflow.db :as db])
   (:import [java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit]))
 
@@ -23,7 +23,8 @@
   (when (and (= "STARTED" state) expired)
     (let [timeout-ms (- expires-at state-changed-at)]
       (when (db/time-out! ds invocation-id
-                          (exception-str
+                          (serialize-failure
+                           engine
                            (doto (ex-info (str "Timed out: still running " timeout-ms " ms after it started")
                                           {:type ::timed-out :timeout-ms timeout-ms})
                              ;; where the sweep found it says nothing about the run

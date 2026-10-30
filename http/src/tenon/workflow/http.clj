@@ -50,9 +50,11 @@
    it (i.e. with prefix stripped, as wrap-handler does), and every
    link/URL this handler's HTML generates gets prefix prepended back on
    via ui/*uri-prefix*, bound here. Pass \"\" to mount unprefixed at the
-   app's own root."
+   app's own root. Stored values are read by engine's :tenon/serializer,
+   bound as ui/*serializer*."
   [engine prefix request]
-  (binding [ui/*uri-prefix* prefix]
+  (binding [ui/*uri-prefix* prefix
+            ui/*serializer* (:tenon/serializer engine)]
     (let [[endpoint path-params] (route request)]
       (endpoint/respond endpoint (assoc request :path-params path-params :tenon/engine engine)))))
 

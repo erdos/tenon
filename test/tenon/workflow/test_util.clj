@@ -4,6 +4,7 @@
             [next.jdbc.result-set :as rs]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]
+            [tenon.workflow.serializer :as serializer]
             [tenon.workflow.sqlite.next-jdbc]))
 
 (def ^:dynamic *db-path*
@@ -40,6 +41,17 @@
                                 (rs/as-unqualified-modified-maps
                                  rs (assoc opts :label-fn #(str (if (= "data" (str/lower-case %)) "event/" "workflow/")
                                                                 (str/replace (str/lower-case %) \_ \-)))))}))
+
+(def base64-serializer
+  "A Serializer storing the EDN of a value base64-encoded - so a test can
+   tell what went through the engine's serializer from what did not."
+  (reify serializer/Serializer
+    (serialize [_ x]
+      (.encodeToString (java.util.Base64/getEncoder)
+                       (.getBytes (serializer/serialize serializer/edn-serializer x) "UTF-8")))
+    (deserialize [_ s]
+      (serializer/deserialize serializer/edn-serializer
+                              (String. (.decode (java.util.Base64/getDecoder) ^String s) "UTF-8")))))
 
 (defn timeline
   "The states of the workflow invocation-id belongs to - not those of its

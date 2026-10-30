@@ -14,6 +14,7 @@
             [tenon.workflow.http :as http]
             [tenon.workflow.ui :as ui]
             [tenon.workflow :as engine]
+            [tenon.workflow.serializer :as serializer]
             [tenon.workflow.kerodon-util :as ku :refer [count? present? texts? attrs? dd-of panel with-text]]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
 
@@ -164,6 +165,16 @@
           (has (texts? [:span.panel-muted] ["done"]))
           (has (texts? [:pre] ["42"]))))))
 
+(deftest workflow-detail-page-reads-by-the-engines-serializer-test
+  (let [encode #(serializer/serialize test-util/base64-serializer %)
+        id (test-util/insert! "test.ns/base64" :params (encode [1 2]) :metadata (encode {:user "ada"}))]
+    (test-util/finish! id "DONE" (encode 42))
+    (-> (visit (http/app (assoc engine/*workflow-engine* :tenon/serializer test-util/base64-serializer))
+               (href id))
+        (has (texts? (conj (panel "Params") :span.panel-muted) ["2 arguments"]))
+        (has (texts? (conj (panel "Result") :pre) ["42"]))
+        (has (texts? (conj (panel "Metadata") :pre) ["\"ada\""])))))
+
 (deftest workflow-detail-page-shows-no-arguments-and-pending-result-test
   (let [id (test-util/insert! "test.ns/no-args" :params (pr-str []))]
     (-> (visit (href id))
@@ -174,7 +185,7 @@
   (let [id (test-util/insert! "test.ns/unreadable" :params "[#object[Foo 0x1 \"x\"]]")]
     (-> (visit (href id))
         (within (panel "Params")
-          (has (texts? [:span.panel-muted] ["unreadable EDN, shown raw:"]))
+          (has (texts? [:span.panel-muted] ["unreadable, shown raw:"]))
           (has (texts? [:pre] ["[#object[Foo 0x1 \"x\"]]"]))))))
 
 (deftest workflow-detail-page-shows-error-panel-test

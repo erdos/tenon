@@ -1,13 +1,16 @@
-(ns tenon.workflow.common-test
+(ns tenon.workflow.serializer-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.walk :as walk]
-            [tenon.workflow.common :as common]))
+            [tenon.workflow.serializer :as serializer]))
 
 (defrecord Point [x y])
 
+(defn- edn-str [x]
+  (serializer/serialize serializer/edn-serializer x))
+
 (defn- reference-edn-str
-  "edn-str as it was first written - sorting by rebuilding maps and sets as
-   sorted ones, then pr-str - with namespace maps off. edn-str must print
+  "edn-serializer as it was first written - sorting by rebuilding maps and
+   sets as sorted ones, then pr-str - with namespace maps off. It must print
    exactly the same: a stored params string is part of the workflow's
    identity."
   [x]
@@ -50,16 +53,20 @@
         4 (zipmap (items) (items))
         5 (zipmap (map (fn [_] (leaf)) (items)) (items))))))
 
-(deftest edn-str-prints-what-pr-str-of-the-sorted-value-did-test
+(deftest edn-serializer-prints-what-pr-str-of-the-sorted-value-did-test
   (doseq [x samples]
-    (is (= (reference-edn-str x) (common/edn-str x)) (pr-str x)))
+    (is (= (reference-edn-str x) (edn-str x)) (pr-str x)))
   (let [rnd (java.util.Random. 42)]
     (dotimes [_ 2000]
       (let [x (random-value rnd 4)]
-        (is (= (reference-edn-str x) (common/edn-str x)) (pr-str x))))))
+        (is (= (reference-edn-str x) (edn-str x)) (pr-str x))))))
 
-(deftest edn-str-ignores-the-callers-printing-vars-test
+(deftest edn-serializer-reads-back-what-it-wrote-test
+  (doseq [x (remove #(or (record? %) (and (double? %) (Double/isNaN %))) samples)]
+    (is (= x (serializer/deserialize serializer/edn-serializer (edn-str x))) (pr-str x))))
+
+(deftest edn-serializer-ignores-the-callers-printing-vars-test
   (let [x {:ns/b [1 2 3] :ns/a (with-meta [1] {:m 1})}]
     (is (= "{:ns/a [1], :ns/b [1 2 3]}"
            (binding [*print-length* 1 *print-level* 1 *print-meta* true *print-namespace-maps* true]
-             (common/edn-str x))))))
+             (edn-str x))))))

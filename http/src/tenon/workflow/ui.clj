@@ -6,12 +6,19 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [hiccup2.core :as hiccup]
-            [ring.util.codec :as codec]))
+            [ring.util.codec :as codec]
+            [tenon.workflow.serializer :as serializer]))
 
 (def ^:dynamic *uri-prefix*
   "The URI prefix of tenon routes - bound per request by
    tenon.workflow.http/handler, prepended to every link uri builds."
   "")
+
+(def ^:dynamic *serializer*
+  "The tenon.workflow.serializer/Serializer the stored params, results,
+   failures and metadata shown were written by - bound per request by
+   tenon.workflow.http/handler to the engine's :tenon/serializer."
+  serializer/edn-serializer)
 
 (defn uri
   "Builds a prefix-relative URI from path segments. A map as the last
@@ -52,10 +59,11 @@
       (str "+" mm-ss)
       (format "+%02d:%s" (quot ms 3600000) mm-ss))))
 
-(defn read-edn
-  "The value EDN string s holds, or ::unreadable if it can't be read."
+(defn read-stored
+  "The value the stored string s stands for, read by *serializer*, or
+   ::unreadable if it can't be read."
   [s]
-  (try (edn/read-string s) (catch Throwable _ ::unreadable)))
+  (try (serializer/deserialize *serializer* s) (catch Throwable _ ::unreadable)))
 
 (defn pretty
   "value pretty-printed as EDN."
@@ -177,13 +185,13 @@
            [:span.fold-less "Show less"]]
           [:pre text]])))))
 
-(defn edn-block
-  "An EDN string pretty-printed (folded if large, see folded-pre), or shown
-   raw if it can't be read."
-  [edn-str]
-  (let [value (read-edn edn-str)]
+(defn stored-block
+  "The value of a stored string (see read-stored) pretty-printed (folded if
+   large, see folded-pre), or the string shown raw if it can't be read."
+  [s]
+  (let [value (read-stored s)]
     (if (= ::unreadable value)
-      [:div (muted "unreadable EDN, shown raw:") (folded-pre (str edn-str))]
+      [:div (muted "unreadable, shown raw:") (folded-pre (str s))]
       (folded-pre (pretty value)))))
 
 (defn panel-toggle-btn

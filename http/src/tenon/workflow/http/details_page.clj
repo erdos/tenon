@@ -7,9 +7,9 @@
             [tenon.workflow.ui :as ui]))
 
 (defn- params-html [params-str]
-  (let [params (ui/read-edn params-str)]
+  (let [params (ui/read-stored params-str)]
     (cond
-      (not (sequential? params)) (ui/panel {:title "Params"} (ui/edn-block params-str))
+      (not (sequential? params)) (ui/panel {:title "Params"} (ui/stored-block params-str))
       (empty? params) (ui/panel {:title "Params" :subtitle "no arguments"})
       :else (ui/panel {:title "Params"
                        :subtitle (ui/pluralize (count params) "argument")}
@@ -17,14 +17,14 @@
                                        [[:code (str "%" (inc i))] (ui/folded-pre (ui/pretty arg))]))))))
 
 (defn- metadata-body
-  "Metadata EDN as key-value rows, one per key - or the raw EDN block if it
-   isn't a non-empty map."
+  "Stored metadata as key-value rows, one per key - or the stored-block if
+   it isn't a non-empty map."
   [metadata-str]
-  (let [metadata (ui/read-edn metadata-str)]
+  (let [metadata (ui/read-stored metadata-str)]
     (if (and (map? metadata) (seq metadata))
       (ui/key-values (for [[k v] (sort-by (comp str key) metadata)]
                        [[:code (pr-str k)] (ui/folded-pre (ui/pretty v))]))
-      (ui/edn-block metadata-str))))
+      (ui/stored-block metadata-str))))
 
 (defn- metadata-html [metadata-str]
   (ui/panel {:title "Metadata"} (metadata-body metadata-str)))
@@ -32,13 +32,13 @@
 (defmulti ^:private result-panel :workflow/state)
 
 (defmethod result-panel "DONE" [wf]
-  (ui/panel {:title "Result" :subtitle "done"} (ui/edn-block (:workflow/result wf))))
+  (ui/panel {:title "Result" :subtitle "done"} (ui/stored-block (:workflow/result wf))))
 
 (defn- failure-panel [title {result :workflow/result}]
   (ui/panel {:title title}
-            (if-let [summary (ui/error-summary (ui/read-edn result))]
+            (if-let [summary (ui/error-summary (ui/read-stored result))]
               (ui/error-details summary)
-              (ui/edn-block result))))
+              (ui/stored-block result))))
 
 (defmethod result-panel "ERROR" [wf] (failure-panel "Error" wf))
 
@@ -145,14 +145,14 @@
 (defn- error-title
   "\"class: message\" of an ERROR or TIMEOUT event, for a chip's tooltip."
   [ev]
-  (let [{:keys [class message]} (ui/error-summary (ui/read-edn (:event/data ev)))]
+  (let [{:keys [class message]} (ui/error-summary (ui/read-stored (:event/data ev)))]
     (str class ": " message)))
 
 (defn- error-class-html
   "The exception class of an ERROR or TIMEOUT event, its package muted so the class
    name stands out - nil if the saved error has none."
   [ev]
-  (when-let [cls (some-> (ui/error-summary (ui/read-edn (:event/data ev))) :class str)]
+  (when-let [cls (some-> (ui/error-summary (ui/read-stored (:event/data ev))) :class str)]
     (if-let [i (str/last-index-of cls ".")]
       [:code.err-class [:span.wf-ns (subs cls 0 (inc i))] [:span.err-name (subs cls (inc i))]]
       [:code.err-class [:span.err-name cls]])))
@@ -182,9 +182,9 @@
 (defn- error-body
   "The full error of an ERROR or TIMEOUT event as saved (a Throwable->map): class,
    message, ex-data, the chain of causes (via) and the stack trace. Not a
-   map - shown as the raw EDN."
+   map - shown as a stored-block."
   [data-str]
-  (let [{:keys [via trace phase] :as error} (ui/read-edn data-str)]
+  (let [{:keys [via trace phase] :as error} (ui/read-stored data-str)]
     (if-let [summary (ui/error-summary error)]
       [:div.event-error-body
        (ui/error-details summary
@@ -198,7 +198,7 @@
                          (when (seq trace)
                            [:div (ui/muted "stack trace")
                             (ui/stack-trace trace)]))]
-      (ui/edn-block data-str))))
+      (ui/stored-block data-str))))
 
 (defmulti ^:private event-fold-body :workflow/state)
 

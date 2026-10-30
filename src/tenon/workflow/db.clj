@@ -25,32 +25,32 @@
     "Ensures the required schema and tables exist in the storage. Returns this.")
 
   (insert-workflow!
-    [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+    [this wf-def params-str parent-invocation-id metadata-str timeout-ms]
     "Inserts a STARTED workflow row, unless one already exists for this exact
      (wf_def, params) pair, in which case nothing is inserted. Its lease
      expires timeout-ms after now (nil: never). Returns the new row's
      invocation_id, or nil if nothing was inserted.")
 
-  (finish! [this invocation-id state result-edn-str]
+  (finish! [this invocation-id state result-str]
     "Moves invocation-id from STARTED to state (DONE or ERROR) with
-     result-edn-str as its result - but only if it is still STARTED under
+     result-str as its result - but only if it is still STARTED under
      that same invocation_id, i.e. it was neither finished, timed out nor
      restarted meanwhile. Returns true if the row was updated.")
 
-  (time-out! [this invocation-id result-edn-str]
+  (time-out! [this invocation-id result-str]
     "Like finish! with state TIMEOUT, but only if the lease of invocation-id
      has also expired. Returns true if the row was updated.")
 
-  (restart! [this invocation-id metadata-edn-str timeout-ms]
+  (restart! [this invocation-id metadata-str timeout-ms]
     "Moves invocation-id from DONE, ERROR or TIMEOUT back to STARTED under a new,
      larger invocation_id, clearing its result, replacing its metadata and
      leasing it for timeout-ms (nil: never expires). Returns the new
      invocation_id, or nil if invocation-id is no longer DONE, ERROR or TIMEOUT
      (e.g. a concurrent restart got there first).")
 
-  (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
+  (record-reuse! [this invocation-id parent-invocation-id metadata-str]
     "Logs that a caller running under parent-invocation-id (nil: top-level)
-     with metadata-edn-str got the stored result (or failure) of
+     with metadata-str got the stored result (or failure) of
      invocation-id instead of running it again: appends a REUSED row to the
      history of the workflow invocation-id belongs to - which may also be
      an earlier invocation_id of it - without changing the workflow row.")
@@ -62,7 +62,7 @@
      row also carries :workflow/expired true if its lease has run out (by the storage's
      clock), so time-out! would succeed.")
 
-  (find-by-wf-def-and-params [this wf-def params-edn-str]
+  (find-by-wf-def-and-params [this wf-def params-str]
     "The workflow row of exactly this (wf_def, params) pair - the one
      insert-workflow! would not insert again - or nil.")
 

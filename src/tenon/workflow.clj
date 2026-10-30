@@ -1,7 +1,7 @@
 (ns tenon.workflow
-  (:require [clojure.edn :as edn]
-            [tenon.workflow.common :refer [edn-str emit! exception-str]]
+  (:require [tenon.workflow.common :refer [deserialize emit! serialize serialize-failure]]
             [tenon.workflow.db :as db]
+            [tenon.workflow.serializer :as serializer]
             [tenon.workflow.sqlite :as sqlite]
             [tenon.workflow.timeout :as timeout])
   (:import [java.io Closeable]))
@@ -51,7 +51,9 @@
    someone else - and :heartbeat-error and :sweep-error) and
    :tenon/metadata-fn (a 2-arg fn (fn [wf-type args]) returning the
    metadata to persist - empty-metadata-fn by default; see also
-   host-thread-metadata-fn).
+   host-thread-metadata-fn) and :tenon/serializer (a
+   tenon.workflow.serializer/Serializer - how params, results, failures
+   and metadata are stored; serializer/edn-serializer by default).
 
    Unless :tenon/timeout-ms is nil, daemon threads renew the leases of the
    invocations running in this process and time out the expired ones of
@@ -83,6 +85,7 @@
                 :tenon/in-flight (atom {})
                 :tenon/on-event (fn [_event _data])
                 :tenon/metadata-fn empty-metadata-fn
+                :tenon/serializer serializer/edn-serializer
                 :tenon/pool-size 10
                 :tenon/sqlite-params {}}
                opts)
@@ -143,10 +146,10 @@
                                *invocation-stack* (conj *invocation-stack* invocation-id)]
                        (apply raw-fn args))
                      (catch Throwable e
-                       (db/finish! ds invocation-id "ERROR" (exception-str e))
+                       (db/finish! ds invocation-id "ERROR" (serialize-failure engine e))
                        (emit! engine :error (assoc event :error e))
                        (throw e)))]
-        (db/finish! ds invocation-id "DONE" (edn-str result))
+        (db/finish! ds invocation-id "DONE" (serialize engine result))
         (emit! engine :done (assoc event :result result))
         result)
       (finally
@@ -208,8 +211,8 @@
                            :state (:workflow/state wf)
                            :metadata metadata})
     (cond
-      (done? wf) (edn/read-string (:workflow/result wf))
-      (failed? wf) (let [failure (edn/read-string (:workflow/result wf))
+      (done? wf) (deserialize engine (:workflow/result wf))
+      (failed? wf) (let [failure (deserialize engine (:workflow/result wf))
                          ;; A caller failing on this saves it as its own failure,
                          ;; so failing on a reused failure in turn saves the one
                          ;; it carries: the original one, not nested ever deeper.
@@ -232,10 +235,10 @@
    (let [ds (:tenon/db engine)
          wf-def-str (str (symbol v))
          args-vec (vec args)
-         params-str (edn-str args-vec)
+         params-str (serialize engine args-vec)
          parent-id (first *invocation-stack*)
          metadata (metadata-for engine (symbol v) args-vec)
-         meta-str (some-> metadata edn-str)
+         meta-str (some->> metadata (serialize engine))
          find-existing #(db/find-by-wf-def-and-params ds wf-def-str params-str)
          reuse! #(reuse-existing-result! engine (:workflow/invocation-id %) parent-id metadata meta-str)]
      (if-let [existing (find-existing)]
@@ -266,7 +269,8 @@
 
      :workflow/invocation-id        long - the current invocation id
      :workflow/name               string - the workflow fn's qualified symbol
-     :workflow/params               string - EDN vector of the args
+     :workflow/params               string - the vector of the args, serialized
+                                    by :tenon/serializer
      :workflow/parent-invocation-id long - the invocation it ran nested under
                                     (as of when it first started), nil if
                                     top-level
@@ -275,11 +279,11 @@
      :workflow/state-changed-at     long - epoch ms of entering state
      :workflow/expires-at           long - epoch ms its STARTED lease ends, nil
                                     if not STARTED or never expiring
-     :workflow/metadata             string - EDN of the :tenon/metadata-fn
-                                    result when started, or nil
-     :workflow/result               string - EDN of the return value (DONE) or
-                                    of the failure's Throwable->map (ERROR) or of
-                                     the timeout's description (TIMEOUT),
+     :workflow/metadata             string - the :tenon/metadata-fn result
+                                    when started, serialized, or nil
+     :workflow/result               string - the return value (DONE), the
+                                    failure's Throwable->map (ERROR) or the
+                                    timeout's description (TIMEOUT), serialized;
                                     nil while STARTED
      :workflow/expired              boolean - whether the STARTED lease has
                                     run out"
@@ -323,9 +327,9 @@
      :workflow/state                 string - \"STARTED\", \"DONE\", \"ERROR\",
                                       \"TIMEOUT\" or \"REUSED\" (a caller got its stored outcome)
      :workflow/state-changed-at      long - epoch ms of entering state
-     :event/data                  string - EDN of the metadata (STARTED,
-                                     REUSED) or of the result (DONE, ERROR, TIMEOUT),
-                                     or nil
+     :event/data                  string - the metadata (STARTED, REUSED) or
+                                     the result (DONE, ERROR, TIMEOUT),
+                                     serialized, or nil
      :workflow/depth                 long - 0 for the workflow itself, 1 for a
                                      direct sub-workflow, and so on"
   [engine invocation-id]
@@ -356,12 +360,12 @@
                 (throw (ex-info "wf_def not registered in this process"
                                  {:type ::precondition-failed
                                   :wf-def (str wf-def-sym)})))
-          args (edn/read-string (:workflow/params wf))
+          args (deserialize engine (:workflow/params wf))
           metadata (metadata-for engine wf-def-sym args)]
       ;; A concurrent restart may have restarted it since wf was read -
       ;; restarting only if it is still DONE/ERROR/TIMEOUT under the same
       ;; invocation id lets only one of them through.
-      (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) (some-> metadata edn-str)
+      (if-let [new-invocation-id (db/restart! ds (:workflow/invocation-id wf) (some->> metadata (serialize engine))
                                              (:tenon/timeout-ms engine))]
         [new-invocation-id
          #(start-and-run! engine new-invocation-id :restarted

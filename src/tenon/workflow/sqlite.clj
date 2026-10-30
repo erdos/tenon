@@ -246,8 +246,8 @@
   "Appends a state-ended event for invocation-id - if it is still the
    current state of its workflow (so STARTED, and neither finished,
    timed out nor restarted) and, when expired-only?, its lease is over."
-  [ds invocation-id state result-edn-str expired-only?]
-  (boolean (seq (write! ds finish-sql [(state-code state) result-edn-str invocation-id (not expired-only?)]))))
+  [ds invocation-id state result-str expired-only?]
+  (boolean (seq (write! ds finish-sql [(state-code state) result-str invocation-id (not expired-only?)]))))
 
 (def ^:private read-call
   (current-row-fn :event/call-id (int-at %)
@@ -488,24 +488,24 @@
     (init-schema! this)
     this)
 
-  (insert-workflow! [this wf-def params-edn-str parent-invocation-id metadata-edn-str timeout-ms]
+  (insert-workflow! [this wf-def params-str parent-invocation-id metadata-str timeout-ms]
     (first (write! this insert-sql
-                   [(idempotence-key wf-def params-edn-str) wf-def params-edn-str
-                    parent-invocation-id metadata-edn-str timeout-ms])))
+                   [(idempotence-key wf-def params-str) wf-def params-str
+                    parent-invocation-id metadata-str timeout-ms])))
 
-  (finish! [this invocation-id state result-edn-str]
-    (end-state! this invocation-id state result-edn-str false))
+  (finish! [this invocation-id state result-str]
+    (end-state! this invocation-id state result-str false))
 
-  (time-out! [this invocation-id result-edn-str]
-    (end-state! this invocation-id "TIMEOUT" result-edn-str true))
+  (time-out! [this invocation-id result-str]
+    (end-state! this invocation-id "TIMEOUT" result-str true))
 
-  (restart! [this invocation-id metadata-edn-str timeout-ms]
+  (restart! [this invocation-id metadata-str timeout-ms]
     (first (write! this restart-sql
-                   [metadata-edn-str timeout-ms invocation-id])))
+                   [metadata-str timeout-ms invocation-id])))
 
-  (record-reuse! [this invocation-id parent-invocation-id metadata-edn-str]
+  (record-reuse! [this invocation-id parent-invocation-id metadata-str]
     (write! this reuse-sql
-            [metadata-edn-str parent-invocation-id parent-invocation-id invocation-id])
+            [metadata-str parent-invocation-id parent-invocation-id invocation-id])
     nil)
 
   (get-workflow [this invocation-id]
@@ -513,12 +513,12 @@
                        (current-row-fn :workflow/parent-invocation-id (int-or-nil-at %)
                                        :workflow/expired (.getBoolean %)))))
 
-  (find-by-wf-def-and-params [this wf-def params-edn-str]
+  (find-by-wf-def-and-params [this wf-def params-str]
     ;; The rows with the key - all but never more than one - are told apart
     ;; by their name and params here, rather than by binding both to the
     ;; statement too.
-    (some #(when (and (= params-edn-str (:workflow/params %)) (= wf-def (:workflow/name %))) %)
-          (pool/query this find-sql [(idempotence-key wf-def params-edn-str)] read-state)))
+    (some #(when (and (= params-str (:workflow/params %)) (= wf-def (:workflow/name %))) %)
+          (pool/query this find-sql [(idempotence-key wf-def params-str)] read-state)))
 
   (list-calls [this filters]
     (let [[sql param-keys] (calls-sql (calls-shape filters))]

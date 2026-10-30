@@ -50,13 +50,25 @@ You can find the invocations in the web UI started at http://localhost:3000.
 
 Every invocation is stored with metadata, which shows up in the web UI and as `:metadata` in the `:started`, `:restarted` and `:reused` events. By default it is an empty map (`empty-metadata-fn`). `host-thread-metadata-fn` provides the host name and the Java thread name the invocation was started from, e.g. `{:host "app-1" :thread "http-nio-8080-exec-3"}`.
 
-To change it, pass a `:tenon/metadata-fn` when initializing the engine. It is called with the workflow type (the workflow function's qualified symbol) and the vector of its arguments, on the thread making the call, and returns the metadata to persist (any EDN-printable value, usually a map; `nil` stores nothing):
+To change it, pass a `:tenon/metadata-fn` when initializing the engine. It is called with the workflow type (the workflow function's qualified symbol) and the vector of its arguments, on the thread making the call, and returns the metadata to persist (any value the serializer can store, usually a map; `nil` stores nothing):
 
 ```clojure
 (tenon.workflow/init "app.db" :tenon/metadata-fn (fn [wf-type args] {:actor-id 42}))
 ```
 
 The function runs once per call: for a call that reuses a stored result, the metadata describes the reusing call, and a restart replaces the metadata with the restarting call's.
+
+## Serialization
+
+Params, results, failures (as `Throwable->map`) and metadata are stored as strings by a `tenon.workflow.serializer/Serializer`: `serialize` turns a value into a string, `deserialize` turns it back. The default, `edn-serializer`, writes canonical EDN - maps and sets in a deterministic order - and reads it with `clojure.edn/read-string`.
+
+To change it, pass a `:tenon/serializer` when initializing the engine. Equal values must serialize to equal strings, since an invocation is identified by its serialized params:
+
+```clojure
+(tenon.workflow/init "app.db" :tenon/serializer my-serializer)
+```
+
+The web UI reads stored values with the engine's serializer too.
 
 ## State transitions
 

@@ -6,6 +6,7 @@
             [next.jdbc :as jdbc]
             [tenon.workflow :as engine]
             [tenon.workflow.db :as db]
+            [tenon.workflow.serializer :as serializer]
             [tenon.workflow.timeout :as timeout]
             [tenon.workflow.fixtures :as fixtures]
             [tenon.workflow.test-util :as test-util :refer [temp-db-fixture]]))
@@ -368,6 +369,27 @@
                                            [999])]
         (is (= :winner-result result))
         (is (zero? @calls) "the loser must not have run raw-fn itself")))))
+
+(deftest stores-through-the-engines-serializer-test
+  (let [eng (assoc engine/*workflow-engine*
+                   :tenon/serializer test-util/base64-serializer
+                   :tenon/metadata-fn (constantly {:user "ada"}))
+        stored (fn [] (first (test-util/find-by-wf-def "tenon.workflow-test/add-fn")))
+        decode #(serializer/deserialize test-util/base64-serializer %)]
+    (engine/register! #'add-fn add-fn)
+    (is (= 3 (engine/run-invocation eng #'add-fn add-fn [1 2])))
+    (is (match? {:workflow/params #(= [1 2] (decode %))
+                 :workflow/metadata #(= {:user "ada"} (decode %))
+                 :workflow/result #(= 3 (decode %))}
+                (stored)))
+    (is (= 3 (engine/run-invocation eng #'add-fn add-fn [1 2])) "reused, read back")
+    (is (= 3 (engine/restart-invocation eng (:workflow/invocation-id (stored)))) "restarted with its params read back")
+    (is (thrown? Exception (engine/run-invocation eng #'boom-fn boom-fn ["kaput"])))
+    (let [failed (first (test-util/find-by-wf-def "tenon.workflow-test/boom-fn"))]
+      (is (match? {:cause "kaput"} (decode (:workflow/result failed))))
+      (is (thrown-match? {:type ::engine/previous-failure :failure {:cause "kaput"}}
+                         (engine/run-invocation eng #'boom-fn boom-fn ["kaput"]))
+          "a reused failure, read back"))))
 
 (deftest restart-preconditions-test
   (is (thrown-match? clojure.lang.ExceptionInfo

@@ -68,9 +68,9 @@
       (has (attr? [:span.chip] :class "chip state-"))
       (has (texts? [:span.chip] [""]))))
 
-(deftest read-edn-test
-  (is (= [1 2] (ui/read-edn "[1 2]")))
-  (is (= ::ui/unreadable (ui/read-edn "(1 2"))))
+(deftest read-stored-test
+  (is (= [1 2] (ui/read-stored "[1 2]")))
+  (is (= ::ui/unreadable (ui/read-stored "(1 2"))))
 
 (deftest panel-test
   (-> (render (ui/panel {:title "Result" :subtitle "2 items"} [:p "body"]))
@@ -170,13 +170,13 @@
   (is (= "{:a 1}" (ui/pretty {:a 1})))
   (is (= "nil" (ui/pretty nil))))
 
-(deftest edn-block-test
-  (-> (render (ui/edn-block "[1 2]"))
+(deftest stored-block-test
+  (-> (render (ui/stored-block "[1 2]"))
       (has (texts? [:pre] ["[1 2]"])))
-  (-> (render (ui/edn-block "nil"))
+  (-> (render (ui/stored-block "nil"))
       (has (texts? [:pre] ["nil"])))
-  (-> (render (ui/edn-block "#object[Foo]"))
-      (has (texts? [:div :span.panel-muted] ["unreadable EDN, shown raw:"]))
+  (-> (render (ui/stored-block "#object[Foo]"))
+      (has (texts? [:div :span.panel-muted] ["unreadable, shown raw:"]))
       (has (texts? [:div :pre] ["#object[Foo]"]))))
 
 (deftest state-with-tooltip-test
