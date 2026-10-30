@@ -14,6 +14,11 @@
                       nubank/matcher-combinators {:mvn/version "3.11.0"}
                       tenon/http {:local/root "http"}}}
 
+  :bench {:extra-paths ["bench"]
+          :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}
+          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+          :main-opts ["-m" "tenon.workflow.bench"]}
+
   :repl/rebel
   {:extra-deps {com.bhauman/rebel-readline {:mvn/version "0.1.11"}}
    :main-opts ["--eval" "(require 'tenon.workflow 'tenon.workflow.server 'tenon.workflow.fixtures)"
