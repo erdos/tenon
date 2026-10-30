@@ -438,11 +438,15 @@
   [form]
   (when-not (and (list? form) (= 'defn (first form)))
     (throw (ex-info "#workflow only supports defn forms" {:form form})))
-  (let [[_ fname fn-form] (macroexpand-1 form)]
+  (let [[_ fname fn-form] (macroexpand-1 form)
+        raw-fn (gensym "raw-fn")
+        ;; The defn's position, so the var's :file and :line point at it.
+        def-form (with-meta `(def ~fname
+                               (fn [& args#]
+                                 (run-invocation (var ~fname) ~raw-fn args#)))
+                   (meta form))]
     `(do
        (declare ~fname)
-       (let [raw-fn# ~fn-form]
-         (def ~fname
-           (fn [& args#]
-             (run-invocation (var ~fname) raw-fn# args#)))
-         (register! (var ~fname) raw-fn#)))))
+       (let [~raw-fn ~fn-form]
+         ~def-form
+         (register! (var ~fname) ~raw-fn)))))
